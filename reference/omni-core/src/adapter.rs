@@ -1472,6 +1472,10 @@ pub fn lora_adapter_value(
     targets: &[&str],
     bind_a: &str,
     bind_b: &str,
+    // `rank_axis` is the base's own name for the axis the rank contracts over.
+    // Naming it rather than assuming one is what makes `require` catch a
+    // mismatch instead of the math being quietly wrong (§08.3).
+    rank_axis: &str,
 ) -> Res<Value> {
     let scale = if alpha.fract() == 0.0 && rank > 0 {
         Scalar::Ratio(alpha as i64, rank as i64)
@@ -1498,7 +1502,7 @@ pub fn lora_adapter_value(
                 ),
                 (
                     "require",
-                    Value::map(vec![("rank_axis", Value::text("in"))]),
+                    Value::map(vec![("rank_axis", Value::text(rank_axis.to_string()))]),
                 ),
             ])
         })
@@ -1664,6 +1668,7 @@ mod tests {
             &["model.layers.*.attn.q_proj.weight"],
             "lora.{1}.q_proj.A",
             "lora.{1}.q_proj.B",
+            "in",
         )
         .unwrap();
         Adapter::from_value(&v).unwrap()

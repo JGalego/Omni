@@ -168,6 +168,65 @@ jobs:
             --range 0:64 | grep -q 'bytes 0..32 (32 B)'
           echo "expressions evaluate, and a partial read reads only its part"
 
+      # §12.5: a signature is attached to the manifest it signs, and the
+      # container still verifies afterwards.
+      - name: Signing and V7 verification
+        run: |
+          OMNI=reference/target/release/omni
+          SEED=$(python3 -c "print('11'*32)")
+          PUB=$("$OMNI" keygen --seed $SEED | awk '/^public/ {print $2}')
+          "$OMNI" example /tmp/base.omni
+          "$OMNI" sign /tmp/base.omni --key $SEED -o /tmp/signed.omni
+          "$OMNI" verify /tmp/signed.omni --level 6
+          "$OMNI" sign --verify /tmp/signed.omni --key $PUB
+          "$OMNI" inspect /tmp/signed.omni | grep -q 'signatures    1'
+          # A different key must not satisfy the policy, and must not be
+          # reported as invalid either: it is simply not our key.
+          OTHER=$("$OMNI" keygen --seed $(python3 -c "print('22'*32)") | awk '/^public/ {print $2}')
+          set +e
+          "$OMNI" sign --verify /tmp/signed.omni --key $OTHER; code=$?
+          set -e
+          [ "$code" = "3" ] || { echo "::error::expected indeterminate (3), got $code"; exit 1; }
+          # Tampering with a signed manifest must break the signature.
+          python3 -c "
+          d = bytearray(open('/tmp/signed.omni','rb').read())
+          d[20000] ^= 1
+          open('/tmp/tampered.omni','wb').write(bytes(d))"
+          set +e
+          "$OMNI" sign --verify /tmp/tampered.omni --key $PUB >/dev/null 2>&1; code=$?
+          set -e
+          [ "$code" != "0" ] || { echo "::error::a tampered container verified"; exit 1; }
+          echo "signed, verified, and unforgeable"
+
+      # §08.6: a fine-tune of a model is a delta over it, and reading the delta
+      # needs the base.
+      - name: Deltas and adapters
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --tune 0 /tmp/b.omni
+          "$OMNI" example --tune 7 /tmp/t.omni
+          "$OMNI" delta /tmp/b.omni /tmp/t.omni -o /tmp/d.omni --max-err 1e-2 | tee /tmp/delta.txt
+          grep -q 'low-rank' /tmp/delta.txt
+          # The delta must be a small fraction of the base.
+          python3 - <<'PY'
+          import re
+          pct = float(re.search(r'\(([\d.]+) % of base\)', open('/tmp/delta.txt').read()).group(1))
+          assert pct < 10.0, f"delta is {pct}% of base, expected well under 10%"
+          print(f"delta is {pct}% of the base")
+          PY
+          # On its own the delta is incomplete (exit 5), not invalid.
+          set +e
+          "$OMNI" verify /tmp/d.omni >/dev/null; code=$?
+          set -e
+          [ "$code" = "5" ] || { echo "::error::expected incomplete (5), got $code"; exit 1; }
+          # Layered with its parent, its tensors read back.
+          "$OMNI" cat /tmp/d.omni --tensor model.layers.0.attn.q_proj.weight \
+            --with /tmp/b.omni --limit 4
+          # §08.3: an adapter is checked against a base before any weights load.
+          "$OMNI" adapter make /tmp/b.omni -o /tmp/lora.omni
+          "$OMNI" adapter check /tmp/b.omni /tmp/lora.omni | grep -q attachable
+          echo "delta and adapter paths hold"
+
       - name: Both mandatory hash algorithms produce valid containers
         run: |
           OMNI=reference/target/release/omni

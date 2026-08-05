@@ -367,6 +367,16 @@ pub fn analyze(base: &Tensor, tuned: &Tensor, opts: &Options) -> Res<Plan> {
         return Ok(full_plan(tuned, opts));
     }
     let n = tuned.data.len();
+    let bytes_base = base.to_bytes(&opts.store_dtype, &Layout::default(), Round::Rne)?;
+    let bytes_tuned = tuned.to_bytes(&opts.store_dtype, &Layout::default(), Round::Rne)?;
+
+    // identical — exact, and therefore always preferred. The test is on bytes
+    // rather than on values, because a tensor holding a NaN is bit-identical to
+    // itself and not *equal* to itself.
+    if bytes_base == bytes_tuned {
+        return Ok(identical_plan());
+    }
+
     let diff: Vec<f64> = tuned
         .data
         .iter()
@@ -376,26 +386,20 @@ pub fn analyze(base: &Tensor, tuned: &Tensor, opts: &Options) -> Res<Plan> {
     let scale = tuned
         .data
         .iter()
+        .filter(|x| x.is_finite())
         .fold(0.0f64, |m, x| m.max(x.abs()))
         .max(f64::MIN_POSITIVE);
 
-    // identical — exact, and therefore always preferred.
     if diff.iter().all(|d| *d == 0.0) {
-        return Ok(Plan {
-            kind: Kind::Identical,
-            max_rel_err: 0.0,
-            stored_bytes: 0,
-            tensors: vec![],
-            changed_chunks: vec![],
-            total_chunks: 0,
-        });
+        return Ok(identical_plan());
     }
 
-    let mut candidates: Vec<Plan> = Vec::new();
+    // A difference that is not a finite number cannot be approximated: there is
+    // no rank-1 factorization of a NaN and no residual that reconstructs an
+    // infinity. Only the exact representations are candidates.
+    let approximable = diff.iter().all(|d| d.is_finite());
 
-    // chunk-level — exact. Compare the stored bytes chunk by chunk.
-    let bytes_base = base.to_bytes(&opts.store_dtype, &Layout::default(), Round::Rne)?;
-    let bytes_tuned = tuned.to_bytes(&opts.store_dtype, &Layout::default(), Round::Rne)?;
+    let mut candidates: Vec<Plan> = Vec::new();
     let (changed, total) = chunk_diff(&bytes_base, &bytes_tuned, opts.chunk_size);
     if !changed.is_empty() && changed.len() as u64 != total {
         candidates.push(Plan {
@@ -409,7 +413,7 @@ pub fn analyze(base: &Tensor, tuned: &Tensor, opts: &Options) -> Res<Plan> {
     }
 
     // low-rank — lossy unless the change genuinely was low-rank.
-    if tuned.shape.len() == 2 {
+    if approximable && tuned.shape.len() == 2 {
         let (rows, cols) = (tuned.shape[0] as usize, tuned.shape[1] as usize);
         let max_rank = opts.max_rank.min(rows.min(cols));
         for rank in 1..=max_rank {
@@ -449,7 +453,11 @@ pub fn analyze(base: &Tensor, tuned: &Tensor, opts: &Options) -> Res<Plan> {
 
     // sparse — exact for the entries it keeps, dropping the ones below the
     // bound.
-    let threshold = opts.max_err * scale;
+    let threshold = if approximable {
+        opts.max_err * scale
+    } else {
+        0.0
+    };
     let mut mask = vec![0.0f64; n];
     let mut values = Vec::new();
     let mut dropped = 0.0f64;
@@ -461,7 +469,7 @@ pub fn analyze(base: &Tensor, tuned: &Tensor, opts: &Options) -> Res<Plan> {
             dropped = dropped.max(d.abs());
         }
     }
-    if !values.is_empty() {
+    if !values.is_empty() && approximable {
         let bytes = values.len() as u64 * opts.store_dtype.packed_bytes(1)
             + DType::Bool.packed_bytes(n as u64);
         candidates.push(Plan {
@@ -484,7 +492,7 @@ pub fn analyze(base: &Tensor, tuned: &Tensor, opts: &Options) -> Res<Plan> {
     }
 
     // quantized-residual — lossy only in the residual, which is declared.
-    {
+    if approximable {
         let absmax = diff.iter().fold(0.0f64, |m, x| m.max(x.abs()));
         let (qlo, qhi) = match &opts.residual_dtype {
             DType::Int { w, signed: true } => {
@@ -558,6 +566,17 @@ fn dtype_eps(d: &DType) -> f64 {
     match d {
         DType::Float(f) => 2f64.powi(-(f.m as i32 + 1)),
         _ => 0.0,
+    }
+}
+
+fn identical_plan() -> Plan {
+    Plan {
+        kind: Kind::Identical,
+        max_rel_err: 0.0,
+        stored_bytes: 0,
+        tensors: vec![],
+        changed_chunks: vec![],
+        total_chunks: 0,
     }
 }
 

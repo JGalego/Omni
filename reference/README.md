@@ -14,6 +14,11 @@ $ ./target/release/omni verify  model.omni --level 6
 $ ./target/release/omni example --quantized quant.omni   # int4 + LoRA, as expressions
 $ ./target/release/omni cat  quant.omni --tensor model.layers.0.attn.q_proj.weight.lora
 $ ./target/release/omni deps quant.omni --tensor model.layers.0.attn.q_proj.weight.bf16 --range 0:64
+$ ./target/release/omni keygen --out key.hex
+$ ./target/release/omni sign model.omni --key <seed-hex> -o signed.omni
+$ ./target/release/omni sign --verify signed.omni --key <public-hex>
+$ ./target/release/omni delta base.omni tuned.omni -o delta.omni
+$ ./target/release/omni adapter check base.omni lora.omni
 ```
 
 ## What is here
@@ -21,7 +26,7 @@ $ ./target/release/omni deps quant.omni --tensor model.layers.0.attn.q_proj.weig
 | Crate | Contents | Spec |
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, model builder | §01–§05, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · pack · unpack · fsck · example` | design/cli.md |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · pack · unpack · fsck · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 

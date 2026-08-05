@@ -59,9 +59,10 @@ VERBS:
     ls      <file>            List objects in the index
     dump    <file> --header   Annotated hexdump of the 128-byte file header
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
-    cat     <file> --tensor <name> [--hex] [--limit N] [--raw]
+    cat     <file> --tensor <name> [--hex] [--limit N] [--raw] [--with <file>]
                               Evaluate a tensor's expression and print elements;
-                              --raw hexdumps the stored bytes instead
+                              --raw hexdumps the stored bytes instead, --with
+                              layers another container (a delta's parent)
     deps    <file> --tensor <name> [--range A:B]
                               What a (partial) read of that tensor must fetch
     pack    <dir.omnid> -o <file.omni> [--align N]
@@ -70,10 +71,25 @@ VERBS:
                               Explode a container into a directory store
     fsck    <file> [--rebuild -o <out.omni>]
                               Diagnose damage; rebuild by segment scan (§02.8)
-    example <out.omni> [--hash blake3|sha256] [--quantized]
+    keygen  [--out key.hex] [--seed <hex>]
+                              Make an Ed25519 signing key (§12.5.1)
+    sign    <file> --key <hex> [-o <out.omni>] [--purpose P] [--counter N]
+                              Sign a manifest and embed the attestation
+    sign    --verify <file> --key <pubkey-hex>[,<hex>…] [--require any|all|k:N]
+                              V7: authenticity against a trust policy
+    delta   <base.omni> <tuned.omni> -o <delta.omni> [--max-err E]
+                              Express one model as a delta over another (§08.6)
+    adapter make  <base.omni> -o <lora.omni> [--rank R] [--alpha A]
+                              [--targets <glob>]  Build a LoRA over that base
+    adapter check <base.omni> <adapter.omni>
+                              Validate attachment before loading weights (§08.3)
+    example <out.omni> [--hash blake3|sha256] [--quantized] [--tune N]
                               Build a small but complete example container;
                               --quantized exercises the value layer (int4 +
-                              per-group scales + a LoRA, all as expressions)
+                              per-group scales + a LoRA, all as expressions);
+                              --tune N fills the weights with plausible values
+                              and, for N > 0, applies a seeded rank-1 update —
+                              two containers that differ by a fine-tune
 
 EXIT CODES (docs/design/cli.md §10):
     0 ok · 1 invalid · 2 usage · 3 indeterminate · 5 incomplete
@@ -98,6 +114,10 @@ fn main() -> ExitCode {
         // `run`, which opens the container first.
         "fsck" => cmd_fsck(&args),
         "example" => cmd_example(&args),
+        "keygen" => cmd_keygen(&args),
+        "sign" => cmd_sign(&args),
+        "delta" => cmd_delta(&args),
+        "adapter" => cmd_adapter(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
         other => {
@@ -979,8 +999,23 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
         return Ok(0);
     }
 
+    // §01.8: a delta's tensors are expressions over its parent's objects, so
+    // reading one needs both containers. Layering is how a runtime holds a base
+    // once and many deltas beside it.
     let store = Borrowed(c);
-    let ctx = Ctx::new(&store);
+    let extra = match flag(args, "--with") {
+        Some(path) => Some(ContainerStore::new(Container::open(std::fs::read(path)?)?)),
+        None => None,
+    };
+    let layered = match &extra {
+        Some(e) => Some(omni_core::store::Layered::new(vec![&store, e])?),
+        None => None,
+    };
+    let backing: &dyn Store = match &layered {
+        Some(l) => l,
+        None => &store,
+    };
+    let ctx = Ctx::new(backing);
     let t = match desc.value.eval(&ctx) {
         Ok(t) => t,
         Err(e) => {
@@ -1321,6 +1356,7 @@ fn cmd_example(args: &[String]) -> R {
     // Options come in two shapes: valueless switches, and `--name value`
     // pairs whose value must not be mistaken for the positional output path.
     const SWITCHES: &[&str] = &["--quantized"];
+    let tune: Option<u64> = flag(args, "--tune").and_then(|s| s.parse().ok());
     let mut positional = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -1408,7 +1444,20 @@ fn cmd_example(args: &[String]) -> R {
             ("o_proj", 64),
         ] {
             let name = format!("model.layers.{layer}.attn.{proj}.weight");
-            let data = pattern(DType::BF16.packed_bytes(out_dim * hidden) as usize, &name);
+            // Without --tune the filler is random *bytes*, which is right for
+            // proving the container and useless as a weight: random bf16 bit
+            // patterns span 1e±38. With it, the values are plausible and a
+            // fine-tune of them is a meaningful thing to take a delta of.
+            let data = match tune {
+                None => pattern(DType::BF16.packed_bytes(out_dim * hidden) as usize, &name),
+                Some(seed) => {
+                    let mut d = floats(&DType::BF16, (out_dim * hidden) as usize, &name, 0.05);
+                    if seed != 0 {
+                        rank1_update(&mut d, out_dim as usize, hidden as usize, seed, 0.002);
+                    }
+                    d
+                }
+            };
             b = b.tensor(TensorSpec {
                 name,
                 shape: vec![out_dim, hidden],
@@ -1614,6 +1663,715 @@ fn add_quantized_layer(mut b: ModelBuilder) -> ModelBuilder {
         "model.layers.0.attn.q_proj.weight.fp8",
         desc(&w_fp8, DType::F8E4M3, "weight"),
     )
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if !s.len().is_multiple_of(2) {
+        return Err("hex must have an even number of digits".into());
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string().into()))
+        .collect()
+}
+
+/// `omni keygen` — an Ed25519 key pair (§12.5.1).
+fn cmd_keygen(args: &[String]) -> R {
+    let seed: [u8; 32] = match flag(args, "--seed") {
+        // A declared seed makes the key reproducible, which is what tests and
+        // CI need. It is not a way to make a release key: the seed *is* the
+        // private key.
+        Some(h) => unhex(h)?
+            .try_into()
+            .map_err(|_| "--seed takes 32 bytes of hex")?,
+        None => {
+            let bytes = std::fs::read("/dev/urandom")
+                .map_err(|_| "no /dev/urandom on this platform; pass --seed <64 hex digits>")?;
+            bytes
+                .get(..32)
+                .ok_or("short read from /dev/urandom")?
+                .try_into()
+                .map_err(|_| "short read from /dev/urandom")?
+        }
+    };
+    let sk = omni_core::ed25519::SecretKey::from_seed(&seed);
+    let out = flag(args, "--out");
+    let line = format!(
+        "# OMNI Ed25519 key. The seed is the private key: treat this file as one.\nseed {}\npublic {}\n",
+        hex(&sk.seed()),
+        hex(&sk.public_key())
+    );
+    match out {
+        Some(path) => {
+            std::fs::write(path, &line)?;
+            pr!("wrote {path}");
+            pr!("  public  {}", hex(&sk.public_key()));
+        }
+        None => prr!("{line}"),
+    }
+    Ok(0)
+}
+
+/// The objects of a container, ready to repack.
+fn container_objects(c: &Container) -> Result<Vec<omni_core::Object>, Box<dyn std::error::Error>> {
+    let mut out = Vec::with_capacity(c.index.len());
+    for e in &c.index {
+        out.push(omni_core::Object {
+            otype: e.otype,
+            payload: c.read(&e.digest)?,
+            oflags: e.oflags,
+            stored: None,
+        });
+    }
+    Ok(out)
+}
+
+/// `omni sign` — sign a manifest, or verify signatures against a policy.
+fn cmd_sign(args: &[String]) -> R {
+    use omni_core::sign::{
+        canonical_digest, sign_cose, signing_root, verify_signatures, Policy, Purpose, Requirement,
+        Signature, Summary, Tbs, TrustedKey,
+    };
+
+    if args.iter().any(|a| a == "--verify") {
+        let path = flag(args, "--verify").ok_or("--verify <file>")?;
+        let c = Container::open(std::fs::read(path)?)?;
+        let manifest = c.root()?;
+        let algo = c.header.hash;
+        let cacheable: std::collections::BTreeSet<omni_core::Digest> = c
+            .index
+            .iter()
+            .filter(|e| e.oflags & 0b10 != 0)
+            .map(|e| e.digest)
+            .collect();
+        let root = signing_root(&manifest, algo);
+        let canon = canonical_digest(&manifest, algo, &|d| cacheable.contains(d));
+        let mut keys = Vec::new();
+        for k in flag(args, "--key").unwrap_or_default().split(',') {
+            if k.is_empty() {
+                continue;
+            }
+            let b: [u8; 32] = unhex(k)?
+                .try_into()
+                .map_err(|_| "--key takes 32 bytes of hex per key")?;
+            keys.push(TrustedKey::new(b));
+        }
+        let requirement = match flag(args, "--require") {
+            None | Some("any") => Requirement::AnyOf,
+            Some("all") => Requirement::AllOf,
+            Some(spec) if spec.starts_with("k:") => {
+                Requirement::KOfN(spec[2..].parse().map_err(|_| "--require k:N")?)
+            }
+            Some(other) => {
+                prr!("omni: unknown --require `{other}` (any, all, k:N)\n");
+                return Ok(2);
+            }
+        };
+        let mut policy = Policy::keys(keys)
+            .requirement(requirement)
+            .purposes(vec![Purpose::Release, Purpose::Internal]);
+        if let Some(now) = flag(args, "--at") {
+            policy = policy.at(now);
+        }
+        let mut sigs = Vec::new();
+        for d in omni_core::sign::attestation_refs(&manifest) {
+            match c.get_value(&d) {
+                Ok(v) => match Signature::from_value(&v) {
+                    Ok(s) => sigs.push(s),
+                    Err(e) => pr!("  ⚠ {}: {e}", short(algo, &d)),
+                },
+                Err(e) => pr!("  ⚠ {}: {e}", short(algo, &d)),
+            }
+        }
+        pr!("{path}");
+        pr!("  root            {}", short(algo, &root));
+        pr!("  canonical       {}", short(algo, &canon));
+        pr!("  attestations    {}", sigs.len());
+        let v = verify_signatures(&sigs, &root, &canon, &policy);
+        for o in &v.outcomes {
+            pr!(
+                "  {} {}  {}",
+                if o.ok {
+                    "✓"
+                } else if o.indeterminate {
+                    "?"
+                } else {
+                    "✗"
+                },
+                o.kid
+                    .as_ref()
+                    .map(|k| hex(&k[..8.min(k.len())]))
+                    .unwrap_or_else(|| "(no kid)".into()),
+                o.message
+            );
+            if let Some(t) = &o.tbs {
+                pr!(
+                    "      subject {} {}  purpose {}  counter {}",
+                    t.subject_name,
+                    t.subject_version.clone().unwrap_or_default(),
+                    t.purpose.name(),
+                    t.counter
+                );
+            }
+        }
+        if v.satisfied {
+            pr!("\nV7 authenticity ✓ policy satisfied");
+            return Ok(0);
+        }
+        if v.invalid_count() > 0 {
+            pr!(
+                "\ninvalid: {} signature(s) do not verify",
+                v.invalid_count()
+            );
+            return Ok(1);
+        }
+        pr!("\nindeterminate: the policy is not satisfied and nothing is provably wrong");
+        return Ok(3);
+    }
+
+    // --- signing ---
+    let path = args.get(1).ok_or("usage: omni sign <file> --key <hex>")?;
+    if path.starts_with("--") {
+        return Err("usage: omni sign <file> --key <hex>".into());
+    }
+    let key_hex = flag(args, "--key").ok_or("--key <64 hex digits of seed>")?;
+    let seed: [u8; 32] = unhex(key_hex)?
+        .try_into()
+        .map_err(|_| "--key takes 32 bytes of hex (the seed)")?;
+    let sk = omni_core::ed25519::SecretKey::from_seed(&seed);
+    let out = flag(args, "-o")
+        .or_else(|| flag(args, "--out"))
+        .unwrap_or(path);
+    let purpose = match flag(args, "--purpose") {
+        None => Purpose::Release,
+        Some(p) => match Purpose::parse(p) {
+            Some(p) => p,
+            None => {
+                prr!("omni: unknown purpose `{p}` (release, internal, test, revocation)\n");
+                return Ok(2);
+            }
+        },
+    };
+    let counter: u64 = flag(args, "--counter")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let c = Container::open(std::fs::read(path)?)?;
+    let algo = c.header.hash;
+    let manifest = c.root()?;
+    let cacheable: std::collections::BTreeSet<omni_core::Digest> = c
+        .index
+        .iter()
+        .filter(|e| e.oflags & 0b10 != 0)
+        .map(|e| e.digest)
+        .collect();
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let (tensors, params) = match tensor_table(&c) {
+        Ok(t) => {
+            let n = t.len() as u64;
+            let p = t
+                .tensors
+                .values()
+                .filter_map(|r| TensorDesc::load(&ctx, r).ok())
+                .filter(|d| matches!(d.value, Expr::Literal { .. }) && d.is_weight())
+                .filter_map(|d| d.numel())
+                .sum();
+            (n, p)
+        }
+        Err(_) => (0, 0),
+    };
+    let name = manifest
+        .get("meta")
+        .and_then(as_ref_digest)
+        .and_then(|d| c.get_value(&d).ok())
+        .and_then(|m| {
+            m.get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "(unnamed)".into());
+
+    let tbs = Tbs {
+        root: signing_root(&manifest, algo),
+        alg: "EdDSA".into(),
+        purpose,
+        subject_name: name.clone(),
+        subject_version: flag(args, "--version").map(|s| s.to_string()),
+        not_before: flag(args, "--not-before").map(|s| s.to_string()),
+        not_after: flag(args, "--not-after").map(|s| s.to_string()),
+        summary: Summary {
+            tensors,
+            params,
+            canonical_digest: canonical_digest(&manifest, algo, &|d| cacheable.contains(d)),
+            // Nothing in this implementation marks an object executable, and
+            // saying so is part of the signed payload (§12.5.2).
+            executables: 0,
+        },
+        counter,
+    };
+    let sig = Signature::new(&sign_cose(&sk, &tbs));
+    let sig_obj = omni_core::Object::structure(otype::SIGNATURE, &sig.to_value());
+    let sig_digest = sig_obj.digest(algo);
+    let signed_manifest = omni_core::sign::attach(&manifest, &sig_digest);
+    let manifest_obj = omni_core::Object::structure(otype::MANIFEST, &signed_manifest);
+    let new_root = manifest_obj.digest(algo);
+
+    // Repack: everything except the old manifest, plus the new manifest and the
+    // signature. The old manifest is dropped because nothing references it any
+    // more; the signature is valid over either, which is the point of hashing
+    // the manifest with `attestations` removed.
+    let mut objects: Vec<omni_core::Object> = container_objects(&c)?
+        .into_iter()
+        .filter(|o| o.digest(algo) != c.header.root_digest)
+        .collect();
+    objects.push(manifest_obj);
+    objects.push(sig_obj);
+    let bytes = pack(
+        &objects,
+        &new_root,
+        &PackOptions {
+            hash: algo,
+            log2_align: c.header.log2_align,
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &bytes)?;
+    pr!("wrote {out}");
+    pr!("  subject         {name}");
+    pr!("  purpose         {}  counter {counter}", purpose.name());
+    pr!("  signing root    {}", short(algo, &tbs.root));
+    pr!(
+        "  canonical       {}",
+        short(algo, &tbs.summary.canonical_digest)
+    );
+    pr!("  public key      {}", hex(&sk.public_key()));
+    pr!("  new file root   {}", short(algo, &new_root));
+    pr!(
+        "  verify with     omni sign --verify {out} --key {}",
+        hex(&sk.public_key())
+    );
+    Ok(0)
+}
+
+/// `omni delta` — express one model as a delta over another (§08.6).
+///
+/// The result is deliberately *incomplete* on its own: its tensors are
+/// expressions over the base's chunk objects, which live in the base container.
+/// That is what makes a delta small, and `omni verify` reports it as incomplete
+/// rather than invalid.
+fn cmd_delta(args: &[String]) -> R {
+    use omni_core::delta::{analyze, literal_of, Kind, Options, Parent, Report};
+    use omni_core::tensor::Materialize;
+
+    let base_path = args
+        .get(1)
+        .ok_or("usage: omni delta <base> <tuned> -o <out>")?;
+    let tuned_path = args
+        .get(2)
+        .ok_or("usage: omni delta <base> <tuned> -o <out>")?;
+    let out = flag(args, "-o")
+        .or_else(|| flag(args, "--out"))
+        .ok_or("-o <delta.omni> required")?;
+    let max_err: f64 = flag(args, "--max-err")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1e-2);
+
+    let base = Container::open(std::fs::read(base_path)?)?;
+    let tuned = Container::open(std::fs::read(tuned_path)?)?;
+    if base.header.hash != tuned.header.hash {
+        prr!("omni: the two containers use different digest algorithms\n");
+        return Ok(2);
+    }
+    let algo = base.header.hash;
+    let bs = Borrowed(&base);
+    let ts = Borrowed(&tuned);
+    let bctx = Ctx::new(&bs);
+    let tctx = Ctx::new(&ts);
+    let btable = tensor_table(&base)?;
+    let ttable = tensor_table(&tuned)?;
+
+    let base_opts = Options {
+        max_err,
+        ..Default::default()
+    };
+    let mut report = Report {
+        base_bytes: base
+            .index
+            .iter()
+            .filter(|e| e.otype == otype::BLOB)
+            .map(|e| e.logical_len)
+            .sum(),
+        ..Default::default()
+    };
+    let mut b = ModelBuilder::new(format!("delta of {tuned_path}")).hash(algo);
+    let mut carried = 0usize;
+
+    for (name, tr) in &ttable.tensors {
+        let td = TensorDesc::load(&tctx, tr)?;
+        let Some(br) = btable.get(name) else {
+            // A tensor the base does not have is carried whole.
+            carried += 1;
+            continue;
+        };
+        let bd = TensorDesc::load(&bctx, br)?;
+        let (Ok(bt), Ok(tt)) = (bd.value.eval(&bctx), td.value.eval(&tctx)) else {
+            carried += 1;
+            continue;
+        };
+        // Store the delta's own tensors in the *tuned* tensor's dtype: LoRA
+        // factors are bf16 in practice, and it keeps the delta's inferred dtype
+        // equal to the tensor it replaces.
+        let opts = Options {
+            store_dtype: td.dtype.clone(),
+            ..base_opts.clone()
+        };
+        let plan = analyze(&bt, &tt, &opts)?;
+        report.add(&plan);
+        // The delta's expression is written over the *base's* value, so the
+        // parent's bytes are referenced rather than copied.
+        let mut stored = std::collections::BTreeMap::new();
+        for (role, tensor) in &plan.tensors {
+            let bytes = tensor.to_bytes(
+                &tensor.dtype,
+                &omni_core::layout::Layout::default(),
+                omni_core::Round::Rne,
+            )?;
+            let cl = b.chunk_list(&bytes);
+            stored.insert(
+                role.clone(),
+                Expr::Literal {
+                    chunks: cl,
+                    dtype: tensor.dtype.clone(),
+                    shape: omni_core::expr::dims(&tensor.shape),
+                    layout: omni_core::layout::Layout::default(),
+                },
+            );
+        }
+        let _ = literal_of; // the helper above builds the same node from a blob
+        let value = plan.build(&bd.value, &stored)?;
+        let inferred = value.infer()?;
+        b = b.derived(
+            name.clone(),
+            TensorDesc {
+                shape: inferred.shape,
+                dtype: inferred.dtype,
+                layout: td.layout.clone(),
+                value,
+                semantic: td.semantic.clone(),
+                role: td.role.clone(),
+                axes: td.axes.clone(),
+                device_hint: None,
+                materialize: Materialize::Lazy,
+                stats: None,
+                digest_materialized: None,
+            },
+        );
+    }
+
+    // §08.7: the parent is pinned by digest.
+    b.extra.push((
+        "parents".into(),
+        Value::Array(vec![Parent {
+            reference: (otype::MANIFEST, base.header.root_digest),
+            role: "base".into(),
+            name: Some(base_path.to_string()),
+            locators: vec![],
+            required: true,
+        }
+        .to_value()]),
+    ));
+    let (objs, root) = b.build();
+    // A delta's objects are small — a few kilobytes of low-rank factors — and
+    // page alignment would cost more in padding than the payload itself. The
+    // 64-byte minimum of §02.3 is the right choice here, and `--align` overrides
+    // it for a delta big enough to want mmap alignment back.
+    let log2_align: u8 = flag(args, "--align")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let bytes = pack(
+        &objs,
+        &root,
+        &PackOptions {
+            hash: algo,
+            log2_align,
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &bytes)?;
+    pr!("{report}");
+    if carried > 0 {
+        pr!("  ({carried} tensor(s) had no counterpart in the base and were skipped)");
+    }
+    pr!();
+    pr!("wrote {out}  {}", human(bytes.len() as u64));
+    pr!("  parent        {}", short(algo, &base.header.root_digest));
+    pr!(
+        "  identical     {} tensor(s) reference the parent directly, at zero bytes",
+        report
+            .rows
+            .get(Kind::Identical.name())
+            .map(|r| r.tensors)
+            .unwrap_or(0)
+    );
+    pr!("  incomplete    reading it needs the base: `omni cat <delta> --with <base>`");
+    Ok(0)
+}
+
+/// `omni adapter check` — §08.3 attachment validation, before any weights load.
+fn cmd_adapter(args: &[String]) -> R {
+    match args.get(1).map(|s| s.as_str()) {
+        Some("check") => cmd_adapter_check(args),
+        Some("make") => cmd_adapter_make(args),
+        _ => {
+            prr!(
+                "usage: omni adapter check <base.omni> <adapter.omni>\n       omni adapter make \
+                 <base.omni> -o <lora.omni>\n"
+            );
+            Ok(2)
+        }
+    }
+}
+
+/// `omni adapter make` — a LoRA over a base, as §08.1 describes it: a manifest
+/// with `kind: "adapter"` whose only asset is an `Adapter`, referencing the base
+/// by digest.
+fn cmd_adapter_make(args: &[String]) -> R {
+    use omni_core::adapter::lora_adapter_value;
+    use omni_core::tensor::Materialize;
+
+    let base_path = args
+        .get(2)
+        .ok_or("usage: omni adapter make <base.omni> -o <out>")?;
+    let out = flag(args, "-o")
+        .or_else(|| flag(args, "--out"))
+        .ok_or("-o <lora.omni> required")?;
+    let rank: u64 = flag(args, "--rank")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let alpha: f64 = flag(args, "--alpha")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16.0);
+    let targets = flag(args, "--targets").unwrap_or("model.layers.*.attn.q_proj.weight");
+
+    let base = Container::open(std::fs::read(base_path)?)?;
+    let algo = base.header.hash;
+    let bs = Borrowed(&base);
+    let bctx = Ctx::new(&bs);
+    let table = tensor_table(&base)?;
+
+    // One A/B pair per matched base tensor, sized from that tensor's own shape.
+    let matched: Vec<String> = table.select(targets).into_iter().cloned().collect();
+    if matched.is_empty() {
+        prr!("omni: `{targets}` matches no tensor in {base_path}\n");
+        return Ok(2);
+    }
+    let mut b = ModelBuilder::new(format!("lora over {base_path}")).hash(algo);
+    let mut factors: Vec<(String, TensorDesc)> = Vec::new();
+    for name in &matched {
+        let d = TensorDesc::load(&bctx, table.get(name).unwrap())?;
+        let sizes = d.sizes().ok_or("a target tensor has a symbolic shape")?;
+        if sizes.len() != 2 {
+            continue;
+        }
+        let (out_f, in_f) = (sizes[0], sizes[1]);
+        // §08.3's `{1}` capture: the adapter's tensors are named by what the
+        // glob matched, so the binding survives renaming of everything else.
+        let caps = omni_core::pattern::glob_captures(targets, name).unwrap_or_default();
+        let key = caps.join(".");
+        let a_bytes = floats(
+            &DType::BF16,
+            (rank * in_f) as usize,
+            &format!("A{key}"),
+            0.02,
+        );
+        let b_bytes = vec![0u8; DType::BF16.packed_bytes(out_f * rank) as usize];
+        let a_expr = b.literal(
+            &a_bytes,
+            DType::BF16,
+            &[rank, in_f],
+            omni_core::layout::Layout::default(),
+        );
+        let b_expr = b.literal(
+            &b_bytes,
+            DType::BF16,
+            &[out_f, rank],
+            omni_core::layout::Layout::default(),
+        );
+        let desc = |value: Expr, axes: Vec<&str>, shape: &[u64]| TensorDesc {
+            shape: omni_core::expr::dims(shape),
+            dtype: DType::BF16,
+            layout: omni_core::layout::Layout::default(),
+            value,
+            semantic: Some("weight".into()),
+            role: Some("lora".into()),
+            axes: Some(axes.iter().map(|a| a.to_string()).collect()),
+            device_hint: None,
+            materialize: Materialize::Lazy,
+            stats: None,
+            digest_materialized: None,
+        };
+        factors.push((
+            format!("lora.{key}.A"),
+            desc(a_expr, vec!["rank", "in"], &[rank, in_f]),
+        ));
+        factors.push((
+            format!("lora.{key}.B"),
+            desc(b_expr, vec!["out", "rank"], &[out_f, rank]),
+        ));
+    }
+    for (name, d) in factors {
+        b = b.derived(name, d);
+    }
+    // The adapter's tensors live in their own table, so build the model graph
+    // and then point the Adapter object at that table.
+    let (mut objs, _) = b.build();
+    let table_ref = objs
+        .iter()
+        .find(|o| o.otype == otype::TENSOR_TABLE)
+        .map(|o| (otype::TENSOR_TABLE, o.digest(algo)))
+        .ok_or("the builder produced no tensor table")?;
+    // The rank contracts over the base's *input* axis, whatever the base calls
+    // it. Reading the name off the base is what lets `require` catch a mismatch
+    // rather than the multiplication being quietly wrong.
+    let rank_axis = TensorDesc::load(&bctx, table.get(&matched[0]).unwrap())?
+        .axes
+        .and_then(|a| a.last().cloned())
+        .unwrap_or_else(|| "in".to_string());
+    let adapter = lora_adapter_value(
+        &(otype::MANIFEST, base.header.root_digest),
+        &table_ref,
+        rank,
+        alpha,
+        &[targets],
+        "lora.{1}.A",
+        "lora.{1}.B",
+        &rank_axis,
+    )?;
+    let adapter_obj = omni_core::Object::structure(otype::ADAPTER, &adapter);
+    let adapter_ref = adapter_obj.digest(algo);
+    objs.push(adapter_obj);
+    // §08.1: an adapter is a first-class publishable artifact.
+    let manifest = omni_core::Object::structure(
+        otype::MANIFEST,
+        &Value::map(vec![
+            ("t", Value::text("omni.core/manifest")),
+            ("v", Value::U(1)),
+            ("kind", Value::text("adapter")),
+            ("created", Value::U(0)),
+            (
+                "assets",
+                Value::map(vec![(
+                    "adapter",
+                    Value::Array(vec![
+                        Value::U(otype::ADAPTER as u64),
+                        Value::Bytes(adapter_ref.to_vec()),
+                    ]),
+                )]),
+            ),
+            ("entry", Value::text("adapter")),
+            (
+                "parents",
+                Value::Array(vec![omni_core::delta::Parent {
+                    reference: (otype::MANIFEST, base.header.root_digest),
+                    role: "base".into(),
+                    name: Some(base_path.to_string()),
+                    locators: vec![],
+                    required: true,
+                }
+                .to_value()]),
+            ),
+        ]),
+    );
+    let root = manifest.digest(algo);
+    objs.push(manifest);
+    let bytes = pack(
+        &objs,
+        &root,
+        &PackOptions {
+            hash: algo,
+            log2_align: 6,
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &bytes)?;
+    pr!("wrote {out}  {}", human(bytes.len() as u64));
+    pr!("  method        lora  rank {rank}  alpha {alpha}");
+    pr!("  base          {}", short(algo, &base.header.root_digest));
+    pr!("  targets       {targets}  ({} matched)", matched.len());
+    pr!("  check with    omni adapter check {base_path} {out}");
+    Ok(0)
+}
+
+fn cmd_adapter_check(args: &[String]) -> R {
+    let base_path = args
+        .get(2)
+        .ok_or("usage: omni adapter check <base> <adapter>")?;
+    let adapter_path = args
+        .get(3)
+        .ok_or("usage: omni adapter check <base> <adapter>")?;
+    let base = Container::open(std::fs::read(base_path)?)?;
+    let adapter = Container::open(std::fs::read(adapter_path)?)?;
+    let bs = ContainerStore::new(base);
+    let as_ = ContainerStore::new(adapter);
+    let layered = omni_core::store::Layered::new(vec![&as_, &bs])?;
+    let ctx = Ctx::new(&layered);
+
+    // The adapter object is the manifest's only asset.
+    let manifest = as_.container().root()?;
+    let ad = manifest
+        .get("assets")
+        .and_then(|a| a.get("adapter"))
+        .and_then(as_ref_digest)
+        .ok_or("this container has no `adapter` asset")?;
+    let a = omni_core::adapter::Adapter::load(&ctx, &(otype::ADAPTER, ad))?;
+    let table = tensor_table(bs.container())?;
+    let r = a.check(&ctx, &table)?;
+
+    pr!("{adapter_path} against {base_path}");
+    pr!("  method        {}", a.method.name());
+    pr!("  base          {}", short(as_.hash(), &a.base.1));
+    if let (Some(rank), Some(alpha)) = (a.rank, a.alpha) {
+        pr!("  rank/alpha    {rank} / {alpha}");
+    }
+    pr!("  attached      {} tensor(s)", r.bindings.len());
+    for b in r.bindings.iter().take(8) {
+        pr!("    {:<52} <- {}", b.tensor, b.used.join(", "));
+    }
+    if r.bindings.len() > 8 {
+        pr!("    … {} more", r.bindings.len() - 8);
+    }
+    for f in &r.findings {
+        pr!("  {f}");
+    }
+    if !r.graph_patches.is_empty() {
+        pr!("  graph patches {} (applied by §07)", r.graph_patches.len());
+    }
+    if r.is_ok() {
+        pr!("\nattachable");
+        return Ok(0);
+    }
+    pr!("\ninvalid: the adapter cannot attach to this base");
+    Ok(1)
+}
+
+/// Adds a seeded rank-1 update to a bf16 matrix in place — a fine-tune's worth
+/// of change, and the case §08.6's low-rank representation exists for.
+fn rank1_update(bytes: &mut [u8], rows: usize, cols: usize, seed: u64, scale: f64) {
+    let u: Vec<f64> = (0..rows)
+        .map(|i| omni_core::expr::uniform01(seed, i as u64) - 0.5)
+        .collect();
+    let v: Vec<f64> = (0..cols)
+        .map(|j| omni_core::expr::uniform01(seed ^ 0xffff, j as u64) - 0.5)
+        .collect();
+    for (i, ui) in u.iter().enumerate() {
+        for (j, vj) in v.iter().enumerate() {
+            let k = (i * cols + j) as u64;
+            let Some(old) = DType::BF16.decode(bytes, k) else {
+                continue;
+            };
+            DType::BF16.encode(bytes, k, old + scale * ui * vj, omni_core::Round::Rne);
+        }
+    }
 }
 
 /// Deterministic filler in a *dtype*, with values bounded by `scale`.
