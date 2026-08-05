@@ -306,7 +306,7 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
 
     pr!();
     pr!("tensors       {:<6} {:>28}", n_tensors, human(tensor_bytes));
-    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.3));
     for (name, shape, dt, bytes) in rows.iter().take(8) {
         pr!(
             "  {:<44} {:<14} {:<8} {:>10}",
