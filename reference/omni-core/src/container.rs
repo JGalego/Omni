@@ -907,7 +907,10 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
             ]),
         ),
         ("segments", Value::Array(segments)),
-        ("hash", Value::text("sha2-256")),
+        // §02.5: the container's digest algorithm. The header carries it too, and
+        // the two must agree — a superblock that names a different algorithm
+        // than the file uses is a contradiction a reader cannot resolve.
+        ("hash", Value::text(opts.hash.name())),
         (
             // §02.5: the codecs a reader may meet in this container. `raw` is
             // always among them — structure objects are never compressed — and
@@ -1629,6 +1632,45 @@ mod tests {
     // Compression tests live here rather than in `codec` because what matters
     // is the container-level invariant of §01.2: a compressed copy is the same
     // object.
+    /// §02.5: the superblock describes the container, so the algorithm it names
+    /// has to be the one the container uses. Naming the other one is a
+    /// contradiction a reader cannot resolve — and it was hardcoded here.
+    #[test]
+    fn the_superblock_names_the_container_s_own_hash() {
+        for algo in [HashAlgo::Blake3_256, HashAlgo::Sha256] {
+            let (objs, root) = crate::model::ModelBuilder::new("test/hash")
+                .hash(algo)
+                .tensor(crate::model::TensorSpec {
+                    name: "w".into(),
+                    shape: vec![4],
+                    dtype: crate::dtype::DType::F32,
+                    axes: None,
+                    semantic: "weight",
+                    data: vec![0u8; 16],
+                })
+                .build();
+            let c = Container::open(
+                pack(
+                    &objs,
+                    &root,
+                    &PackOptions {
+                        hash: algo,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(c.header.hash, algo);
+            assert_eq!(
+                c.superblock.get("hash").and_then(|v| v.as_str()),
+                Some(algo.name()),
+                "the superblock must name {}",
+                algo.name()
+            );
+        }
+    }
+
     mod compression {
         use super::super::*;
         use crate::codec::Codec;

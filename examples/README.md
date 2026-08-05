@@ -82,8 +82,8 @@ signatures    none
 objects       49 in index (27 structure, 22 blob)
 storage       86.54 KiB logical in objects · 24.65 KiB container overhead
 
-read          header 128 B + trailer 64 B + superblock 337 B + index 3200 B + structure 6187 B
-              = 9.68 KiB total, 0 tensor payload bytes
+read          header 128 B + trailer 64 B + superblock 339 B + index 3200 B + structure 6187 B
+              = 9.69 KiB total, 0 tensor payload bytes
 ```
 
 Several of the specification's claims are made concrete in that output:
@@ -103,13 +103,13 @@ Several of the specification's claims are made concrete in that output:
 ```console
 $ omni verify toy.omni
 V0 framing     ✓ 7 segments
-     0x00000080  SUPER           337 B
+     0x00000080  SUPER           339 B
      0x00001080  OBJ            6294 B
      0x00002938  PAD            1672 B
      0x00002fe0  BLOB          90112 B
      0x00019000  PAD            4032 B
      0x00019fe0  INDEX          3200 B
-     0x0001ac80  SUPER           337 B
+     0x0001ac80  SUPER           339 B
 V0 padding     ✓ (R-C07 zero fill)
 V0 alignment   ✓ (R-C08 data objects on 4096-byte boundaries)
 V1 index       ✓ 49 entries, sorted, complete
@@ -144,23 +144,23 @@ OMNI FileHeader (§02.3)
    35  00                                                  reserved0
    36  03 00 00 00                                         flags
    40  a0 00 00 00 00 00 00 00                             front_sb_off
-   48  51 01 00 00 00 00 00 00                             front_sb_len
+   48  53 01 00 00 00 00 00 00                             front_sb_len
    56  c0 bc 01 00 00 00 00 00                             file_size
    64  ef 5e 49 b8 b0 c2 fa a7 54 5b d6 0a da 41 37 30 …   root_digest
    96  6f 6d 6e 69 2d 72 73 2f 30 2e 31 2e 30 00 00 00     creator
   112  00 00 00 00 00 00 00 00                             created_unix_ms
   120  00 00 00 00                                         reserved1
-  124  f8 42 36 49                                         header_crc32c
+  124  88 3e 26 92                                         header_crc32c
 
 raw:
 00000000  89 4f 4d 4e 49 0d 0a 1a 01 00 00 00 01 0c 80 00  |.OMNI...........|
 00000010  cd 5a 1f e6 73 22 7c 0f 9d 73 9d 31 23 dd 0c cb  |.Z..s"|..s.1#...|
 00000020  1e 00 20 00 03 00 00 00 a0 00 00 00 00 00 00 00  |.. .............|
-00000030  51 01 00 00 00 00 00 00 c0 bc 01 00 00 00 00 00  |Q...............|
+00000030  53 01 00 00 00 00 00 00 c0 bc 01 00 00 00 00 00  |S...............|
 00000040  ef 5e 49 b8 b0 c2 fa a7 54 5b d6 0a da 41 37 30  |.^I.....T[...A70|
 00000050  fc c1 47 4f a7 3b e4 a5 b9 3f 5e 58 80 56 c8 d3  |..GO.;...?^X.V..|
 00000060  6f 6d 6e 69 2d 72 73 2f 30 2e 31 2e 30 00 00 00  |omni-rs/0.1.0...|
-00000070  00 00 00 00 00 00 00 00 00 00 00 00 f8 42 36 49  |.............B6I|
+00000070  00 00 00 00 00 00 00 00 00 00 00 00 88 3e 26 92  |.............>&.|
 ```
 
 `created_unix_ms` is zero and the UUID is derived from the root digest, so the
@@ -352,7 +352,7 @@ normal open   ✗ R-C09: trailer magic mismatch
 header        ✓ OMNI/1.0  hash=blake3-256  align=4096
 root          b3:ef5e49b8b0c2faa7…
 segment scan  5 segments with valid CRCs
-     0x00000080  SUPER         337 B
+     0x00000080  SUPER         339 B
      0x00001080  OBJ          6294 B
      0x00002938  PAD          1672 B
      0x00002fe0  BLOB        90112 B
