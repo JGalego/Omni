@@ -175,10 +175,10 @@ lossless safetensors import and export. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
 it — every importer and exporter except safetensors, `https://` (TLS needs a
 dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
-plugin host, and the MAY-level codecs —
-and every one of them is reported as unsupported at run time rather than guessed
-at. See [the roadmap](docs/design/roadmap.md) for what the gates have and have
-not proven.
+plugin host, and the MAY-level codecs — and every one of them is reported as
+unsupported at run time rather than guessed at. See
+[the roadmap](docs/design/roadmap.md) for what the gates have and have not
+proven.
 
 ## File extension and media types
 
