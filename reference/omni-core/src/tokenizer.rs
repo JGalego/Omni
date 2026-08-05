@@ -383,14 +383,12 @@ impl Tokenizer {
                 PreTokenizer::Unsupported(k) => out.push(format!("pre-tokenizer `{k}`")),
                 PreTokenizer::RegexSplit {
                     pattern, flavor, ..
-                } => {
-                    if crate::pattern::Regex::parse(pattern).is_err() {
-                        out.push(format!(
-                            "regex-split pattern (flavor `{flavor}`) uses constructs this build's \
-                             engine does not implement; splitting it differently would produce \
-                             different token ids"
-                        ));
-                    }
+                } if crate::pattern::Regex::parse(pattern).is_err() => {
+                    out.push(format!(
+                        "regex-split pattern (flavor `{flavor}`) uses constructs this build's \
+                         engine does not implement; splitting it differently would produce \
+                         different token ids"
+                    ));
                 }
                 _ => {}
             }
