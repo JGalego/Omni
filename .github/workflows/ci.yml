@@ -294,16 +294,35 @@ jobs:
           "$OMNI" sign --verify /tmp/signed.omni --key $OTHER; code=$?
           set -e
           [ "$code" = "3" ] || { echo "::error::expected indeterminate (3), got $code"; exit 1; }
-          # Tampering with a signed manifest must break the signature.
+          # A signature covers the manifest (§12.5.2), and the manifest covers
+          # everything else by content addressing. Both halves of that need
+          # testing, and they fail in different places on purpose.
+          MOFF=$("$OMNI" ls /tmp/signed.omni | awk '$2 == "Manifest" { print $3 }')
           python3 -c "
+          import sys
           d = bytearray(open('/tmp/signed.omni','rb').read())
-          d[20000] ^= 1
-          open('/tmp/tampered.omni','wb').write(bytes(d))"
+          d[int(sys.argv[1]) + 40] ^= 1
+          open('/tmp/tampered.omni','wb').write(bytes(d))" "$MOFF"
           set +e
           "$OMNI" sign --verify /tmp/tampered.omni --key $PUB >/dev/null 2>&1; code=$?
           set -e
-          [ "$code" != "0" ] || { echo "::error::a tampered container verified"; exit 1; }
-          echo "signed, verified, and unforgeable"
+          [ "$code" != "0" ] || { echo "::error::a tampered manifest verified"; exit 1; }
+
+          # Tampering with a tensor payload instead does *not* break the
+          # signature, and must not be reported as if it did: the manifest is
+          # still authentic. It is caught one layer down, by the object digests
+          # the manifest transitively commits to.
+          python3 -c "
+          d = bytearray(open('/tmp/signed.omni','rb').read())
+          d[20000] ^= 1
+          open('/tmp/blob-tampered.omni','wb').write(bytes(d))"
+          set +e
+          "$OMNI" sign --verify /tmp/blob-tampered.omni --key $PUB >/dev/null 2>&1; sig=$?
+          "$OMNI" verify /tmp/blob-tampered.omni >/dev/null 2>&1; full=$?
+          set -e
+          [ "$sig" = "0" ] || { echo "::error::the manifest is untouched; its signature should still verify (got $sig)"; exit 1; }
+          [ "$full" != "0" ] || { echo "::error::a corrupted tensor payload passed full verification"; exit 1; }
+          echo "signed, verified, and unforgeable at both layers"
 
       # §08.6: a fine-tune of a model is a delta over it, and reading the delta
       # needs the base.
