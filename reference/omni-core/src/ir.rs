@@ -4609,9 +4609,37 @@ pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<
             headed.push((cur, n_heads));
         }
 
+        // §07.8's `attention` contracts over the *last two* axes: keys against
+        // queries, then head dimension. The projections above are
+        // `[B*S, heads, head_dim]`, where the last two are heads and head
+        // dimension — so without this transpose the op would attend across the
+        // heads of a single token instead of across positions, which is not
+        // attention at all. Found by running the graph (`crate::interp`) rather
+        // than by verifying it: shapes and types agree either way.
+        let mut posed = Vec::new();
+        for (t, n_heads) in &headed {
+            let p = fresh();
+            ops.push(
+                Op::new("omni.tensor", "transpose", 1)
+                    .with_inputs(&[*t])
+                    .with_attr(
+                        "perm",
+                        Value::Array(vec![Value::U(1), Value::U(0), Value::U(2)]),
+                    )
+                    .with_output(
+                        p,
+                        Type::tensor(
+                            vec![Dim::N(*n_heads), Dim::Dynamic, Dim::N(head_dim)],
+                            dt.clone(),
+                        ),
+                    ),
+            );
+            posed.push(p);
+        }
+
         let attn = fresh();
         let mut attn_op = Op::new("omni.nn", "attention", 2)
-            .with_inputs(&[headed[0].0, headed[1].0, headed[2].0])
+            .with_inputs(&[posed[0], posed[1], posed[2]])
             .with_attr("causal", Value::Bool(true))
             .with_attr("kv_groups", Value::U(heads / kv_heads.max(1)))
             // The scale is written explicitly: a shipped lowering cannot know
@@ -4621,17 +4649,35 @@ pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<
             .with_output(
                 attn,
                 Type::tensor(
-                    vec![Dim::Dynamic, Dim::N(heads), Dim::N(head_dim)],
+                    vec![Dim::N(heads), Dim::Dynamic, Dim::N(head_dim)],
                     dt.clone(),
                 ),
             );
         attn_op.loc = Some("synthesized from arch.params".into());
         ops.push(attn_op);
 
+        // Back to position-major, so the heads concatenate along the hidden axis.
+        let unposed = fresh();
+        ops.push(
+            Op::new("omni.tensor", "transpose", 1)
+                .with_inputs(&[attn])
+                .with_attr(
+                    "perm",
+                    Value::Array(vec![Value::U(1), Value::U(0), Value::U(2)]),
+                )
+                .with_output(
+                    unposed,
+                    Type::tensor(
+                        vec![Dim::Dynamic, Dim::N(heads), Dim::N(head_dim)],
+                        dt.clone(),
+                    ),
+                ),
+        );
+
         let flat = fresh();
         ops.push(
             Op::new("omni.tensor", "reshape", 1)
-                .with_inputs(&[attn])
+                .with_inputs(&[unposed])
                 .with_attr("shape", Value::Array(vec![Value::I(-1), Value::U(hidden)]))
                 .with_output(
                     flat,
@@ -4727,9 +4773,17 @@ pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<
             }],
         },
         constraints: vec![
+            // Exactly one, not "at least one". `omni.tensor/reshape` takes static
+            // extents and at most one `-1`, and both B and S are symbolic — so
+            // the only reshape this synthesizer can write collapses them into a
+            // single axis. A batch of more than one would then let attention
+            // attend across the boundary between sequences, so the graph declares
+            // the shape it is actually correct for rather than the shape it looks
+            // like it handles. Declaring `>= 1` here is how a wrong answer would
+            // have become a silent one.
             Constraint {
                 dim: "B".into(),
-                rel: Rel::Ge,
+                rel: Rel::Eq,
                 bound: 1,
             },
             Constraint {

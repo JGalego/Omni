@@ -788,6 +788,53 @@ jobs:
           # Two-read open is the other half of Gate 0 and is met by construction.
           grep -qE 'open +[0-9.]+ ms for 1,000,000 index entries' /tmp/bench.txt
 
+      # §07's claim is not that a graph type-checks — it is that a runtime which
+      # has never heard of the architecture can *execute* it. Verification cannot
+      # tell those apart, and did not: the synthesizer emitted a graph whose
+      # attention attended across heads rather than across positions, which
+      # verified perfectly and computed the wrong thing. Only running it found
+      # that. So it is run.
+      - name: A synthesized graph executes, and executing it is a different check
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --graph /tmp/run-graph.omni > /dev/null
+          "$OMNI" graph run /tmp/run-graph.omni --tokens 1,2,3 | tee /tmp/run.txt
+          # Two layers of a decoder, executed op by op over the container's own
+          # weights, with the symbolic dimensions bound by the argument.
+          grep -qE 'ran forward over [0-9]+ op' /tmp/run.txt
+          grep -q 'dims           B=1, S=3' /tmp/run.txt
+          grep -q 'result 0       \[1, 3, 256\] bf16' /tmp/run.txt
+          # The example's weights are a byte pattern rather than a trained model,
+          # so read as bf16 some of them are infinities and the logits are NaN.
+          # That is arithmetic, and the verb says so rather than leaving it as a
+          # surprise — an interpreter that quietly produced numbers here would be
+          # hiding the one thing worth knowing.
+          grep -q 'non-finite' /tmp/run.txt
+          grep -q 'not a trained model' /tmp/run.txt
+
+          # A weights-only container has no graph, which is legal (§07.5) and
+          # indeterminate rather than invalid: exit 3.
+          set +e
+          "$OMNI" graph run examples/toy.omni --tokens 1 > /tmp/norun.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 3
+          grep -q 'weights-only' /tmp/norun.txt
+
+          # A graph is untrusted input, so the interpreter is bounded and reports
+          # the bound rather than running forever.
+          set +e
+          "$OMNI" graph run /tmp/run-graph.omni --tokens 1,2,3 --fuel 10 > /tmp/fuel.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'over the limit of 10' /tmp/fuel.txt
+
+          # And the numbers themselves are checked in the unit tests, where a
+          # decoder built from known weights has to produce a distribution over
+          # the vocabulary and logits at position 0 that no later token can move.
+          echo "the synthesized graph runs, is bounded, and says when its weights are not a model"
+
       # §05's central claim is that quantization is a transformation and not a
       # file type: a GPTQ or AWQ weight is `dequantize(packed_words, scheme)` and
       # needs no new mechanism. The test of that claim is not that the importer

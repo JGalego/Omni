@@ -121,12 +121,29 @@ frozen and `omni.tensor`/`omni.nn`/`omni.quant`/`omni.io` are defined with per-o
 versions; `graph synthesize` builds a decoder graph from `arch.params` and
 `graph lower` applies the shipped lowerings. The tokenizer IR and OMNI-CT run
 their own conformance vectors. The WASM host of §11.6 exists and runs plugin
-expression ops under the restricted profile. **Not met, and not close:** one
-architecture family is synthesizable rather than ten, there is no reference
-*interpreter* for the IR (verification and rewriting are not execution), the
+expression ops under the restricted profile. **A reference interpreter now exists**
+(`omni graph run`): all of `omni.core` including its control flow, all 31
+`omni.tensor` ops with a general `einsum`, `omni.quant`'s four, and the `omni.nn`
+ops a decoder needs. What it does not implement — `conv`, `pool`, `moe_route`,
+`ssm_scan`, `interpolate` — is refused by name rather than approximated.
+
+Writing it paid for itself immediately, which is the argument for gates of this
+kind: **the synthesizer was emitting a graph that verified and computed the wrong
+thing.** It reshaped the projections to `[B·S, heads, head_dim]` and handed them
+to `attention`, whose last two axes are keys and head dimension — so the op was
+attending across the *heads of a single token* instead of across positions. Every
+shape agreed, every type checked, `graph --verify` reported no findings. Only
+running it and asking whether position 0's logits could be moved by a later token
+found it. Fixed, along with a `B == 1` constraint the graph had been missing:
+`reshape` takes static extents, so the only reshape the synthesizer can write
+collapses batch and sequence, and a batch of two would have attended across the
+boundary between sequences.
+
+**Still not met:** one architecture family is synthesizable rather than ten, the
 tokenizer vectors are this repository's rather than 200 real ones, and no
-Jinja2 → OMNI-CT translator exists, so the 95 % figure is untested. The
-coverage numbers in this gate are the point of it; none of them has a value yet.
+Jinja2 → OMNI-CT translator exists, so the 95 % figure is untested. The coverage
+numbers in this gate are the point of it, and only the interpreter half of the
+first one now has a value.
 
 ## Phase 3 — Prove the distribution layer (months 12–18)
 

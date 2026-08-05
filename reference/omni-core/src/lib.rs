@@ -5,7 +5,8 @@
 //! numeric type algebra, layouts, and the tensor expression algebra with its
 //! typing, identity, evaluation and range pushdown, plus the quantization
 //! sparsity and quantization scheme catalogues of §04.6 and §05. Above those:
-//! OMNI-IR (§07), training state (§09), a WebAssembly plugin host (§11.6),
+//! OMNI-IR (§07) with a reference interpreter that executes it, training state
+//! (§09), a WebAssembly plugin host (§11.6),
 //! streaming transport (§13), and safetensors, PEFT, GPTQ and AWQ import.
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
@@ -51,6 +52,7 @@ pub mod dtype;
 pub mod ed25519;
 pub mod expr;
 pub mod hfquant;
+pub mod interp;
 pub mod ir;
 pub mod json;
 pub mod layout;

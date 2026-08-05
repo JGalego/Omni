@@ -45,6 +45,7 @@ $ ./target/release/omni strip model.omni --weights -o catalogue.omni   # §13.8
 $ ./target/release/omni import safetensors w.safetensors -o w.omni  # with a report
 $ ./target/release/omni export safetensors w.omni --plan            # what it would cost
 $ ./target/release/omni import peft ./lora --base w.omni -o lora.omni  # a LoRA, pinned
+$ ./target/release/omni graph run m.omni --tokens 1,2,3   # execute the §07 graph
 $ ./target/release/omni import gptq ./model-gptq -o m.omni    # §05.2.2, as expressions
 $ ./target/release/omni import awq ./model-awq -o m.omni      # §05.2.3
 $ ./target/release/omni serve model.omni --port 8080    # §13.4.3 object server
@@ -55,7 +56,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors, PEFT, GPTQ and AWQ import, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors, PEFT, GPTQ and AWQ import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
@@ -227,6 +228,28 @@ implemented:
   when the base actually names its axes: a base imported from safetensors names
   none, because safetensors says nothing about them, and asserting a requirement
   the base cannot meet made every attach *invalid* instead of merely unchecked
+- **A reference interpreter for OMNI-IR** (`omni graph run`), which is where §07's
+  claim gets tested rather than asserted: a model that describes its own
+  computation can be executed by something that was never told its architecture.
+  All of `omni.core` including `if`, `while`, `scan`, `map`, `call` and `tuple`;
+  all 31 `omni.tensor` ops with a general `einsum` over explicit subscripts;
+  `omni.quant`'s four, taking scale and zero from the op's *operands* because that
+  is what the IR form does; and the `omni.nn` ops a decoder needs — `embedding`,
+  `norm`, `rope`, `activation` and `attention` with `causal`, `window`, `softcap`
+  and grouped queries, which the shipped lowering declines and `graph synthesize`
+  emits. `conv`, `pool`, `moe_route`, `ssm_scan` and `interpolate` are refused by
+  name; a graph is bounded in ops, elements and loop iterations, because a graph
+  is untrusted input.
+
+  It earned its keep on the first run. **`graph synthesize` was emitting a graph
+  that verified and computed the wrong thing:** the projections were reshaped to
+  `[B·S, heads, head_dim]` and handed to `attention`, whose last two axes are keys
+  and head dimension — so it attended across the heads of a single token rather
+  than across positions. Every shape agreed and `graph --verify` found nothing,
+  because there was nothing wrong with the *types*. Running it and asking whether
+  a later token could move position 0's logits is what found it. That is the
+  difference between verifying a graph and executing one, and it is the whole
+  argument for writing an interpreter
 - **GPTQ and AWQ import**, which is where §05's claim gets tested: quantization is
   a transformation and not a file type, so a packed 4-bit weight becomes
   `permute(dequantize(reshape(permute(qweight)), scheme))` and needs nothing new
@@ -299,7 +322,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-406 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+430 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -462,6 +485,21 @@ that the imported adapter pins its base by digest, declares it as a non-required
 parent that `delta::parents` can actually read back, and attaches to that base
 binding each layer's own factors while touching nothing it did not train.
 
+And, for the interpreter, the tests that check what it *computes* rather than that
+it runs: that a causal attention's first position is exactly `v[0]` whatever the
+scores are, and that removing the mask changes that, so the mask is load-bearing;
+that grouped queries share the kv heads they are supposed to and a grouping the
+shapes cannot support is an error rather than a modulo that produces numbers; that
+a sliding window forgets and a soft cap keeps a logit of 1000 finite; that RMS norm
+leaves unit mean-square and layer norm also centres, and that the two are
+different functions; that both RoPE conventions preserve each pair's length and
+disagree with each other; that `einsum` agrees with `matmul` and refuses an
+ellipsis; that `scan` agrees with `cumsum`; that `while` terminates and a bound
+stops one that would not; that a lowered graph computes what the graph it came
+from computes, which is §07.2's claim; and — the whole thing — that a synthesized
+decoder produces a distribution over the vocabulary and logits at position 0 that
+no later token can move.
+
 And, for GPTQ and AWQ, the tests that would notice a wrong answer rather than a
 crash: that a fixture packed by the formats' own rules dequantizes to values
 computed in the test, so the transpose, the interleave and the grouping are each
@@ -522,7 +560,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 406 passed; 0 failed
+test result: ok. 430 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

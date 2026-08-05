@@ -2411,7 +2411,7 @@ impl Tensor {
         self.data.get(lin as usize).copied()
     }
 
-    fn at(&self, index: &[u64]) -> f64 {
+    pub(crate) fn at(&self, index: &[u64]) -> f64 {
         let s = self.strides();
         let mut lin = 0u64;
         for (i, st) in index.iter().zip(&s) {
@@ -2421,7 +2421,7 @@ impl Tensor {
     }
 
     /// Reads with NumPy broadcasting against `shape`.
-    fn broadcast_at(&self, out_index: &[u64]) -> f64 {
+    pub(crate) fn broadcast_at(&self, out_index: &[u64]) -> f64 {
         let off = out_index.len() - self.shape.len();
         let mut idx = Vec::with_capacity(self.shape.len());
         for (k, d) in self.shape.iter().enumerate() {
@@ -2431,7 +2431,7 @@ impl Tensor {
     }
 }
 
-fn bump(idx: &mut [u64], shape: &[u64]) {
+pub(crate) fn bump(idx: &mut [u64], shape: &[u64]) {
     for k in (0..idx.len()).rev() {
         idx[k] += 1;
         if idx[k] < shape[k] {
@@ -3040,7 +3040,13 @@ impl Expr {
     }
 }
 
-fn matmul(a: &Tensor, b: &Tensor, sum: Sum, shape: &[u64], dtype: &DType) -> Res<Tensor> {
+pub(crate) fn matmul(
+    a: &Tensor,
+    b: &Tensor,
+    sum: Sum,
+    shape: &[u64],
+    dtype: &DType,
+) -> Res<Tensor> {
     let (m, k) = (a.shape[a.shape.len() - 2], a.shape[a.shape.len() - 1]);
     let nn = b.shape[b.shape.len() - 1];
     let batch: u64 = shape[..shape.len() - 2].iter().product();

@@ -93,6 +93,11 @@ VERBS:
                               derived, droppable module (§07.2)
     graph   migrate <file.omni> -o <out.omni>
                               Apply shipped op-version rewrites (§07.4.1)
+    graph   run <file.omni> --tokens 1,2,3 [--fuel N] [--max-elems N]
+                              Execute the graph over the container's own weights.
+                              Verification says a graph is well-typed; this says
+                              whether it computes anything. An op this build does
+                              not implement is refused by name and exits 3
     plugin  list <file.omni>
                               Embedded plugins (§11.5): what they provide, which
                               modules run under the §11.6 profile
@@ -2804,7 +2809,7 @@ fn cmd_graph(args: &[String]) -> R {
     use omni_core::ir;
     let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let (mode, path) = match sub {
-        "synthesize" | "lower" | "migrate" => (sub, args.get(2)),
+        "synthesize" | "lower" | "migrate" | "run" => (sub, args.get(2)),
         _ => ("show", args.get(1)),
     };
     let Some(path) = path else {
@@ -2864,6 +2869,9 @@ fn cmd_graph(args: &[String]) -> R {
         prr!("      `omni graph synthesize` can build one for a registered family\n");
         return Ok(3);
     };
+    if mode == "run" {
+        return graph_run(&c, &module, args);
+    }
     let shipped = graph_rewrites(&c, &module)?;
 
     match mode {
@@ -3066,6 +3074,192 @@ fn module_digest(c: &Container) -> Result<Digest, Box<dyn std::error::Error>> {
 /// is reused byte for byte, so the weights keep their digests: a model that gains
 /// a graph is the same weights with a new manifest, and §12.6 records that
 /// relationship rather than pretending nothing changed.
+/// `omni graph run` — execute the graph, which is the only way to find out
+/// whether it computes anything.
+///
+/// Verification says a graph is well-typed; §07's claim is that a runtime which
+/// has never heard of the architecture can *execute* it. This verb is that claim,
+/// run against the container's own weights: every `constant` naming a tensor is
+/// resolved through the tensor table, so the graph cannot be fed anything but the
+/// model it ships with.
+fn graph_run(c: &Container, module: &omni_core::ir::Module, args: &[String]) -> R {
+    use omni_core::interp::{run, Limits, Weights};
+
+    /// The container's tensors, materialized on demand. A graph mentions a
+    /// handful of the model's tensors per layer and materializing all of them up
+    /// front would be the opposite of what §04.1 is for.
+    struct TableWeights<'a> {
+        ctx: Ctx<'a>,
+        table: omni_core::tensor::TensorTable,
+        /// Tensors read, and how many of their elements are not finite. A graph
+        /// run over weights that are a byte pattern rather than a trained model
+        /// produces NaN, and that is the right answer — so the reason is counted
+        /// here instead of leaving the caller to wonder whether the interpreter
+        /// is broken.
+        read: std::cell::Cell<(u64, u64, u64)>,
+    }
+    impl Weights for TableWeights<'_> {
+        fn tensor(&self, name: &str) -> Option<omni_core::expr::Tensor> {
+            let r = self.table.get(name)?;
+            let d = omni_core::tensor::TensorDesc::load(&self.ctx, r).ok()?;
+            let t = d.value.eval(&self.ctx).ok()?;
+            let bad = t.data.iter().filter(|v| !v.is_finite()).count() as u64;
+            let (n, elems, nonfinite) = self.read.get();
+            self.read
+                .set((n + 1, elems + t.data.len() as u64, nonfinite + bad));
+            Some(t)
+        }
+    }
+
+    let tokens: Vec<f64> = match flag(args, "--tokens") {
+        Some(list) => list
+            .split(',')
+            .map(|t| t.trim().parse::<f64>())
+            .collect::<Result<Vec<f64>, _>>()
+            .map_err(|e| format!("--tokens: {e}"))?,
+        None => {
+            prr!(
+                "omni: graph run needs --tokens <n,n,…>; a graph's inputs are the \
+                 caller's to supply and inventing them would be measuring nothing\n"
+            );
+            return Ok(2);
+        }
+    };
+    let store = Borrowed(c);
+    let w = TableWeights {
+        ctx: Ctx::new(&store),
+        table: tensor_table(c)?,
+        read: std::cell::Cell::new((0, 0, 0)),
+    };
+    let entry = module.function(&module.entry).ok_or_else(|| {
+        format!(
+            "the module names `{}` as its entry and has no such function",
+            module.entry
+        )
+    })?;
+    // The argument shape comes from the entry function's own declaration, with
+    // the symbolic dimensions filled from what was actually passed.
+    let arg = match entry.params.first().and_then(|(_, t)| t.as_tensor()) {
+        Some((shape, dtype)) => {
+            let mut sizes: Vec<u64> = Vec::with_capacity(shape.len());
+            for (k, d) in shape.iter().enumerate() {
+                sizes.push(match d {
+                    omni_core::expr::Dim::N(n) => *n,
+                    // The last symbolic axis takes the tokens; the rest are 1,
+                    // which is what a single sequence is.
+                    _ if k + 1 == shape.len() => tokens.len() as u64,
+                    _ => 1,
+                });
+            }
+            if sizes.iter().product::<u64>() != tokens.len() as u64 {
+                prr!(
+                    "omni: the entry takes {sizes:?} and {} token(s) were given\n",
+                    tokens.len()
+                );
+                return Ok(2);
+            }
+            omni_core::expr::Tensor::new(sizes, dtype.clone(), tokens)
+        }
+        None => {
+            prr!("omni: the entry function's first parameter is not a tensor\n");
+            return Ok(2);
+        }
+    };
+
+    let limits = Limits {
+        max_elems: flag(args, "--max-elems")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 24),
+        fuel: flag(args, "--fuel")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 22),
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let out = match run(module, &[arg], &w, &limits) {
+        Ok(o) => o,
+        Err(e) => {
+            // An op this build does not implement is not a wrong answer; it is a
+            // refusal to give one, and it exits 3 (indeterminate) rather than 1.
+            prr!("omni: {e}\n");
+            return Ok(match e {
+                omni_core::interp::Error::Unsupported(_) => 3,
+                _ => 1,
+            });
+        }
+    };
+    let elapsed = t0.elapsed();
+
+    pr!("ran {} over {} op(s)", module.entry, commas(out.ops));
+    if !out.dims.is_empty() {
+        pr!(
+            "  dims           {}",
+            out.dims
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+    }
+    pr!("  time           {:.1} ms", elapsed.as_secs_f64() * 1e3);
+    let (tensors, elems, nonfinite) = w.read.get();
+    pr!(
+        "  weights        {} tensor(s), {} element(s)",
+        commas(tensors),
+        commas(elems)
+    );
+    if nonfinite > 0 {
+        // Said plainly rather than left as a surprise in the results: garbage in
+        // is NaN out, and that is arithmetic rather than a bug.
+        pr!(
+            "     non-finite  {} of them — these weights are not a trained model, so \
+             the results below are NaN by arithmetic",
+            commas(nonfinite)
+        );
+    }
+    for (i, t) in out.returned.iter().enumerate() {
+        pr!("  result {i}       {:?} {}", t.shape, t.dtype.label());
+        // The first few values, and the argmax — which for a decoder's logits is
+        // the token it predicts, and the only summary worth printing.
+        let head: Vec<String> = t.data.iter().take(6).map(|v| format!("{v:.5}")).collect();
+        pr!(
+            "     head        [{}{}]",
+            head.join(", "),
+            if t.data.len() > 6 { ", …" } else { "" }
+        );
+        let bad = t.data.iter().filter(|v| !v.is_finite()).count();
+        if bad > 0 {
+            pr!(
+                "     non-finite  {} of {}",
+                commas(bad as u64),
+                commas(t.data.len() as u64)
+            );
+        }
+        if let Some(last) = t.shape.last() {
+            let rows = t.data.len() as u64 / (*last).max(1);
+            if rows > 0 && *last > 1 {
+                let start = ((rows - 1) * *last) as usize;
+                let row = &t.data[start..start + *last as usize];
+                let best = row
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, v)| (i, *v));
+                if let Some((i, v)) = best {
+                    pr!("     argmax      {i} at the last position (score {v:.5})");
+                }
+            }
+        }
+    }
+    for (name, t) in &out.outputs {
+        pr!("  output {name}   {:?}", t.shape);
+    }
+    if !out.debug.is_empty() {
+        pr!("  debug          {}", out.debug.join(", "));
+    }
+    Ok(0)
+}
+
 fn attach_graph(
     c: &Container,
     module: &omni_core::ir::Module,

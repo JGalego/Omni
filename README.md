@@ -100,7 +100,8 @@ The same binary can quantize (`example --quantized`), evaluate tensor
 expressions (`cat`), show what a read costs in real I/O (`open`), plan against a
 runtime's capabilities (`plan`), sign and verify (`sign`), diff two models
 (`delta`), attach adapters (`adapter`), tokenize (`tokenize`), render chat
-templates (`render`), print, verify and lower an execution graph (`graph`), run
+templates (`render`), print, verify, lower and *execute* an execution graph
+(`graph`), run
 an embedded WebAssembly plugin (`plugin`), and separate a training checkpoint
 from the weights it shares (`strip`, `log`, `reshard`), read a container over
 HTTP one range at a time, serve one, or map one onto an OCI registry (`index`,
@@ -188,7 +189,8 @@ The reference implementation covers the container and object model, canonical
 encoding and both mandatory hashes, the tensor expression algebra with its
 typing and range pushdown, quantization and sparsity, compression (including
 `zstd`, the one codec §03 marks MUST), tokenizers and chat templates, adapters
-and deltas, OMNI-IR with its dialects and rewrites, capability negotiation,
+and deltas, OMNI-IR with its dialects and rewrites and an interpreter that runs
+it, capability negotiation,
 signatures, training state, a WebAssembly host for plugins, HTTP range transport
 with the detached index sidecar, an object server and the OCI mapping, and
 lossless safetensors import and export, and PEFT LoRA, GPTQ and AWQ import — the
