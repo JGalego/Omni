@@ -168,6 +168,34 @@ jobs:
             --range 0:64 | grep -q 'bytes 0..32 (32 B)'
           echo "expressions evaluate, and a partial read reads only its part"
 
+      # §10: resolution is a function of the model and the capability set, so a
+      # CI job can answer "will this run on our fleet?" without the fleet.
+      - name: Capability negotiation and planning
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" caps --out /tmp/caps.cbor
+          "$OMNI" example --quantized /tmp/q.omni
+          "$OMNI" plan /tmp/q.omni --caps /tmp/caps.cbor --objective min-memory \
+            | tee /tmp/min.txt | grep -q FEASIBLE
+          "$OMNI" plan /tmp/q.omni --objective max-quality | tee /tmp/max.txt | grep -q FEASIBLE
+          # The two objectives must not agree: the model carries an fp8
+          # realization and a bf16 one, and that is the whole point.
+          if cmp -s /tmp/min.txt /tmp/max.txt; then
+            echo "::error::min-memory and max-quality produced the same plan"; exit 1
+          fi
+          grep -q 'f8e4m3' /tmp/min.txt
+          # A budget nothing fits is an informative failure with an exit code.
+          set +e
+          "$OMNI" plan /tmp/q.omni --memory 1000 >/tmp/tiny.txt; code=$?
+          set -e
+          [ "$code" = "1" ] || { echo "::error::expected infeasible (1), got $code"; exit 1; }
+          grep -q 'remedy' /tmp/tiny.txt
+          # Resolution is deterministic: the same inputs give the same plan key.
+          a=$("$OMNI" plan /tmp/q.omni --caps /tmp/caps.cbor | awk '/plan key/ {print $3}')
+          b=$("$OMNI" plan /tmp/q.omni --caps /tmp/caps.cbor | awk '/plan key/ {print $3}')
+          [ "$a" = "$b" ] || { echo "::error::resolution is not deterministic"; exit 1; }
+          echo "resolution is deterministic, and failure is informative"
+
       # §12.5: a signature is attached to the manifest it signs, and the
       # container still verifies afterwards.
       - name: Signing and V7 verification

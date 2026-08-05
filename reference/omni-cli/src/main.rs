@@ -71,6 +71,10 @@ VERBS:
                               Explode a container into a directory store
     fsck    <file> [--rebuild -o <out.omni>]
                               Diagnose damage; rebuild by segment scan (§02.8)
+    caps    [--out caps.cbor]  Emit this build's CapabilitySet (§10.2)
+    plan    <file> [--caps caps.cbor] [--objective O] [--memory N]
+                              [--optimistic] [--allow-lossy]
+                              Resolve a model against a runtime (§10.5)
     keygen  [--out key.hex] [--seed <hex>]
                               Make an Ed25519 signing key (§12.5.1)
     sign    <file> --key <hex> [-o <out.omni>] [--purpose P] [--counter N]
@@ -114,6 +118,8 @@ fn main() -> ExitCode {
         // `run`, which opens the container first.
         "fsck" => cmd_fsck(&args),
         "example" => cmd_example(&args),
+        "caps" => cmd_caps(&args),
+        "plan" => run(&args, cmd_plan),
         "keygen" => cmd_keygen(&args),
         "sign" => cmd_sign(&args),
         "delta" => cmd_delta(&args),
@@ -1663,6 +1669,129 @@ fn add_quantized_layer(mut b: ModelBuilder) -> ModelBuilder {
         "model.layers.0.attn.q_proj.weight.fp8",
         desc(&w_fp8, DType::F8E4M3, "weight"),
     )
+}
+
+/// `omni caps` — publish what this build can do (§10.2).
+fn cmd_caps(args: &[String]) -> R {
+    let caps = omni_core::plan::Capabilities::reference();
+    let bytes = caps.to_value().encode();
+    match flag(args, "--out") {
+        Some(path) => {
+            std::fs::write(path, &bytes)?;
+            pr!("wrote {path}  {} bytes", bytes.len());
+        }
+        None => pr!("{}", caps.to_value().diag()),
+    }
+    Ok(0)
+}
+
+/// `omni plan` — resolve a model against a runtime's capabilities (§10.5).
+fn cmd_plan(c: &Container, args: &[String]) -> R {
+    use omni_core::plan::{resolve, Capabilities, Objective};
+
+    let mut caps = match flag(args, "--caps") {
+        Some(path) => Capabilities::from_value(&omni_core::cbor::decode(&std::fs::read(path)?)?)?,
+        None => Capabilities::reference(),
+    };
+    if let Some(m) = flag(args, "--memory").and_then(|s| s.parse::<u64>().ok()) {
+        caps.memory_bytes = Some(m);
+    }
+    if args.iter().any(|a| a == "--allow-lossy") {
+        caps.allow_lossy = true;
+    }
+    if args.iter().any(|a| a == "--no-lossy") {
+        caps.allow_lossy = false;
+    }
+    let objective = match flag(args, "--objective") {
+        None => Objective::MinMemory,
+        Some(o) => match Objective::parse(o) {
+            Some(o) => o,
+            None => {
+                prr!("omni: unknown objective `{o}`\n");
+                return Ok(2);
+            }
+        },
+    };
+    let optimistic = args.iter().any(|a| a == "--optimistic");
+
+    let store = Borrowed(c);
+    let ctx = Ctx::new(&store);
+    let manifest = c.root()?;
+    let table = tensor_table(c)?;
+    let plan = resolve(
+        &ctx,
+        &manifest,
+        (otype::MANIFEST, c.header.root_digest),
+        &table,
+        &caps,
+        objective,
+        optimistic,
+    )?;
+
+    pr!(
+        "{}  →  {} {}",
+        std::env::args().nth(2).unwrap_or_default(),
+        caps.runtime_name,
+        caps.runtime_version
+    );
+    pr!("  objective     {}", objective.name());
+    pr!(
+        "  caps digest   {}",
+        short(c.header.hash, &plan.caps_digest)
+    );
+    pr!(
+        "  plan key      {}",
+        short(c.header.hash, &plan.key(c.header.hash))
+    );
+    pr!();
+    if plan.is_feasible() {
+        pr!("FEASIBLE");
+    } else {
+        pr!("INFEASIBLE");
+    }
+    for u in &plan.unmet {
+        pr!("  {u}");
+    }
+    if plan.is_feasible() {
+        pr!(
+            "  ✓ {} tensor(s): {} resident, {} read",
+            plan.tensors.len(),
+            human(plan.resident_bytes),
+            human(plan.read_bytes)
+        );
+        // Group the choices, since a plan for a real model has thousands.
+        let mut by: std::collections::BTreeMap<(String, &'static str), (usize, u64)> =
+            Default::default();
+        for t in &plan.tensors {
+            let e = by
+                .entry((t.dtype.label(), t.materialization.name()))
+                .or_insert((0, 0));
+            e.0 += 1;
+            e.1 += t.resident_bytes;
+        }
+        for ((dtype, how), (n, bytes)) in by {
+            pr!(
+                "    {:<10} {:<20} {:>4} tensors  {:>10}",
+                dtype,
+                how,
+                n,
+                human(bytes)
+            );
+        }
+    }
+    for w in &plan.warnings {
+        pr!("  ⚠ {w}");
+    }
+    if let Some(path) = flag(args, "-o").or_else(|| flag(args, "--out")) {
+        std::fs::write(path, plan.to_value().encode())?;
+        pr!("\nwrote {path}");
+    }
+    // §10.5.2: an infeasible plan is a definite answer, not an error.
+    if plan.is_feasible() {
+        Ok(0)
+    } else {
+        Ok(1)
+    }
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

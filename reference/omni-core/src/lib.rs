@@ -41,6 +41,7 @@ pub mod expr;
 pub mod layout;
 pub mod model;
 pub mod pattern;
+pub mod plan;
 pub mod quant;
 pub mod recover;
 pub mod sha256;

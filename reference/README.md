@@ -26,7 +26,7 @@ $ ./target/release/omni adapter check base.omni lora.omni
 | Crate | Contents | Spec |
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, model builder | §01–§05, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · pack · unpack · fsck · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · pack · unpack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -87,6 +87,9 @@ implemented:
 - §03.7 compression: `raw`, `deflate` (RFC 1951, both directions), `bitshuffle`
   and `bitshuffle+deflate`, with the §03.7.4 decompression bounds; a compressed
   container holds the same object identities as an uncompressed one
+- §10 capability negotiation: capability sets with the three-valued support of
+  §10.2, candidate enumeration, the deterministic resolver of §10.5 under all
+  five objectives, budget retry, and the informative failures of §10.5.2
 - §12.5 signatures: COSE_Sign1 over the §12.5.2 payload, Ed25519, the
   `canonical_digest` of §12.5.3, trust policies (any-of, all-of, k-of-n,
   role-based), validity windows, rollback counters and revocation statements
@@ -96,7 +99,7 @@ implemented:
 What is **not** implemented, and is reported as such rather than faked:
 
 - §07 OMNI-IR · §09 training state
-- §10 capability negotiation · §11 WASM plugins
+- §11 WASM plugins
 - §03.7's `zstd` (a MUST) and the other optional codecs: reported as
   unsupported rather than half-decoded · §13 HTTP/OCI transport
 - `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
@@ -105,7 +108,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-221 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+234 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -160,13 +163,16 @@ rather than invalid; and, for compression, that deflate round-trips at every
 level and is reproducible, that bitshuffle is exactly invertible at any length
 and helps on float weights, that a compressed container holds the same objects
 and digests as an uncompressed one, and that a lying ratio, a back-reference
-before the start of a stream and a tampered compressed object are all refused.
+before the start of a stream and a tampered compressed object are all refused; and, for planning, that the
+objective decides which realization is chosen, that a refused capability is
+never attempted while an unknown one may be, that a dequantizable
+representation needs the scheme, and that resolution is deterministic.
 Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 221 passed; 0 failed
+test result: ok. 234 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
