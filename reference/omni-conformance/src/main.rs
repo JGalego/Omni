@@ -13,6 +13,7 @@
 //! already says.
 
 mod cases;
+mod fuzz;
 
 use cases::{corpus, Case, Expect};
 use omni_core::cbor::Value;
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
         Some("generate") => generate(args.get(1).map(PathBuf::from)),
         Some("run") => run(&args),
         Some("list") => list(),
+        Some("fuzz") => do_fuzz(&args),
         _ => {
             eprintln!(
                 "omni-conformance — OMNI conformance corpus (suite {SUITE_VERSION})\n\
@@ -34,7 +36,8 @@ fn main() -> ExitCode {
                  USAGE:\n\
                  \x20   omni-conformance generate <dir>\n\
                  \x20   omni-conformance run <dir> --impl <command>\n\
-                 \x20   omni-conformance list\n"
+                 \x20   omni-conformance list\n\
+                 \x20   omni-conformance fuzz <dir> [--iterations N] [--seed S] [--out <dir>]\n"
             );
             2
         }
@@ -260,6 +263,24 @@ fn run(args: &[String]) -> u8 {
         println!("suite {SUITE_VERSION}: NOT CONFORMANT ({fail} failed)");
         1
     }
+}
+
+fn do_fuzz(args: &[String]) -> u8 {
+    let Some(dir) = args.get(1).map(PathBuf::from) else {
+        eprintln!("omni-conformance: fuzz needs a corpus directory to seed from");
+        return 2;
+    };
+    let iterations = flag(args, "--iterations")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
+    // Default to a fixed seed. A fuzzer that picks a different seed every run
+    // finds more over time but makes CI flaky and failures unreproducible;
+    // pass --seed to explore.
+    let seed = flag(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let out = flag(args, "--out").map(PathBuf::from);
+    fuzz::run(&dir, iterations, seed, out.as_deref())
 }
 
 fn expected_code(e: Expect) -> &'static str {

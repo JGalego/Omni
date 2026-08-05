@@ -1,0 +1,36 @@
+[package]
+name = "omni-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+omni-core = { path = "../omni-core" }
+
+[[bin]]
+name = "container_open"
+path = "fuzz_targets/container_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cbor_decode"
+path = "fuzz_targets/cbor_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recover"
+path = "fuzz_targets/recover.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

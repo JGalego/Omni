@@ -215,6 +215,24 @@ jobs:
           reference/target/release/omni-conformance run conformance \
             --impl reference/target/release/omni
 
+      # Coverage-guided fuzzing needs nightly and cannot gate every push
+      # (see reference/fuzz/README.md). This is the part that can: a seeded,
+      # dependency-free mutator, reproducible from its seed when it fails.
+      - name: Mutation fuzzing finds no crashes
+        run: |
+          for seed in 1 2 3; do
+            reference/target/release/omni-conformance fuzz conformance \
+              --iterations 400000 --seed $seed --out /tmp/fuzz-findings
+          done
+
+      - name: Upload fuzz findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: /tmp/fuzz-findings
+          if-no-files-found: ignore
+
   docs:
     name: docs
     runs-on: ubuntu-latest

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["omni-core", "omni-cli", "omni-conformance"]
+# Needs nightly and pulls in libfuzzer-sys; see fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

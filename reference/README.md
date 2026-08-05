@@ -19,7 +19,8 @@ $ ./target/release/omni verify  model.omni
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, model builder | §01–§04, §13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · pack · unpack · fsck · example` | design/cli.md |
-| `omni-conformance` | corpus generator and cross-implementation test runner | §15.3 |
+| `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
+| `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
 ## Deliberate constraints
 
