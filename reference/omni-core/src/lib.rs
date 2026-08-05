@@ -31,6 +31,7 @@ pub mod adapter;
 pub mod bao;
 pub mod blake3;
 pub mod cbor;
+pub mod codec;
 pub mod container;
 pub mod crc32c;
 pub mod delta;

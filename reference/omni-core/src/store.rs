@@ -140,6 +140,7 @@ impl MemoryStore {
                 otype: types.get(d).copied().unwrap_or(otype::BLOB),
                 payload: payload.clone(),
                 oflags: crate::container::oflags::CRITICAL | crate::container::oflags::SAFE_TO_COPY,
+                stored: None,
             })
             .collect()
     }
@@ -207,8 +208,10 @@ impl Store for ContainerStore {
     }
 
     fn resolve(&self, d: &Digest) -> Res<Option<Vec<u8>>> {
-        match self.inner.get(d) {
-            Ok(b) => Ok(Some(b.to_vec())),
+        // `read` rather than `get`: a compressed copy is still the same object,
+        // and a store's callers should not have to know how it was packed.
+        match self.inner.read(d) {
+            Ok(b) => Ok(Some(b)),
             // A digest that is not in the index is absent, not an error; a
             // digest that is in the index but fails to verify is corruption
             // and must not be quietly reported as absence.
@@ -701,6 +704,7 @@ mod tests {
                 otype: *t,
                 payload: d.resolve(dig).unwrap().unwrap(),
                 oflags: oflags::CRITICAL | oflags::SAFE_TO_COPY,
+                stored: None,
             })
             .collect();
         let rebuilt = pack(
@@ -720,6 +724,7 @@ mod tests {
                     otype: e.otype,
                     payload: src.resolve(&e.digest).unwrap().unwrap(),
                     oflags: e.oflags,
+                    stored: None,
                 })
                 .collect::<Vec<_>>(),
             &root,

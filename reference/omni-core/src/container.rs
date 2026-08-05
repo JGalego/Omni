@@ -274,6 +274,8 @@ pub enum Error {
     Rule(&'static str, String),
     Cbor(cbor::Error),
     NotFound(String),
+    /// A codec problem: unsupported, malformed, or over a §03.7.4 bound.
+    Codec(String),
 }
 
 impl std::fmt::Display for Error {
@@ -282,6 +284,7 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Rule(id, msg) => write!(f, "{id}: {msg}"),
             Error::Cbor(e) => write!(f, "cbor: {e}"),
+            Error::Codec(m) => write!(f, "codec: {m}"),
             Error::NotFound(d) => write!(f, "object not found: {d}"),
         }
     }
@@ -292,6 +295,12 @@ impl From<std::io::Error> for Error {
         Error::Io(e)
     }
 }
+impl From<crate::codec::Error> for Error {
+    fn from(e: crate::codec::Error) -> Self {
+        Error::Codec(e.to_string())
+    }
+}
+
 impl From<cbor::Error> for Error {
     fn from(e: cbor::Error) -> Self {
         Error::Cbor(e)
@@ -315,16 +324,59 @@ fn round_up(n: usize, a: usize) -> usize {
 #[derive(Clone)]
 pub struct Object {
     pub otype: u16,
+    /// The object's *logical* bytes. Digests are over these, always (§03.5.2),
+    /// which is why recompressing a container changes no identities.
     pub payload: Vec<u8>,
     pub oflags: u8,
+    /// The stored form, when this copy is compressed: the codec id and the
+    /// compressed bytes. Compression is a property of a stored copy, never of
+    /// the object (§01.2).
+    pub stored: Option<(u8, Vec<u8>)>,
 }
 
 impl Object {
+    /// The bytes this copy occupies in a container.
+    pub fn stored_bytes(&self) -> &[u8] {
+        match &self.stored {
+            Some((_, b)) => b,
+            None => &self.payload,
+        }
+    }
+
+    /// The codec id of this stored copy.
+    pub fn codec_id(&self) -> u8 {
+        match &self.stored {
+            Some((c, _)) => *c,
+            None => crate::codec::id::RAW,
+        }
+    }
+
+    /// Returns this object with a compressed stored form. Keeps whichever
+    /// encoding is smaller: a codec that expands an object is not a
+    /// compression, and storing the expansion would be strictly worse.
+    pub fn compressed(
+        mut self,
+        codec: &crate::codec::Codec,
+    ) -> Result<Object, crate::codec::Error> {
+        if matches!(codec, crate::codec::Codec::Raw) {
+            self.stored = None;
+            return Ok(self);
+        }
+        let bytes = codec.encode(&self.payload)?;
+        if bytes.len() < self.payload.len() {
+            self.stored = Some((codec.id(), bytes));
+        } else {
+            self.stored = None;
+        }
+        Ok(self)
+    }
+
     pub fn structure(otype: u16, v: &Value) -> Object {
         Object {
             otype,
             payload: v.encode(),
             oflags: oflags::CRITICAL | oflags::SAFE_TO_COPY,
+            stored: None,
         }
     }
 
@@ -333,6 +385,7 @@ impl Object {
             otype: otype::BLOB,
             payload,
             oflags: oflags::CRITICAL | oflags::SAFE_TO_COPY,
+            stored: None,
         }
     }
 
@@ -352,6 +405,10 @@ pub struct PackOptions {
     pub reproducible: bool,
     /// The container's primary digest algorithm (§03.5.1).
     pub hash: HashAlgo,
+    /// Codec for data objects (§03.7). Structure objects stay `raw`: they are
+    /// tiny, they are on the parse hot path, and §03.1 already keeps tensor
+    /// payloads out of them.
+    pub codec: crate::codec::Codec,
 }
 
 impl Default for PackOptions {
@@ -361,6 +418,7 @@ impl Default for PackOptions {
             creator: format!("omni-rs/{}", env!("CARGO_PKG_VERSION")),
             reproducible: true,
             hash: HashAlgo::default(),
+            codec: crate::codec::Codec::Raw,
         }
     }
 }
@@ -370,7 +428,11 @@ struct Placed {
     otype: u16,
     oflags: u8,
     offset: u64,
+    /// Stored length: what the file holds.
     len: u64,
+    /// Logical length: what the digest covers.
+    logical: u64,
+    codec: u8,
 }
 
 /// Packs an object set into a sealed `core`-profile container.
@@ -389,6 +451,20 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     let mut uniq: BTreeMap<(u16, Digest), &Object> = BTreeMap::new();
     for o in objects {
         uniq.insert((o.otype, o.digest(opts.hash)), o);
+    }
+    // Apply the requested codec to data objects that do not already carry a
+    // stored form. Digests are unaffected, so a compressed container dedups
+    // against an uncompressed one object for object (§01.2).
+    let compressed: Vec<Object> = if matches!(opts.codec, crate::codec::Codec::Raw) {
+        Vec::new()
+    } else {
+        uniq.values()
+            .filter(|o| o.otype == otype::BLOB && o.stored.is_none())
+            .map(|o| (*o).clone().compressed(&opts.codec))
+            .collect::<Result<Vec<Object>, crate::codec::Error>>()?
+    };
+    for c in &compressed {
+        uniq.insert((c.otype, c.digest(opts.hash)), c);
     }
     let ordered: Vec<&Object> = uniq.values().copied().collect();
     let (blobs, structs): (Vec<&Object>, Vec<&Object>) =
@@ -456,7 +532,8 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
             .find(|o| o.digest(opts.hash) == p.digest && o.otype == p.otype)
             .expect("placed object exists");
         let rel = p.offset as usize - layout.obj_payload_off;
-        obj_payload[rel..rel + o.payload.len()].copy_from_slice(&o.payload);
+        let b = o.stored_bytes();
+        obj_payload[rel..rel + b.len()].copy_from_slice(b);
     }
     write_segment(&mut out, layout.obj_hdr_off, seg::OBJ, 1, &obj_payload);
 
@@ -471,7 +548,8 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
             .find(|o| o.digest(opts.hash) == p.digest && o.otype == otype::BLOB)
             .expect("placed blob exists");
         let rel = p.offset as usize - layout.blob_payload_off;
-        blob_payload[rel..rel + o.payload.len()].copy_from_slice(&o.payload);
+        let b = o.stored_bytes();
+        blob_payload[rel..rel + b.len()].copy_from_slice(b);
     }
     write_segment(&mut out, layout.blob_hdr_off, seg::BLOB, 3, &blob_payload);
 
@@ -540,9 +618,11 @@ fn compute_layout(
             otype: o.otype,
             oflags: o.oflags,
             offset: (obj_payload_off + rel) as u64,
-            len: o.payload.len() as u64,
+            len: o.stored_bytes().len() as u64,
+            logical: o.payload.len() as u64,
+            codec: o.codec_id(),
         });
-        rel += o.payload.len();
+        rel += o.stored_bytes().len();
     }
     let obj_payload_len = rel;
     off = obj_payload_off + obj_payload_len;
@@ -576,9 +656,11 @@ fn compute_layout(
             otype: otype::BLOB,
             oflags: o.oflags,
             offset: (blob_payload_off + rel) as u64,
-            len: o.payload.len() as u64,
+            len: o.stored_bytes().len() as u64,
+            logical: o.payload.len() as u64,
+            codec: o.codec_id(),
         });
-        rel += o.payload.len();
+        rel += o.stored_bytes().len();
     }
     let blob_payload_len = rel;
     off = blob_payload_off + blob_payload_len;
@@ -668,9 +750,9 @@ fn build_index(l: &Layout, algo: HashAlgo) -> Vec<u8> {
         out[b..b + 32].copy_from_slice(&e.digest);
         out[b + 32..b + 40].copy_from_slice(&e.offset.to_le_bytes());
         out[b + 40..b + 48].copy_from_slice(&e.len.to_le_bytes()); // stored_len
-        out[b + 48..b + 56].copy_from_slice(&e.len.to_le_bytes()); // logical_len (codec=raw)
+        out[b + 48..b + 56].copy_from_slice(&e.logical.to_le_bytes());
         out[b + 56..b + 58].copy_from_slice(&e.otype.to_le_bytes());
-        out[b + 58] = 0; // codec: raw
+        out[b + 58] = e.codec;
         out[b + 59] = e.oflags;
         out[b + 60..b + 64].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // no aux
     }
@@ -896,25 +978,75 @@ impl Container {
     }
 
     /// Returns an object's bytes, verifying its digest (verification level L1).
+    /// An object's logical bytes, borrowed. Only possible for an uncompressed
+    /// copy; a compressed one has to be materialized, so use [`Container::read`]
+    /// when the codec is not known to be `raw`.
     pub fn get(&self, d: &Digest) -> Res<&[u8]> {
-        let e = self.find(d).ok_or_else(|| Error::NotFound(hex(d)))?;
-        if e.oflags & oflags::EXTERNAL != 0 {
-            return Err(Error::NotFound(format!("{} (external)", hex(d))));
+        let e = self.entry(d)?;
+        if e.codec != crate::codec::id::RAW {
+            return Err(Error::Codec(format!(
+                "{} is stored with codec {} and cannot be borrowed; use `read`",
+                hex(d),
+                crate::codec::Codec::from_id(e.codec).name()
+            )));
         }
-        let s = e.offset as usize;
-        let n = e.stored_len as usize;
-        if s.checked_add(n).is_none_or(|x| x > self.bytes.len()) {
-            return Err(rule("R-C12", "object extent out of range"));
-        }
-        let payload = &self.bytes[s..s + n];
+        let payload = self.stored_slice(e)?;
         if self.header.hash.digest(payload) != *d {
             return Err(rule("R-O01", format!("digest mismatch for {}", hex(d))));
         }
         Ok(payload)
     }
 
+    /// An object's logical bytes, decompressing if this copy is compressed.
+    ///
+    /// The digest is checked over the *logical* bytes, which is what §03.5.2
+    /// says it covers — so a corrupted compressed stream that happens to inflate
+    /// to something is still caught.
+    pub fn read(&self, d: &Digest) -> Res<Vec<u8>> {
+        let e = self.entry(d)?;
+        let stored = self.stored_slice(e)?;
+        let codec = crate::codec::Codec::from_id(e.codec);
+        let logical = match codec {
+            crate::codec::Codec::Raw => stored.to_vec(),
+            other => other.decode(stored, e.logical_len, self.high_ratio())?,
+        };
+        if self.header.hash.digest(&logical) != *d {
+            return Err(rule("R-O01", format!("digest mismatch for {}", hex(d))));
+        }
+        Ok(logical)
+    }
+
+    fn entry(&self, d: &Digest) -> Res<&IndexEntry> {
+        let e = self.find(d).ok_or_else(|| Error::NotFound(hex(d)))?;
+        if e.oflags & oflags::EXTERNAL != 0 {
+            return Err(Error::NotFound(format!("{} (external)", hex(d))));
+        }
+        Ok(e)
+    }
+
+    fn stored_slice(&self, e: &IndexEntry) -> Res<&[u8]> {
+        let s = e.offset as usize;
+        let n = e.stored_len as usize;
+        if s.checked_add(n).is_none_or(|x| x > self.bytes.len()) {
+            return Err(rule("R-C12", "object extent out of range"));
+        }
+        Ok(&self.bytes[s..s + n])
+    }
+
+    /// Whether the container declares the high-ratio codec feature (§03.7.4).
+    pub fn high_ratio(&self) -> bool {
+        self.superblock
+            .get("features")
+            .and_then(|f| f.get("optional"))
+            .and_then(|o| o.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|x| x.as_str() == Some(crate::codec::HIGH_RATIO_FEATURE))
+            })
+    }
+
     pub fn get_value(&self, d: &Digest) -> Res<Value> {
-        Ok(cbor::decode(self.get(d)?)?)
+        Ok(cbor::decode(&self.read(d)?)?)
     }
 
     pub fn root(&self) -> Res<Value> {
@@ -1166,7 +1298,7 @@ pub fn verify(c: &Container) -> Res<Report> {
         if e.oflags & oflags::EXTERNAL != 0 {
             continue;
         }
-        c.get(&e.digest)?;
+        c.read(&e.digest)?;
         objects_verified += 1;
         bytes_verified += e.stored_len;
     }
@@ -1242,6 +1374,157 @@ pub fn collect_refs(v: &Value, out: &mut Vec<Digest>) {
 
 #[cfg(test)]
 mod tests {
+    // Compression tests live here rather than in `codec` because what matters
+    // is the container-level invariant of §01.2: a compressed copy is the same
+    // object.
+    mod compression {
+        use super::super::*;
+        use crate::codec::Codec;
+
+        /// A model with a compressible payload: repetitive bytes, as a real
+        /// tensor's exponent bytes are.
+        fn objects() -> (Vec<Object>, Digest) {
+            let data: Vec<u8> = std::iter::repeat_n([0x3f, 0x80, 0x00, 0x00], 4096)
+                .flatten()
+                .collect();
+            crate::model::ModelBuilder::new("test/compressible")
+                .chunk_size(1 << 20)
+                .tensor(crate::model::TensorSpec {
+                    name: "w".into(),
+                    shape: vec![64, 64],
+                    dtype: crate::dtype::DType::F32,
+                    axes: None,
+                    semantic: "weight",
+                    data,
+                })
+                .build()
+        }
+
+        #[test]
+        fn a_compressed_container_holds_the_same_objects() {
+            let (objs, root) = objects();
+            let raw = pack(&objs, &root, &PackOptions::default()).unwrap();
+            let deflated = pack(
+                &objs,
+                &root,
+                &PackOptions {
+                    codec: Codec::Deflate { level: 9 },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Smaller on disk. Not dramatically so at this size: alignment
+            // padding and the index dominate a 16 KB model, which is itself a
+            // fair illustration of §03.7's guidance about where the size wins
+            // in OMNI actually come from.
+            assert!(
+                deflated.len() < raw.len(),
+                "{} vs {}",
+                deflated.len(),
+                raw.len()
+            );
+            let a = Container::open(raw).unwrap();
+            let b = Container::open(deflated).unwrap();
+            // ...same root, same object identities, same bytes read back.
+            assert_eq!(a.header.root_digest, b.header.root_digest);
+            assert_eq!(a.index.len(), b.index.len());
+            for e in &a.index {
+                assert_eq!(a.read(&e.digest).unwrap(), b.read(&e.digest).unwrap());
+            }
+            // The data object really is stored compressed, and says so.
+            let blob = b
+                .index
+                .iter()
+                .find(|e| e.otype == otype::BLOB)
+                .expect("a data object");
+            assert_eq!(blob.codec, crate::codec::id::DEFLATE);
+            assert!(
+                blob.stored_len * 50 < blob.logical_len,
+                "{} vs {}",
+                blob.stored_len,
+                blob.logical_len
+            );
+            // And it verifies: the digest covers the logical bytes.
+            let r = verify(&b).unwrap();
+            assert!(r.dangling.is_empty());
+            assert!(r.padding_ok && r.alignment_ok);
+        }
+
+        #[test]
+        fn borrowing_a_compressed_object_is_refused_rather_than_wrong() {
+            let (objs, root) = objects();
+            let c = Container::open(
+                pack(
+                    &objs,
+                    &root,
+                    &PackOptions {
+                        codec: Codec::Deflate { level: 6 },
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let blob = c.index.iter().find(|e| e.otype == otype::BLOB).unwrap();
+            assert!(matches!(c.get(&blob.digest), Err(Error::Codec(_))));
+            assert!(c.read(&blob.digest).is_ok());
+            // Structure objects stay raw and can still be borrowed.
+            let manifest = c.index.iter().find(|e| e.otype == otype::MANIFEST).unwrap();
+            assert!(c.get(&manifest.digest).is_ok());
+        }
+
+        #[test]
+        fn a_codec_that_would_expand_an_object_is_not_used() {
+            // Incompressible data: keeping the compressed form would make the
+            // file bigger for nothing.
+            let data: Vec<u8> = (0..4096u64)
+                .map(|i| (crate::expr::uniform01(0xc0de_beef_0000_0001, i) * 256.0) as u8)
+                .collect();
+            let o = Object::blob(data)
+                .compressed(&Codec::Deflate { level: 9 })
+                .unwrap();
+            assert!(o.stored.is_none());
+            assert_eq!(o.codec_id(), crate::codec::id::RAW);
+        }
+
+        #[test]
+        fn an_unimplemented_codec_fails_the_pack_rather_than_silently_storing_raw() {
+            let (objs, root) = objects();
+            let r = pack(
+                &objs,
+                &root,
+                &PackOptions {
+                    codec: Codec::Unsupported("zstd"),
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(r, Err(Error::Codec(_))));
+        }
+
+        #[test]
+        fn tampering_with_a_compressed_stream_is_caught() {
+            let (objs, root) = objects();
+            let mut bytes = pack(
+                &objs,
+                &root,
+                &PackOptions {
+                    codec: Codec::Deflate { level: 9 },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let c = Container::open(bytes.clone()).unwrap();
+            let blob = c.index.iter().find(|e| e.otype == otype::BLOB).unwrap();
+            let at = blob.offset as usize + 4;
+            bytes[at] ^= 0xff;
+            let c = Container::open(bytes).unwrap();
+            // Either the stream no longer inflates, or it inflates to something
+            // whose digest is wrong. Both are errors; neither is silence.
+            assert!(c.read(&blob.digest).is_err());
+            assert!(verify(&c).is_err());
+        }
+    }
+
     use super::*;
 
     /// Every container-level test runs under both mandatory algorithms

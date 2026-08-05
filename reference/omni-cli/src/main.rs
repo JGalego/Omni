@@ -754,6 +754,7 @@ fn cmd_pack(args: &[String]) -> R {
                 otype: *t,
                 payload: b.expect("walk found it a moment ago"),
                 oflags: 0b0100_0001, // CRITICAL | SAFE_TO_COPY
+                stored: None,
             })
         })
         .collect();

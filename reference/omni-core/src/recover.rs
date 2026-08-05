@@ -209,6 +209,7 @@ pub fn recover(bytes: &[u8]) -> Result<Recovery, Error> {
             otype: t,
             payload,
             oflags: oflags::CRITICAL | oflags::SAFE_TO_COPY,
+            stored: None,
         });
     }
     missing.sort_unstable();

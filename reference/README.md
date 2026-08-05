@@ -76,6 +76,9 @@ implemented:
   R-A01–R-A03, the eight arithmetic methods built from core nodes, graph-level
   methods carried as rewrites, composition, the six delta representations with
   measured error, and parent chains with R-O06
+- §03.7 compression: `raw`, `deflate` (RFC 1951, both directions), `bitshuffle`
+  and `bitshuffle+deflate`, with the §03.7.4 decompression bounds; a compressed
+  container holds the same object identities as an uncompressed one
 - §12.5 signatures: COSE_Sign1 over the §12.5.2 payload, Ed25519, the
   `canonical_digest` of §12.5.3, trust policies (any-of, all-of, k-of-n,
   role-based), validity windows, rollback counters and revocation statements
@@ -86,14 +89,15 @@ What is **not** implemented, and is reported as such rather than faked:
 
 - §07 OMNI-IR · §09 training state
 - §10 capability negotiation · §11 WASM plugins
-- §03.7 compression codecs (only `raw`) · §13 HTTP/OCI transport
+- §03.7's `zstd` (a MUST) and the other optional codecs: reported as
+  unsupported rather than half-decoded · §13 HTTP/OCI transport
 - `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
 
 See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-205 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+221 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -144,12 +148,17 @@ tampered signature are all refused; and, for §12.5, that attaching a signature
 to the manifest it signs does not invalidate it, that the canonical digest
 ignores caches but not assets, that a signature over another model does not
 transfer, and that an unknown key or an unimplemented algorithm is indeterminate
-rather than invalid. Every
+rather than invalid; and, for compression, that deflate round-trips at every
+level and is reproducible, that bitshuffle is exactly invertible at any length
+and helps on float weights, that a compressed container holds the same objects
+and digests as an uncompressed one, and that a lying ratio, a back-reference
+before the start of a stream and a tampered compressed object are all refused.
+Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 205 passed; 0 failed
+test result: ok. 221 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -71,6 +71,7 @@ fn base(hash: HashAlgo, align: u8) -> (Vec<u8>, Vec<Object>, Digest) {
         log2_align: align,
         creator: "omni-conformance".into(),
         reproducible: true,
+        ..Default::default()
     };
     (pack(&objs, &root, &opts).unwrap(), objs, root)
 }
@@ -465,6 +466,7 @@ fn container_with_raw_root(payload: Vec<u8>) -> Vec<u8> {
         otype: otype::MANIFEST,
         payload,
         oflags: oflags::CRITICAL | oflags::SAFE_TO_COPY,
+        stored: None,
     };
     let root = obj.digest(hash);
     pack(
@@ -615,6 +617,7 @@ fn forward() -> Vec<Case> {
         ])
         .encode(),
         oflags: oflags::SAFE_TO_COPY, // not CRITICAL
+        stored: None,
     };
     let fd = future.digest(hash);
     let manifest = Object::structure(
