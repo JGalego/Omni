@@ -168,6 +168,34 @@ jobs:
             --range 0:64 | grep -q 'bytes 0..32 (32 B)'
           echo "expressions evaluate, and a partial read reads only its part"
 
+      # §06.7: a tokenizer that changed during conversion is a silent quality
+      # regression everywhere else. Here it is a build failure.
+      - name: The tokenizer is checked, not trusted
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --tokenizer /tmp/tok.omni
+          "$OMNI" verify /tmp/tok.omni --tokenizer | tee /tmp/tokv.txt
+          grep -q '5/5 vectors pass' /tmp/tokv.txt
+          # §06.7's vocabulary/embedding agreement: a truncated conversion shows
+          # up here rather than as garbage logits.
+          grep -q 'vocabulary matches' /tmp/tokv.txt
+          "$OMNI" inspect /tmp/tok.omni | grep -q 'tokenizer     bpe · 256 tokens'
+          # An independent oracle: the ids of a byte-level tokenizer are the
+          # UTF-8 bytes of the input. Computed here from the definition, not by
+          # asking the encoder what it thinks.
+          want=$(python3 -c "print(','.join(str(b) for b in 'Héllo, world!'.encode()))")
+          got=$("$OMNI" tokenize /tmp/tok.omni --text 'Héllo, world!' | sed -n 2p)
+          [ "$want" = "$got" ] || { echo "ids $got != $want"; exit 1; }
+          "$OMNI" tokenize /tmp/tok.omni --text 'Héllo, world!' | grep -q '; round-trips'
+          # `;` lines are comments, as in `omni cat`; the last line is the datum.
+          [ "$("$OMNI" tokenize /tmp/tok.omni --ids "$want" | tail -n 1)" = 'Héllo, world!' ]
+          # A container with no tokenizer is indeterminate and incomplete, never
+          # "valid, no tokenizer problems" (§15.1).
+          "$OMNI" example /tmp/plain.omni
+          "$OMNI" verify /tmp/plain.omni --tokenizer; test $? = 3
+          "$OMNI" tokenize /tmp/plain.omni --text hi; test $? = 5
+          echo "the tokenizer reproduces its own vectors, and refuses when it cannot"
+
       # §10: resolution is a function of the model and the capability set, so a
       # CI job can answer "will this run on our fleet?" without the fleet.
       - name: Capability negotiation and planning

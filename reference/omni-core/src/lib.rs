@@ -50,6 +50,7 @@ pub mod sign;
 pub mod sparse;
 pub mod store;
 pub mod tensor;
+pub mod tokenizer;
 
 pub use bao::BaoTree;
 pub use blake3::blake3 as blake3_256;

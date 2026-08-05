@@ -39,6 +39,11 @@ pub struct ModelBuilder {
     /// Objects the caller stored directly — the chunks and chunk lists behind
     /// the literals inside `derived` expressions.
     pub extra_objects: Vec<Object>,
+    /// Extra manifest assets beyond `model`, as (slot name, object type,
+    /// value): a tokenizer, a chat template. Each becomes an object plus an
+    /// `assets` entry, which is how a reader finds it without a full walk
+    /// (§03.4).
+    pub assets: Vec<(String, u16, Value)>,
     /// The digest algorithm the resulting container will use. Object
     /// identities depend on it, so it has to be fixed before the graph is
     /// built rather than at pack time.
@@ -57,6 +62,7 @@ impl ModelBuilder {
             extra: Vec::new(),
             derived: Vec::new(),
             extra_objects: Vec::new(),
+            assets: Vec::new(),
             hash: HashAlgo::default(),
         }
     }
@@ -140,6 +146,12 @@ impl ModelBuilder {
         let d = chunklist.digest(self.hash);
         self.extra_objects.push(chunklist);
         (otype::CHUNK_LIST, d)
+    }
+
+    /// Adds a manifest asset: an object reachable from `assets` under `slot`.
+    pub fn asset(mut self, slot: impl Into<String>, otype: u16, value: Value) -> Self {
+        self.assets.push((slot.into(), otype, value));
+        self
     }
 
     /// Adds a tensor whose value is an expression. The descriptor is stored as
@@ -360,6 +372,24 @@ impl ModelBuilder {
         let meta_digest = meta.digest(self.hash);
         objects.push(meta);
 
+        // Assets: the model, plus whatever else the caller attached.
+        let mut asset_entries: Vec<(Value, Value)> = vec![(
+            Value::text("model"),
+            Value::Array(vec![
+                Value::U(otype::MODEL as u64),
+                Value::Bytes(model_digest.to_vec()),
+            ]),
+        )];
+        for (slot, ot, value) in &self.assets {
+            let obj = Object::structure(*ot, value);
+            let d = obj.digest(self.hash);
+            objects.push(obj);
+            asset_entries.push((
+                Value::text(slot.clone()),
+                Value::Array(vec![Value::U(*ot as u64), Value::Bytes(d.to_vec())]),
+            ));
+        }
+
         let manifest = Object::structure(
             otype::MANIFEST,
             &Value::map(vec![
@@ -374,16 +404,7 @@ impl ModelBuilder {
                         Value::Bytes(meta_digest.to_vec()),
                     ]),
                 ),
-                (
-                    "assets",
-                    Value::map(vec![(
-                        "model",
-                        Value::Array(vec![
-                            Value::U(otype::MODEL as u64),
-                            Value::Bytes(model_digest.to_vec()),
-                        ]),
-                    )]),
-                ),
+                ("assets", Value::Map(asset_entries)),
                 ("entry", Value::text("model")),
                 (
                     "features",

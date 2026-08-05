@@ -19,14 +19,17 @@ $ ./target/release/omni sign model.omni --key <seed-hex> -o signed.omni
 $ ./target/release/omni sign --verify signed.omni --key <public-hex>
 $ ./target/release/omni delta base.omni tuned.omni -o delta.omni
 $ ./target/release/omni adapter check base.omni lora.omni
+$ ./target/release/omni example --tokenizer tok.omni
+$ ./target/release/omni verify tok.omni --tokenizer     # runs its §06.7.1 vectors
+$ ./target/release/omni tokenize tok.omni --text "hello"
 ```
 
 ## What is here
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, model builder | §01–§05, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · pack · unpack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, model builder | §01–§06, §13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · pack · unpack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -93,12 +96,20 @@ implemented:
 - §12.5 signatures: COSE_Sign1 over the §12.5.2 payload, Ed25519, the
   `canonical_digest` of §12.5.3, trust policies (any-of, all-of, k-of-n,
   role-based), validity windows, rollback counters and revocation statements
+- §06.7 the tokenizer IR: read structurally — the vocabulary as a string tensor,
+  the merges as `u32` id pairs — with `encode`/`decode` for the bpe, wordpiece,
+  unigram, wordlevel, char and byte kinds, the normalizer, pre-tokenizer and
+  decoder pipelines, the template postprocessor, and the §06.7.1 conformance
+  vectors run by `omni verify --tokenizer`. A step this build cannot honour —
+  a plugin kind (§06.7.2), NFC composition, or a `regex-split` pattern needing
+  Unicode property classes — makes encoding *indeterminate* rather than
+  silently producing different token ids
 - §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
   reached through `omni sign --verify`
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §07 OMNI-IR · §09 training state
+- §06.9 chat templates · §07 OMNI-IR · §09 training state
 - §11 WASM plugins
 - §03.7's `zstd` (a MUST) and the other optional codecs: reported as
   unsupported rather than half-decoded · §13 HTTP/OCI transport
@@ -108,7 +119,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-234 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+250 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -166,13 +177,23 @@ and digests as an uncompressed one, and that a lying ratio, a back-reference
 before the start of a stream and a tampered compressed object are all refused; and, for planning, that the
 objective decides which realization is chosen, that a refused capability is
 never attempted while an unknown one may be, that a dequantizable
-representation needs the scheme, and that resolution is deterministic.
+representation needs the scheme, and that resolution is deterministic; and, for
+the tokenizer, that BPE applies merges in priority order rather than
+left-to-right, that added tokens are matched before normalization, that a merge
+naming a token the vocabulary does not contain is an error, that the byte-level
+mapping round-trips all 256 bytes, that WordPiece takes the longest match and
+WordPiece and Unigram agree with their own definitions, that a conformance
+vector which disagrees is a failure rather than a warning, and that an
+unimplemented pre-tokenizer step refuses to encode instead of guessing; and that
+an unimplemented regex escape — `\p{L}` above all — is a parse error rather
+than the literal letter, because reading `\p` as `p` matches a different
+language without saying so.
 Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 234 passed; 0 failed
+test result: ok. 250 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -55,7 +55,9 @@ USAGE:
 
 VERBS:
     inspect <file>            Summarize a container without reading tensor payloads
-    verify  <file> [--level N]  Validate (V0-V6); exit 1 invalid, 3 indeterminate
+    verify  <file> [--level N] [--tokenizer]
+                              Validate (V0-V6); exit 1 invalid, 3 indeterminate;
+                              --tokenizer also runs its conformance vectors
     ls      <file>            List objects in the index
     dump    <file> --header   Annotated hexdump of the 128-byte file header
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
@@ -65,6 +67,8 @@ VERBS:
                               layers another container (a delta's parent)
     deps    <file> --tensor <name> [--range A:B]
                               What a (partial) read of that tensor must fetch
+    tokenize <file> --text <string> | --ids <a,b,c>
+                              Encode or decode with the container's tokenizer
     pack    <dir.omnid> -o <file.omni> [--align N]
                               Build a container from a directory store
     unpack  <file.omni> -o <dir.omnid>
@@ -88,12 +92,15 @@ VERBS:
     adapter check <base.omni> <adapter.omni>
                               Validate attachment before loading weights (§08.3)
     example <out.omni> [--hash blake3|sha256] [--quantized] [--tune N]
+                              [--tokenizer]
                               Build a small but complete example container;
                               --quantized exercises the value layer (int4 +
                               per-group scales + a LoRA, all as expressions);
                               --tune N fills the weights with plausible values
                               and, for N > 0, applies a seeded rank-1 update —
-                              two containers that differ by a fine-tune
+                              two containers that differ by a fine-tune;
+                              --tokenizer attaches a byte-level tokenizer with
+                              conformance vectors
 
 EXIT CODES (docs/design/cli.md §10):
     0 ok · 1 invalid · 2 usage · 3 indeterminate · 5 incomplete
@@ -112,6 +119,7 @@ fn main() -> ExitCode {
         "dump" => run(&args, cmd_dump),
         "cat" => run(&args, cmd_cat),
         "deps" => run(&args, cmd_deps),
+        "tokenize" => run(&args, cmd_tokenize),
         "pack" => cmd_pack(&args),
         "unpack" => cmd_unpack(&args),
         // fsck must work on files that do not open, so it does not go through
@@ -530,14 +538,6 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
         }
     );
     pr!(
-        "tokenizer     {}",
-        if c.index.iter().any(|e| e.otype == otype::TOKENIZER) {
-            "present"
-        } else {
-            "(not present)"
-        }
-    );
-    pr!(
         "adapters      {}",
         if adapters == 0 {
             "none".to_string()
@@ -545,6 +545,30 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
             format!("{adapters}")
         }
     );
+    // The tokenizer, from the manifest asset rather than a graph walk (§06.12).
+    {
+        let store = Borrowed(c);
+        let ctx = Ctx::new(&store);
+        match tokenizer_of(c, &ctx) {
+            Ok(Some(t)) => {
+                let vectors = match t.vectors {
+                    Some(_) => "with conformance vectors",
+                    None => "no conformance vectors (§06.7.1 SHOULD)",
+                };
+                pr!(
+                    "tokenizer     {} · {} tokens · {} merges · {vectors}",
+                    t.kind.name(),
+                    commas(t.vocab_size() as u64),
+                    commas(t.merges.len() as u64)
+                );
+                for u in t.unsupported() {
+                    pr!("              ⚠ {u}");
+                }
+            }
+            Ok(None) => pr!("tokenizer     none"),
+            Err(e) => pr!("tokenizer     ⚠ present but unreadable: {e}"),
+        }
+    }
     let sigs = c
         .index
         .iter()
@@ -776,6 +800,88 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         );
     }
 
+    // --tokenizer: run the conformance vectors of §06.7.1. A tokenizer that
+    // changed during conversion is a silent quality regression everywhere else;
+    // here it is a build failure.
+    if args.iter().any(|a| a == "--tokenizer") {
+        let store = Borrowed(c);
+        let ctx = Ctx::new(&store);
+        match tokenizer_of(c, &ctx)? {
+            None => {
+                pr!("tokenizer      ⚠ this container has no `tokenizer` asset");
+                indeterminate += 1;
+            }
+            Some(t) => {
+                let un = t.unsupported();
+                if un.is_empty() {
+                    let report = t.check_vectors(&ctx)?;
+                    if report.total == 0 {
+                        pr!(
+                            "tokenizer      ⚠ {} kind, {} tokens, but no conformance vectors \
+                             (§06.7.1 SHOULD)",
+                            t.kind.name(),
+                            commas(t.vocab_size() as u64)
+                        );
+                        indeterminate += 1;
+                    } else {
+                        pr!(
+                            "tokenizer      {} {report}",
+                            if report.ok() { "✓" } else { "✗" }
+                        );
+                        for f in &report.failures {
+                            pr!("     {f}");
+                        }
+                        if !report.ok() {
+                            invalid += 1;
+                        }
+                    }
+                } else {
+                    // Encoding would produce *some* ids; they would just be the
+                    // wrong ones. That is indeterminate, not valid (§15.1).
+                    pr!("tokenizer      ⚠ this build cannot run it:");
+                    for u in &un {
+                        pr!("     {u}");
+                    }
+                    indeterminate += 1;
+                }
+                // The vocabulary and the embedding table have to agree; a
+                // mismatch is the classic sign of a truncated conversion.
+                if let Ok(table) = tensor_table(c) {
+                    for name in ["model.embed_tokens.weight", "model.embed.weight"] {
+                        let Some(entry) = table.get(name) else {
+                            continue;
+                        };
+                        let Ok(desc) = c
+                            .get_value(&entry.1)
+                            .map_err(|e| e.to_string())
+                            .and_then(|v| TensorDesc::from_value(&v).map_err(|e| e.to_string()))
+                        else {
+                            continue;
+                        };
+                        let row = desc
+                            .axes
+                            .as_ref()
+                            .and_then(|a| a.iter().position(|x| x == "vocab"))
+                            .unwrap_or(0);
+                        if let Some(n) = desc.shape.get(row).and_then(|d| d.size()) {
+                            if n != t.vocab_size() as u64 {
+                                pr!(
+                                    "tokenizer      ✗ vocabulary is {} tokens but `{name}` has {} \
+                                     rows",
+                                    commas(t.vocab_size() as u64),
+                                    commas(n)
+                                );
+                                invalid += 1;
+                            } else {
+                                pr!("tokenizer      ✓ vocabulary matches `{name}` ({n} rows)");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if level >= 7 {
         // V7 lives in `omni sign --verify`, which needs a trust policy; a
         // verifier with no keys cannot decide authenticity, and saying "valid"
@@ -793,6 +899,96 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         return Ok(3);
     }
     pr!("\nvalid");
+    Ok(0)
+}
+
+/// Finds the `tokenizer` asset, if the manifest declares one (§06.12: the
+/// manifest is where a reader looks, not a full graph walk).
+fn tokenizer_of(
+    c: &Container,
+    ctx: &Ctx<'_>,
+) -> Result<Option<omni_core::tokenizer::Tokenizer>, Box<dyn std::error::Error>> {
+    let Some(r) = c
+        .root()?
+        .get("assets")
+        .and_then(|a| a.get("tokenizer"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let r = omni_core::expr::parse_ref_value(&r)?;
+    Ok(Some(omni_core::tokenizer::Tokenizer::load(ctx, &r)?))
+}
+
+/// `omni tokenize` — encode text, or decode ids, with the container's own
+/// tokenizer.
+fn cmd_tokenize(c: &Container, args: &[String]) -> R {
+    let store = Borrowed(c);
+    let ctx = Ctx::new(&store);
+    let Some(t) = tokenizer_of(c, &ctx)? else {
+        prr!("omni: this container has no `tokenizer` asset\n");
+        return Ok(5);
+    };
+    pr!(
+        "; {} · {} tokens · {} merges{}",
+        t.kind.name(),
+        commas(t.vocab_size() as u64),
+        commas(t.merges.len() as u64),
+        if t.byte_fallback {
+            " · byte fallback"
+        } else {
+            ""
+        }
+    );
+    let un = t.unsupported();
+    if !un.is_empty() {
+        // Producing plausible-looking wrong ids is the failure mode this whole
+        // module exists to prevent.
+        prr!("omni: this build cannot run this tokenizer:\n");
+        for u in &un {
+            prr!("  {u}\n");
+        }
+        return Ok(3);
+    }
+    if let Some(ids) = flag(args, "--ids") {
+        let ids: Result<Vec<u32>, _> = ids
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse::<u32>())
+            .collect();
+        let text = t.decode(&ids?)?;
+        pr!("{text}");
+        return Ok(0);
+    }
+    let Some(text) = flag(args, "--text") else {
+        prr!("omni: --text <string> or --ids <a,b,c> required\n");
+        return Ok(2);
+    };
+    let ids = t.encode(text)?;
+    pr!(
+        "{}",
+        ids.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for id in &ids {
+        pr!(
+            "  {:>6}  {}",
+            id,
+            t.tokens
+                .get(*id as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("<out of vocabulary>")
+        );
+    }
+    // Round-tripping is the property a tokenizer is actually used for, so it is
+    // reported rather than assumed.
+    match t.decode(&ids) {
+        Ok(back) if back == text => pr!("; round-trips"),
+        Ok(back) => pr!("; does NOT round-trip: decoded {back:?}"),
+        Err(e) => pr!("; does NOT round-trip: {e}"),
+    }
     Ok(0)
 }
 
@@ -1361,7 +1557,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn cmd_example(args: &[String]) -> R {
     // Options come in two shapes: valueless switches, and `--name value`
     // pairs whose value must not be mistaken for the positional output path.
-    const SWITCHES: &[&str] = &["--quantized"];
+    const SWITCHES: &[&str] = &["--quantized", "--tokenizer"];
     let tune: Option<u64> = flag(args, "--tune").and_then(|s| s.parse().ok());
     let mut positional = Vec::new();
     let mut i = 1;
@@ -1489,6 +1685,9 @@ fn cmd_example(args: &[String]) -> R {
     if args.iter().any(|a| a == "--quantized") {
         b = add_quantized_layer(b);
     }
+    if args.iter().any(|a| a == "--tokenizer") {
+        b = add_tokenizer(b, vocab);
+    }
     let (objs, root) = b.build();
     let opts = PackOptions {
         hash: algo,
@@ -1515,6 +1714,72 @@ fn cmd_example(args: &[String]) -> R {
     );
     pr!("  reproducible   ✓ (two packs byte-identical)");
     Ok(0)
+}
+
+/// Attaches a tokenizer to the example (§06.7).
+///
+/// A byte-level vocabulary: token `i` is the GPT-2 printable stand-in for byte
+/// `i`, so the tokenizer's vocabulary is exactly the model's `vocab` axis and
+/// every input round-trips. Merges are what make BPE interesting, and there is
+/// no room for a merged token in a 256-entry byte vocabulary — so this example
+/// stores none, and says so rather than claiming a merge table it cannot honour.
+///
+/// The conformance vectors (§06.7.1) are computed from the *definition* — the
+/// ids of a byte-level tokenizer are the UTF-8 bytes of the input — not by
+/// running the encoder. Vectors generated by the thing they test cannot fail.
+fn add_tokenizer(mut b: ModelBuilder, vocab: u64) -> ModelBuilder {
+    let tokens: Vec<String> = (0..vocab)
+        .map(|i| omni_core::tokenizer::byte_to_unicode(i as u8).to_string())
+        .collect();
+    let blob = omni_core::tokenizer::encode_vocab(&tokens);
+    let vocab_expr = b.literal(&blob, DType::Str, &[vocab], Layout::default());
+
+    let mut vectors = String::from("# text \t comma-separated ids (§06.7.1)\n");
+    for text in ["hello", "Hello, world!", "  leading", "a\tb", "ol\u{e1}"] {
+        let ids: Vec<String> = text.bytes().map(|x| x.to_string()).collect();
+        // Tabs and newlines are the field and record separators, so the input
+        // column is escaped; §06.7.1's own examples show escaped inputs.
+        let escaped: String = text
+            .chars()
+            .map(|c| match c {
+                '\t' => "\\t".to_string(),
+                '\n' => "\\n".to_string(),
+                '\\' => "\\\\".to_string(),
+                c => c.to_string(),
+            })
+            .collect();
+        vectors.push_str(&format!("{escaped}\t{}\n", ids.join(",")));
+    }
+    let vec_blob = omni_core::container::Object::blob(vectors.into_bytes());
+    let vec_digest = vec_blob.digest(b.hash);
+    b.extra_objects.push(vec_blob);
+
+    let tok = Value::map(vec![
+        ("t", Value::text("omni.tok/tokenizer")),
+        ("v", Value::U(1)),
+        ("kind", Value::text("bpe")),
+        ("vocab", Value::map(vec![("tokens", vocab_expr.to_value())])),
+        (
+            "pretokenizers",
+            Value::Array(vec![Value::map(vec![
+                ("k", Value::text("byte-level")),
+                ("add_prefix_space", Value::Bool(false)),
+            ])]),
+        ),
+        (
+            "decoder",
+            Value::Array(vec![Value::map(vec![("k", Value::text("byte-level"))])]),
+        ),
+        ("byte_fallback", Value::Bool(true)),
+        (
+            "conformance",
+            Value::map(vec![(
+                "vectors",
+                Value::Array(vec![Value::U(0), Value::Bytes(vec_digest.to_vec())]),
+            )]),
+        ),
+    ]);
+    b.asset("tokenizer", otype::TOKENIZER, tok)
 }
 
 /// Adds the worked example of §04.8: one set of stored bytes, four tensors.

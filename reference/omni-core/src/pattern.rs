@@ -227,6 +227,38 @@ impl Regex {
         Ok(self.captures(text)?.is_some())
     }
 
+    /// The byte range of the leftmost match, or `None` when the pattern matches
+    /// nowhere in `text`.
+    ///
+    /// Semantics are leftmost-first, as in any backtracking engine: the
+    /// earliest start position that can match wins, and the end is wherever the
+    /// pattern's own greediness lands. Splitting text needs the offsets, which
+    /// [`Regex::is_match`] cannot give — asking "does it match?" of successive
+    /// substrings finds the wrong boundaries, because an unanchored match
+    /// inside a substring says nothing about where that substring begins.
+    pub fn find(&self, text: &str) -> Result<Option<(usize, usize)>, Error> {
+        let t: Vec<char> = text.chars().collect();
+        // char index -> byte offset, so callers can slice `text` directly.
+        let mut byte_of: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        byte_of.push(text.len());
+        for start in 0..=t.len() {
+            let mut st = State {
+                text: &t,
+                steps: 0,
+                caps: vec![None; self.groups],
+            };
+            let mut end = start;
+            let hit = st.matches(&self.root, start, &mut |_, e| {
+                end = e;
+                true
+            })?;
+            if hit {
+                return Ok(Some((byte_of[start], byte_of[end])));
+            }
+        }
+        Ok(None)
+    }
+
     /// The capture groups of the leftmost match, in group order. An empty
     /// vector means the pattern matched but has no groups.
     pub fn captures(&self, text: &str) -> Result<Option<Vec<String>>, Error> {
@@ -443,6 +475,9 @@ impl Parser<'_> {
                     },
                     'n' => Node::Char('\n'),
                     't' => Node::Char('\t'),
+                    'r' => Node::Char('\r'),
+                    'f' => Node::Char('\u{c}'),
+                    '0' => Node::Char('\0'),
                     other if other.is_ascii_digit() => {
                         return Err(Error::Syntax(
                             "backreferences are not supported: they are what make matching \
@@ -450,7 +485,7 @@ impl Parser<'_> {
                                 .into(),
                         ))
                     }
-                    other => Node::Char(other),
+                    other => Node::Char(literal_escape(other)?),
                 }
             }
             other => Node::Char(other),
@@ -484,7 +519,9 @@ impl Parser<'_> {
                 match e {
                     'n' => '\n',
                     't' => '\t',
-                    other => other,
+                    'r' => '\r',
+                    'f' => '\u{c}',
+                    other => literal_escape(other)?,
                 }
             } else {
                 c
@@ -507,6 +544,25 @@ impl Parser<'_> {
     fn peek(&self) -> Option<char> {
         self.c.get(self.i).copied()
     }
+}
+
+/// Resolves `\c` for a `c` the engine has no rule for.
+///
+/// Escaping punctuation means the literal character in every regex flavour, so
+/// `\.` and `\+` are safe. An escaped *letter* is a different matter: `\p{L}`,
+/// `\b`, `\A` and friends are constructs this engine does not implement, and
+/// reading `\p` as the letter `p` would match a completely different language
+/// without saying so. A pattern this engine cannot honour is an error, so the
+/// caller can report it as indeterminate (§15.1) instead of acting on a wrong
+/// answer.
+fn literal_escape(c: char) -> Result<char, Error> {
+    if c.is_alphanumeric() {
+        return Err(Error::Syntax(format!(
+            "`\\{c}` is not a construct this engine implements; it is not treated as the \
+             literal `{c}`, because that would silently match a different language"
+        )));
+    }
+    Ok(c)
 }
 
 fn word_class() -> Vec<(char, char)> {
@@ -798,6 +854,45 @@ mod tests {
         assert!(r.is_match(&format!("{}b", "a".repeat(20))).unwrap());
         // And an empty-body repetition terminates instead of looping.
         assert!(Regex::parse("(a*)*b").unwrap().is_match("b").unwrap());
+    }
+
+    #[test]
+    fn an_unimplemented_escape_is_an_error_not_a_literal() {
+        // `\p{L}` is the pre-tokenizer pattern every GPT-2 descendant uses. An
+        // engine without Unicode property classes that reads `\p` as the letter
+        // `p` matches a different language and produces different token ids
+        // without a word of complaint, which is the worst of the three outcomes.
+        for bad in [r"\p{L}+", r"[^\p{N}]", r"\bword\b", r"\A.\z", r"\Qa.b\E"] {
+            assert!(Regex::parse(bad).is_err(), "`{bad}` must not parse");
+        }
+        // Escaped punctuation means the literal in every flavour, so it stays.
+        assert!(m(r"a\.b", "a.b"));
+        assert!(!m(r"^a\.b$", "axb"));
+        assert!(m(r"a\\b", r"a\b"));
+        // And the escapes the engine does implement keep working.
+        assert!(m(r"\d\s\w", "1 a"));
+        assert!(m("a\\tb", "a\tb"));
+        assert!(m("a\\rb", "a\rb"));
+    }
+
+    #[test]
+    fn find_reports_where_the_leftmost_match_is() {
+        let r = Regex::parse("[ab]+").unwrap();
+        assert_eq!(r.find("cabc").unwrap(), Some((1, 3)));
+        assert_eq!(r.find("ccc").unwrap(), None);
+        // Offsets are byte offsets into the input, so multi-byte text slices
+        // correctly: `é` is two bytes, so the match starts at 2, not 1.
+        assert_eq!(r.find("¿ab").unwrap(), Some((2, 4)));
+        let s = "¿ab";
+        let (a, b) = r.find(s).unwrap().unwrap();
+        assert_eq!(&s[a..b], "ab");
+        // An anchor is honoured rather than ignored while scanning forward.
+        assert_eq!(Regex::parse("^b").unwrap().find("ab").unwrap(), None);
+        // A pattern that can match empty reports an empty span at the front.
+        assert_eq!(
+            Regex::parse("a*").unwrap().find("bb").unwrap(),
+            Some((0, 0))
+        );
     }
 
     #[test]
