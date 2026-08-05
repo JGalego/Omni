@@ -44,6 +44,7 @@ pub mod quant;
 pub mod recover;
 pub mod sha256;
 pub mod sha512;
+pub mod sign;
 pub mod sparse;
 pub mod store;
 pub mod tensor;

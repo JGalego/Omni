@@ -76,13 +76,16 @@ implemented:
   R-A01–R-A03, the eight arithmetic methods built from core nodes, graph-level
   methods carried as rewrites, composition, the six delta representations with
   measured error, and parent chains with R-O06
-- §15.1 validation levels V0–V4 (V5 rules are implemented; the CLI ladder still
-  stops at V4)
+- §12.5 signatures: COSE_Sign1 over the §12.5.2 payload, Ed25519, the
+  `canonical_digest` of §12.5.3, trust policies (any-of, all-of, k-of-n,
+  role-based), validity windows, rollback counters and revocation statements
+- §15.1 validation levels V0–V4 (the V5 and V7 rules are implemented; the CLI
+  ladder still stops at V4)
 
 What is **not** implemented, and is reported as such rather than faked:
 
 - §07 OMNI-IR · §09 training state
-- §10 capability negotiation · §11 WASM plugins · §12.5 signatures
+- §10 capability negotiation · §11 WASM plugins
 - §03.7 compression codecs (only `raw`) · §13 HTTP/OCI transport
 - `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
 
@@ -90,7 +93,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-189 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+205 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -137,12 +140,16 @@ change becomes a quantized residual wrapped in `approx`, and that a parent chain
 is bounded and reports a missing required parent as incomplete; and, for
 Ed25519, the RFC 8032 §7.1 vectors plus the checks that make a verdict mean one
 thing — a non-canonical `s`, a non-canonical `y`, a small-order key and a
-tampered signature are all refused. Every
+tampered signature are all refused; and, for §12.5, that attaching a signature
+to the manifest it signs does not invalidate it, that the canonical digest
+ignores caches but not assets, that a signature over another model does not
+transfer, and that an unknown key or an unimplemented algorithm is indeterminate
+rather than invalid. Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 189 passed; 0 failed
+test result: ok. 205 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
