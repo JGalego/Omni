@@ -22,6 +22,9 @@ $ ./target/release/omni adapter check base.omni lora.omni
 $ ./target/release/omni example --tokenizer tok.omni
 $ ./target/release/omni verify tok.omni --tokenizer     # runs its §06.7.1 vectors
 $ ./target/release/omni tokenize tok.omni --text "hello"
+$ ./target/release/omni example --plugin --tune 3 plug.omni   # an op only WASM can do
+$ ./target/release/omni plugin list plug.omni
+$ ./target/release/omni cat plug.omni --tensor model.layers.0.attn.q_proj.weight.scaled
 $ ./target/release/omni open model.omni --tensor w --range 0:64   # what a read costs
 $ ./target/release/omni example --training ckpt.omni    # a checkpoint with Adam state
 $ ./target/release/omni strip ckpt.omni --training -o infer.omni   # weights, unchanged
@@ -42,8 +45,8 @@ $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, model builder | §01–§08, §10, §12, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · tokenize · render · graph · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, model builder | §01–§13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -136,6 +139,20 @@ implemented:
   separability, executed by `omni strip --training` and *proved* rather than
   asserted — the tensor digests are compared before and after, and a strip that
   would drop one refuses to write its output
+- §11 plugins and the WebAssembly host: a from-scratch interpreter under §11.6's
+  restricted profile — imports refused unless they are `omni_plugin/1`, fuel
+  metered per instruction, memory capped, `memory.grow` failing rather than
+  exceeding it, NaN results canonicalized so two runs cannot differ, and threads,
+  exceptions, GC and SIMD refused by opcode at *load* time. The instruction set a
+  plugin compiled from C or Rust uses is implemented: the whole i32/i64/f32/f64
+  numeric set with conversions and saturating truncation, sign extension, every
+  load and store, globals, structured control flow with `br_table`, `call` and
+  `call_indirect`, `select` and the bulk-memory operations. On top of it, §11.5's
+  plugin manifest as an embedded, content-addressed object, and the §04.7.7
+  extension point wired through: `omni example --plugin` builds a container whose
+  tensor is a `plugin` node with **no fallback**, and reading it runs the module
+  the model shipped — which is §11.8's step 3, the property no other model format
+  has
 - §10 capability negotiation: capability sets with the three-valued support of
   §10.2, candidate enumeration, the deterministic resolver of §10.5 under all
   five objectives, budget retry, and the informative failures of §10.5.2
@@ -166,7 +183,6 @@ implemented:
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §11 WASM plugins
 - §03.7's MAY-level codecs `lz4`, `brotli`, `xz`, `ans-lut` and the two lossy
   ones: reported as unsupported rather than half-decoded · §13 HTTP/OCI
   transport
@@ -181,7 +197,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-316 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+334 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -296,6 +312,22 @@ mesh that cannot divide the tensor is refused with the numbers; that
 reproducibility is *reported* rather than claimed, naming the stateful generator
 and the vague dataloader position that limit it; and that stripping a checkpoint
 removes the training state by reachability while every weight digest survives.
+And, for the WebAssembly host: that
+arithmetic, locals, a real loop, memory loads and stores, `call`,
+`call_indirect`, `br_table`, `if`/`else` and the bulk-memory operations all do
+what WebAssembly says; that an out-of-bounds access, a division by zero, an
+`unreachable` and an indirect call with the wrong signature each trap; that fuel
+runs out instead of hanging, that the memory cap makes `memory.grow` return −1
+rather than allocating, and that a module declaring more memory than the cap never
+instantiates; that an import from anywhere but `omni_plugin/1` and an opcode from
+a forbidden proposal are refused at load; that every NaN the host produces is the
+same NaN and `min`/`max` follow WebAssembly's rules rather than Rust's; that
+`read_object` sees only the objects it was given and returns −1 otherwise, and
+that `abort` traps with the plugin's own message; that a malformed module, and the
+same module truncated at every length, are errors rather than panics; and, end to
+end, that a plugin manifest round-trips, that a missing or unrunnable module is
+reported rather than hidden, and that the example module computes
+`x × f` through the host and refuses the argument count it was not written for.
 And that an object whose `t`
 contradicts the index's otype is invalid (R-O02).
 Every
@@ -303,7 +335,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 316 passed; 0 failed
+test result: ok. 334 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -2293,6 +2293,24 @@ impl Expr {
 /// A production evaluator works in the target dtype and in blocks. This one
 /// trades that for legibility: the semantics of every node are visible in one
 /// place, which is what a reference implementation is for.
+/// A host that can evaluate a `plugin` expression node (§04.7.7, §11.6).
+///
+/// The evaluator does not know or care that the implementation is WebAssembly —
+/// [`crate::plugin::Host`] is the one that does — which keeps §11's substrate
+/// argument honest: the expression algebra has one extension point, and it is
+/// this.
+pub trait PluginRunner {
+    fn run(
+        &self,
+        ns: &str,
+        name: &str,
+        version: u64,
+        attrs: &Value,
+        args: &[Tensor],
+        out_elems: usize,
+    ) -> Result<Vec<f64>, String>;
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
     pub shape: Vec<u64>,
@@ -2480,6 +2498,10 @@ pub struct Ctx<'a> {
     pub max_elems: u64,
     /// Plugin implementations this evaluator has.
     pub plugins: Vec<String>,
+    /// A host that can run a plugin op (§11.6). Without one, a `plugin` node
+    /// falls back or refuses; with one, an op this build has never heard of is
+    /// computed by the module the model shipped.
+    pub plugin_host: Option<&'a dyn PluginRunner>,
 }
 
 impl<'a> Ctx<'a> {
@@ -2489,7 +2511,14 @@ impl<'a> Ctx<'a> {
             features: BTreeMap::new(),
             max_elems: 1 << 28,
             plugins: Vec::new(),
+            plugin_host: None,
         }
+    }
+
+    /// Attaches a plugin host (§11.6).
+    pub fn with_plugin_host(mut self, host: &'a dyn PluginRunner) -> Self {
+        self.plugin_host = Some(host);
+        self
     }
 
     pub fn feature(mut self, name: &str, on: bool) -> Self {
@@ -2930,12 +2959,51 @@ impl Expr {
                 ns,
                 name,
                 v,
+                args,
+                attrs,
                 fallback,
                 crit,
-                ..
+                shape,
+                dtype,
             } => {
                 let id = format!("{ns}/{name}.{v}");
-                if ctx.plugins.contains(&id) {
+                // §11.6: the portable implementation of a plugin op is a WASM
+                // module, and running it is what makes an unknown op recoverable
+                // instead of fatal. The fallback below is the *second* answer,
+                // not the first.
+                if let Some(host) = ctx.plugin_host {
+                    let mut evaluated = Vec::with_capacity(args.len());
+                    for a in args {
+                        evaluated.push(a.eval_child(ctx)?);
+                    }
+                    let out_shape = concrete(shape).ok_or_else(|| {
+                        Error::Type("a plugin node with symbolic dimensions".into())
+                    })?;
+                    let n = numel(&out_shape) as usize;
+                    if n as u64 > ctx.max_elems {
+                        return Err(Error::Bounds(format!(
+                            "{n} elements exceeds this evaluator's cap"
+                        )));
+                    }
+                    match host.run(ns, name, *v, attrs, &evaluated, n) {
+                        Ok(data) if data.len() == n => {
+                            return Ok(Tensor::new(out_shape, dtype.clone(), data))
+                        }
+                        Ok(data) => {
+                            return Err(Error::Unsupported(format!(
+                                "plugin `{id}` returned {} of {n} declared elements",
+                                data.len()
+                            )))
+                        }
+                        // A host that has the plugin but cannot run it says so;
+                        // the fallback is still there to try.
+                        Err(why) => {
+                            if fallback.is_none() {
+                                return Err(Error::Unsupported(format!("plugin `{id}`: {why}")));
+                            }
+                        }
+                    }
+                } else if ctx.plugins.contains(&id) {
                     return Err(Error::Unsupported(format!(
                         "plugin `{id}` is registered but this build has no host to run it (§11)"
                     )));

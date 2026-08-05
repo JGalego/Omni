@@ -355,6 +355,60 @@ jobs:
           expect 3 "$OMNI" reshard /tmp/plainmodel.omni --mesh tp=2 -o /tmp/nope.omni
           echo "the checkpoint separates, reshards, and reports what it cannot promise"
 
+      # §11.6: WebAssembly as portable semantics. The claim is that a runtime
+      # from 2076 can execute a 2026 custom op without the 2026 toolchain; the
+      # testable part is that an op *this* build has never heard of computes the
+      # right numbers from the module the model shipped.
+      - name: A plugin op runs under the restricted profile
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --plugin --tune 3 /tmp/plug.omni
+          "$OMNI" inspect /tmp/plug.omni | tee /tmp/plugi.txt
+          grep -q 'plugins       1 embedded' /tmp/plugi.txt
+          grep -q 'runnable under §11.6' /tmp/plugi.txt
+          "$OMNI" plugin list /tmp/plug.omni | grep -q 'expr ops     scale'
+          # The tensor's value is a plugin node with no fallback, so these numbers
+          # exist only if the WebAssembly ran: scaled = base × 2.5, exactly.
+          first() { awk '/^ *-?[0-9]/ { print $1; exit }'; }
+          base=$("$OMNI" cat /tmp/plug.omni --tensor model.layers.0.attn.q_proj.weight \
+                   --limit 1 | first)
+          scaled=$("$OMNI" cat /tmp/plug.omni \
+                     --tensor model.layers.0.attn.q_proj.weight.scaled \
+                     --limit 1 | first)
+          python3 -c "
+          base, scaled = float('$base'), float('$scaled')
+          # Both numbers are printed to six decimals, so the comparison is on
+          # what was printed rather than on the f64s behind them.
+          assert abs(scaled - base * 2.5) < 1e-6, f'{scaled} != {base} * 2.5'
+          print(f'the plugin computed {base} * 2.5 = {scaled}')"
+          # And V5 checks it rather than shrugging: with the module present the
+          # tensor is decidable.
+          "$OMNI" verify /tmp/plug.omni --level 6 | tee /tmp/plugv.txt
+          grep -q '^valid' /tmp/plugv.txt
+
+          # The profile is enforced. A module importing anything but
+          # `omni_plugin/1` is refused, and a module using a forbidden proposal
+          # is refused — both at load, before anything runs.
+          python3 - <<'PY'
+          import subprocess, pathlib
+          # A module that imports from wasi: forbidden by §11.6.
+          m = bytearray(b"\0asm\x01\0\0\0")
+          def section(i, body):
+              return bytes([i]) + bytes([len(body)]) + body
+          m += section(1, bytes([1, 0x60, 0, 0]))                      # type () -> ()
+          imp = bytes([1]) + bytes([4]) + b"wasi" + bytes([3]) + b"log" + bytes([0, 0])
+          m += section(2, imp)
+          pathlib.Path('/tmp/bad.wasm').write_bytes(bytes(m))
+          r = subprocess.run(['reference/target/release/omni', 'plugin', 'run',
+                              '/tmp/bad.wasm', '--export', 'log'],
+                             capture_output=True, text=True)
+          assert r.returncode == 1, r
+          assert 'forbidden' in (r.stdout + r.stderr).lower(), r.stderr
+          print("an import outside omni_plugin/1 is refused:",
+                (r.stdout + r.stderr).strip().splitlines()[-1])
+          PY
+          echo "the plugin host runs what the model shipped, and only that"
+
       # §07: a model that describes its own computation, and the property no
       # other format has — an unknown high-level op recovered from a shipped
       # lowering rather than refused.

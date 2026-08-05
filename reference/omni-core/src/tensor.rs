@@ -582,14 +582,39 @@ impl TensorDesc {
             }
         });
 
-        // Plugins this build cannot evaluate make the tensor indeterminate,
+        // A plugin this build cannot evaluate makes the tensor indeterminate,
         // not invalid — and the rest of the model is still readable (§04.7.7).
+        // With a §11.6 host and the module the model shipped, it is neither: the
+        // op runs, and what it produces is checked like anything else.
         for p in self.value.required_plugins() {
-            out.push(unknown(
-                "R-E06",
-                name,
-                format!("critical plugin `{p}` has no fallback and is not implemented here"),
-            ));
+            match ctx.plugin_host {
+                None => out.push(unknown(
+                    "R-E06",
+                    name,
+                    format!("critical plugin `{p}` has no fallback and is not implemented here"),
+                )),
+                Some(_) => match self.value.eval(ctx) {
+                    Ok(t) => {
+                        let declared: Vec<u64> =
+                            self.shape.iter().filter_map(|d| d.size()).collect();
+                        if t.shape != declared {
+                            out.push(bad(
+                                "R-T01",
+                                name,
+                                format!(
+                                    "plugin `{p}` produced shape {:?}, not the declared {declared:?}",
+                                    t.shape
+                                ),
+                            ));
+                        }
+                    }
+                    Err(e) => out.push(unknown(
+                        "R-E06",
+                        name,
+                        format!("plugin `{p}` is shipped with the model but did not run: {e}"),
+                    )),
+                },
+            }
         }
 
         out

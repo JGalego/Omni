@@ -18,11 +18,12 @@
 //!
 //! ## Not implemented here
 //!
-//! The WASM plugin host (§11) and every
-//! transport beyond the local filesystem. Bao trees (§13.3) are implemented, but
-//! nothing yet fetches over a network to use them. Of §03.7's codecs, `zstd`
-//! (the MUST) and `deflate` are here; the MAY-level ones are reported as
-//! unsupported rather than half-decoded.
+//! Every transport beyond the local filesystem: Bao trees (§13.3) are here, but
+//! nothing yet fetches over a network to use them, and the OCI mapping of §13.5
+//! is unimplemented. Of §03.7's codecs, `zstd` (the MUST) and `deflate` are
+//! here; the MAY-level ones are reported as unsupported rather than
+//! half-decoded. The WebAssembly host of §11.6 runs the core instruction set but
+//! not SIMD.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -45,6 +46,7 @@ pub mod layout;
 pub mod model;
 pub mod pattern;
 pub mod plan;
+pub mod plugin;
 pub mod quant;
 pub mod recover;
 pub mod sha256;
@@ -55,6 +57,7 @@ pub mod store;
 pub mod tensor;
 pub mod tokenizer;
 pub mod train;
+pub mod wasm;
 pub mod zstd;
 
 pub use bao::BaoTree;

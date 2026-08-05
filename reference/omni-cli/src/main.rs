@@ -92,6 +92,12 @@ VERBS:
                               derived, droppable module (§07.2)
     graph   migrate <file.omni> -o <out.omni>
                               Apply shipped op-version rewrites (§07.4.1)
+    plugin  list <file.omni>
+                              Embedded plugins (§11.5): what they provide, which
+                              modules run under the §11.6 profile
+    plugin  run <module.wasm> --export <name> [--i32 N]…
+                              Run one export under the restricted profile and
+                              report the fuel it burned
     strip   <file.omni> --training [--caches] -o <out.omni>
                               Drop training state by reachability; every tensor
                               digest unchanged (§09.1)
@@ -162,6 +168,7 @@ fn main() -> ExitCode {
         "repack" => cmd_repack(&args),
         "graph" => cmd_graph(&args),
         "strip" => cmd_strip(&args),
+        "plugin" => cmd_plugin(&args),
         "log" => cmd_log(&args),
         "reshard" => cmd_reshard(&args),
         // fsck must work on files that do not open, so it does not go through
@@ -696,6 +703,35 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
         Ok(None) => {}
         Err(e) => pr!("training      ⚠ {e}"),
     }
+    // §11.5: `omni inspect` lists embedded plugins and whether this runtime can
+    // run them.
+    match plugins_of(c) {
+        Ok(ps) if !ps.is_empty() => {
+            let (loaded, problems) = plugin_host(c);
+            pr!("plugins       {} embedded", ps.len());
+            for (m, l) in ps.iter().zip(loaded.iter()) {
+                pr!(
+                    "  {}@{}  {} — {}",
+                    m.ns,
+                    m.version,
+                    if m.provides.expr_ops.is_empty() {
+                        "no expr ops".to_string()
+                    } else {
+                        m.provides.expr_ops.join(", ")
+                    },
+                    if l.slot("reference").is_some() {
+                        "runnable under §11.6"
+                    } else {
+                        "no runnable module here"
+                    }
+                );
+            }
+            for p in &problems {
+                pr!("  ⚠ {p}");
+            }
+        }
+        _ => {}
+    }
     let adapters = c.index.iter().filter(|e| e.otype == otype::ADAPTER).count();
     // §07.5 spells out what to print in both cases, and the weights-only case is
     // the interesting one: it is an honest statement of a real limitation.
@@ -945,7 +981,13 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
     // V5 — semantics. The tensor rules of §15.2, decided from descriptors.
     if level >= 5 {
         let store = Borrowed(c);
-        let ctx = Ctx::new(&store);
+        // §11.6: with the model's own plugin modules loaded, a `plugin` node is
+        // checkable rather than indeterminate — which is the difference between
+        // "we cannot tell" and "we ran what you shipped".
+        let (loaded, _) = plugin_host(c);
+        let objects = |d: &[u8; 32]| c.read(d).ok();
+        let host = omni_core::plugin::Host::new(loaded).with_objects(&objects);
+        let ctx = Ctx::new(&store).with_plugin_host(&host);
         match tensor_table(c) {
             Ok(table) => {
                 let mut findings = omni_core::tensor::validate_table(&ctx, &table);
@@ -1779,7 +1821,17 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
         Some(l) => l,
         None => &store,
     };
-    let ctx = Ctx::new(backing);
+    // §11.6: a plugin op is computed by the module the model shipped. The host
+    // is attached here rather than inside the evaluator, so the evaluator stays
+    // ignorant of WebAssembly (§04.7.7's extension point is the node, not the
+    // engine).
+    let (loaded, plugin_problems) = plugin_host(c);
+    let objects = |d: &[u8; 32]| c.read(d).ok();
+    let host = omni_core::plugin::Host::new(loaded).with_objects(&objects);
+    let ctx = Ctx::new(backing).with_plugin_host(&host);
+    for p in &plugin_problems {
+        prr!("omni: {p}\n");
+    }
     let t = match desc.value.eval(&ctx) {
         Ok(t) => t,
         Err(e) => {
@@ -1950,6 +2002,168 @@ fn codec_flag(args: &[String]) -> Result<Option<omni_core::codec::Codec>, String
         });
     }
     Ok(Some(c))
+}
+
+/// Plugin manifests embedded in a container (§11.5), from `Manifest.plugins`.
+fn plugins_of(
+    c: &Container,
+) -> Result<Vec<omni_core::plugin::Manifest>, Box<dyn std::error::Error>> {
+    let manifest = c.root()?;
+    let mut out = Vec::new();
+    if let Some(Value::Array(list)) = manifest.get("plugins") {
+        for r in list {
+            if let Some(d) = as_ref_digest(r) {
+                out.push(omni_core::plugin::Manifest::from_value(&c.get_value(&d)?)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Loads every embedded plugin's WebAssembly, reporting what could not be
+/// loaded rather than hiding it.
+fn plugin_host(c: &Container) -> (Vec<omni_core::plugin::Loaded>, Vec<String>) {
+    let mut loaded = Vec::new();
+    let mut problems = Vec::new();
+    let manifests = match plugins_of(c) {
+        Ok(m) => m,
+        Err(e) => return (loaded, vec![e.to_string()]),
+    };
+    for m in manifests {
+        let ns = m.ns.clone();
+        let resolve = |d: &Digest| c.read(d).ok();
+        let (l, p) = omni_core::plugin::Loaded::load(m, &resolve);
+        problems.extend(p.into_iter().map(|x| format!("{ns}: {x}")));
+        loaded.push(l);
+    }
+    (loaded, problems)
+}
+
+/// `omni plugin` — §11.5's artifacts and §11.6's profile.
+fn cmd_plugin(args: &[String]) -> R {
+    match args.get(1).map(|s| s.as_str()) {
+        Some("list") => {
+            let Some(path) = args.get(2) else {
+                eprint!("{USAGE}");
+                return Ok(2);
+            };
+            let c = Container::open(std::fs::read(path)?)?;
+            let manifests = plugins_of(&c)?;
+            if manifests.is_empty() {
+                pr!("no embedded plugins");
+                return Ok(0);
+            }
+            let (loaded, problems) = plugin_host(&c);
+            for (m, l) in manifests.iter().zip(loaded.iter()) {
+                pr!("{}@{}", m.ns, m.version);
+                if !m.provides.expr_ops.is_empty() {
+                    pr!("  expr ops     {}", m.provides.expr_ops.join(", "));
+                }
+                if !m.provides.dtypes.is_empty() {
+                    pr!("  dtypes       {}", m.provides.dtypes.join(", "));
+                }
+                if !m.provides.dialects.is_empty() {
+                    pr!(
+                        "  dialects     {}",
+                        m.provides
+                            .dialects
+                            .iter()
+                            .map(|(ns, v)| format!("{ns}@{v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                for (slot, spec) in &m.modules {
+                    let ok = l.slot(slot).is_some();
+                    pr!(
+                        "  {slot:<12} {} export `{}`{}",
+                        short(c.header.hash, &spec.reference.1),
+                        spec.export,
+                        if ok {
+                            " — runnable under §11.6"
+                        } else {
+                            " — not runnable here"
+                        }
+                    );
+                }
+                if !m.native_targets.is_empty() {
+                    // §11.6's argument is that the WASM module is what makes a
+                    // plugin trustworthy; a native artifact is neither portable
+                    // nor sandboxed, and this host will not load one.
+                    pr!(
+                        "  native       {} target(s) declared, none loaded (not sandboxable)",
+                        m.native_targets.len()
+                    );
+                }
+                if let Some(lic) = &m.license {
+                    pr!("  license      {lic}");
+                }
+            }
+            for p in &problems {
+                pr!("  ⚠ {p}");
+            }
+            Ok(if problems.is_empty() { 0 } else { 3 })
+        }
+        Some("run") => {
+            let Some(path) = args.get(2) else {
+                eprint!("{USAGE}");
+                return Ok(2);
+            };
+            let Some(export) = flag(args, "--export") else {
+                prr!("omni: plugin run needs --export <name>\n");
+                return Ok(2);
+            };
+            let bytes = std::fs::read(path)?;
+            let m = match omni_core::wasm::Module::load(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    // A module using something §11.6 permits but this host lacks
+                    // is indeterminate; one using something it forbids is not.
+                    return Ok(match e {
+                        omni_core::wasm::Error::Unsupported(_) => 3,
+                        _ => 1,
+                    });
+                }
+            };
+            let mut inputs = Vec::new();
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--i32" {
+                    let v: i32 = args
+                        .get(i + 1)
+                        .and_then(|x| x.parse().ok())
+                        .ok_or("--i32 takes an integer")?;
+                    inputs.push(omni_core::wasm::Value::I32(v));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let env = omni_core::wasm::Env::default();
+            let limits = omni_core::wasm::Limits::default();
+            let mut inst = omni_core::wasm::Instance::new(&m, &env, limits)?;
+            match inst.call(export, &inputs) {
+                Ok(out) => {
+                    pr!("{export}({}) = {:?}", inputs.len(), out);
+                    pr!("  fuel         {} instructions", commas(inst.fuel_used()));
+                    pr!("  memory       {} B", commas(inst.memory().len() as u64));
+                    for l in inst.logs() {
+                        pr!("  log          {l}");
+                    }
+                    Ok(0)
+                }
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    Ok(1)
+                }
+            }
+        }
+        _ => {
+            eprint!("{USAGE}");
+            Ok(2)
+        }
+    }
 }
 
 /// The `TrainingState` a container carries, from `Model.training` (§00.4).
@@ -3332,6 +3546,7 @@ fn cmd_example(args: &[String]) -> R {
         "--chat-template",
         "--graph",
         "--training",
+        "--plugin",
     ];
     let tune: Option<u64> = flag(args, "--tune").and_then(|s| s.parse().ok());
     let mut positional = Vec::new();
@@ -3465,6 +3680,9 @@ fn cmd_example(args: &[String]) -> R {
     }
     if args.iter().any(|a| a == "--chat-template") {
         b = add_chat_template(b);
+    }
+    if args.iter().any(|a| a == "--plugin") {
+        b = add_plugin(b);
     }
     if args.iter().any(|a| a == "--training") {
         let step = flag(args, "--step")
@@ -3842,6 +4060,94 @@ fn add_quantized_layer(mut b: ModelBuilder) -> ModelBuilder {
 }
 
 /// `omni caps` — publish what this build can do (§10.2).
+/// Embeds a §11.5 plugin and a tensor that needs it.
+///
+/// The tensor's value is a `plugin` node for an op no part of this build knows.
+/// It has *no fallback*, so reading it either runs the WebAssembly the model
+/// shipped or fails — which is the whole point of §11.6, and the only way to
+/// test that the host is really doing the work.
+fn add_plugin(mut b: ModelBuilder) -> ModelBuilder {
+    use omni_core::plugin::{Manifest, ModuleSlot, Provides};
+    let hash = b.hash;
+    let wasm = omni_core::Object::blob(omni_core::plugin::example_module());
+    let wasm_d = wasm.digest(hash);
+    b.extra_objects.push(wasm);
+
+    let manifest = Manifest {
+        ns: "org.acme/scale".into(),
+        version: 1,
+        provides: Provides {
+            expr_ops: vec!["scale".into()],
+            ..Default::default()
+        },
+        requires: vec![("omni.core".into(), 1)],
+        modules: vec![(
+            "reference".into(),
+            ModuleSlot {
+                reference: (otype::BLOB, wasm_d),
+                export: "scale".into(),
+            },
+        )],
+        native_targets: Vec::new(),
+        license: Some("Apache-2.0".into()),
+    };
+    let manifest_obj = omni_core::Object::structure(otype::PLUGIN_MODULE, &manifest.to_value());
+    let manifest_d = manifest_obj.digest(hash);
+    b.extra_objects.push(manifest_obj);
+
+    // The operand tensors: an existing weight, and the scalar factor. A
+    // projection rather than the embedding table, because `--tune` fills those
+    // with plausible values and the point of the example is to see the
+    // multiplication happen.
+    let pick = b
+        .tensors
+        .iter()
+        .position(|t| t.name.contains("q_proj"))
+        .unwrap_or(0);
+    let base = b.tensors[pick].name.clone();
+    let shape = b.tensors[pick].shape.clone();
+    let numel: u64 = shape.iter().product();
+    let weight_data = b.tensors[pick].data.clone();
+    let x = b.literal(&weight_data, DType::BF16, &shape, Layout::default());
+    let factor = b.literal(&2.5f64.to_le_bytes(), DType::F64, &[1], Layout::default());
+    let value = Expr::Plugin {
+        ns: "org.acme/scale".into(),
+        name: "scale".into(),
+        v: 1,
+        args: vec![x, factor],
+        attrs: Value::map(vec![("note", Value::text("the factor is operand 1"))]),
+        // Critical: a reader that cannot run it must refuse *this tensor*, and
+        // §04.7.7 says the rest of the model stays readable.
+        crit: true,
+        shape: omni_core::expr::dims(&shape),
+        dtype: DType::F64,
+        fallback: None,
+    };
+    let desc = TensorDesc {
+        shape: omni_core::expr::dims(&shape),
+        dtype: DType::F64,
+        layout: Layout::default(),
+        value,
+        semantic: Some("weight".into()),
+        role: None,
+        axes: None,
+        device_hint: None,
+        materialize: Materialize::Lazy,
+        stats: None,
+        digest_materialized: None,
+    };
+    assert_eq!(numel, desc.numel().unwrap_or(0));
+    b.derived.push((format!("{base}.scaled"), desc));
+    b.manifest_extra.push((
+        "plugins".into(),
+        Value::Array(vec![Value::Array(vec![
+            Value::U(otype::PLUGIN_MODULE as u64),
+            Value::Bytes(manifest_d.to_vec()),
+        ])]),
+    ));
+    b
+}
+
 /// Adds a §09 training state: Adam moments for every weight, a shard map, RNG
 /// streams of both kinds, a dataloader position and a loss history.
 ///
