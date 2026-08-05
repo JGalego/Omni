@@ -1,10 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Omni">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 132" width="200" height="132" role="img" aria-label="Omni">
   <title>Omni</title>
   <desc>A ring carrying the full colour spectrum — the container and its
   endless derived views — around a quiet infinity: the model, which exists
   once.</desc>
+  <svg x="57" y="0" width="86" height="86" viewBox="0 0 64 64">
   <path d="M32.00 32.00 L31.59 31.59 L31.17 31.17 L30.75 30.76 L30.32 30.36 L29.88 29.96 L29.44 29.56 L28.97 29.18 L28.50 28.80 L28.00 28.44 L27.49 28.09 L26.95 27.76 L26.39 27.46 L25.80 27.18 L25.19 26.94 L24.55 26.73 L23.89 26.57 L23.20 26.46 L22.50 26.42 L21.78 26.43 L21.05 26.53 L20.33 26.70 L19.61 26.96 L18.93 27.32 L18.28 27.76 L17.70 28.30 L17.19 28.92 L16.77 29.62 L16.46 30.38 L16.26 31.18 L16.20 32.00 L16.26 32.82 L16.46 33.62 L16.77 34.38 L17.19 35.08 L17.70 35.70 L18.28 36.24 L18.93 36.68 L19.61 37.04 L20.33 37.30 L21.05 37.47 L21.78 37.57 L22.50 37.58 L23.20 37.54 L23.89 37.43 L24.55 37.27 L25.19 37.06 L25.80 36.82 L26.39 36.54 L26.95 36.24 L27.49 35.91 L28.00 35.56 L28.50 35.20 L28.97 34.82 L29.44 34.44 L29.88 34.04 L30.32 33.64 L30.75 33.24 L31.17 32.83 L31.59 32.41 L32.00 32.00 L32.41 31.59 L32.83 31.17 L33.25 30.76 L33.68 30.36 L34.12 29.96 L34.56 29.56 L35.03 29.18 L35.50 28.80 L36.00 28.44 L36.51 28.09 L37.05 27.76 L37.61 27.46 L38.20 27.18 L38.81 26.94 L39.45 26.73 L40.11 26.57 L40.80 26.46 L41.50 26.42 L42.22 26.43 L42.95 26.53 L43.67 26.70 L44.39 26.96 L45.07 27.32 L45.72 27.76 L46.30 28.30 L46.81 28.92 L47.23 29.62 L47.54 30.38 L47.74 31.18 L47.80 32.00 L47.74 32.82 L47.54 33.62 L47.23 34.38 L46.81 35.08 L46.30 35.70 L45.72 36.24 L45.07 36.68 L44.39 37.04 L43.67 37.30 L42.95 37.47 L42.22 37.57 L41.50 37.58 L40.80 37.54 L40.11 37.43 L39.45 37.27 L38.81 37.06 L38.20 36.82 L37.61 36.54 L37.05 36.24 L36.51 35.91 L36.00 35.56 L35.50 35.20 L35.03 34.82 L34.56 34.44 L34.12 34.04 L33.68 33.64 L33.25 33.24 L32.83 32.83 L32.41 32.41 L32.00 32.00 Z" fill="none" stroke="#7c8798" stroke-width="3.5" stroke-linejoin="round"/>
   <g>
+    <animateTransform attributeName="transform" type="rotate"
+                      from="0 32 32" to="360 32 32" dur="10s"
+                      repeatCount="indefinite"/>
     <path d="M32.00 3.45 L33.20 3.48 L33.00 8.17 L32.00 8.15 Z" fill="#f59d0c" stroke="#f59d0c" stroke-width="0.3" stroke-linejoin="round"/>
     <path d="M33.20 3.48 L34.39 3.55 L34.00 8.23 L33.00 8.17 Z" fill="#f59a0e" stroke="#f59a0e" stroke-width="0.3" stroke-linejoin="round"/>
     <path d="M34.39 3.55 L35.58 3.68 L34.99 8.34 L34.00 8.23 Z" fill="#f59811" stroke="#f59811" stroke-width="0.3" stroke-linejoin="round"/>
@@ -156,4 +160,8 @@
     <path d="M29.61 3.55 L30.80 3.48 L31.00 8.17 L30.00 8.23 Z" fill="#eb9f13" stroke="#eb9f13" stroke-width="0.3" stroke-linejoin="round"/>
     <path d="M30.80 3.48 L32.00 3.45 L32.00 8.15 L31.00 8.17 Z" fill="#f29e0e" stroke="#f29e0e" stroke-width="0.3" stroke-linejoin="round"/>
   </g>
+  </svg>
+  <text x="100" y="122" text-anchor="middle"
+        font-family="Inter,'SF Pro Display','Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif" font-size="42" font-weight="600"
+        letter-spacing="-1.4" fill="#f8fafc">Omni</text>
 </svg>

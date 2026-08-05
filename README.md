@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/omni-logo-dark.svg">
-  <img src="assets/omni-logo.svg" alt="Omni" width="260">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/omni-logo-anim-dark.svg">
+  <img src="assets/omni-logo-anim.svg" alt="Omni" width="230">
 </picture>
 
 <p><em><strong>A model exists once. Everything else is derived.</strong></em></p>
@@ -26,7 +26,7 @@ TensorRT, CoreML, MLX, …) is *derived*.
 This repository holds the engineering proposal, the normative specification, and
 a reference implementation in Rust.
 
-## What OMNI is
+## The idea
 
 Today a model exists as a dozen incompatible artifacts: a PyTorch checkpoint, a
 safetensors shard set, four GGUF quantizations, an ONNX export, a TensorRT
@@ -44,39 +44,69 @@ stores, OCI registries and HTTP ranges.
 
 ## The design
 
-**A model exists once.** Everything else is a view, a derivation, or a cache.
+**🧬 A model exists once.** Everything else is a view, a derivation, or a cache.
 
-**Identity is a hash.** Objects are immutable and content-addressed, so
+**#️⃣ Identity is a hash.** Objects are immutable and content-addressed, so
 deduplication, deltas, resumable transfer and integrity all fall out of a single
 mechanism instead of several unrelated ones.
 
-**Weights are expressions, not files.** A tensor's value is a pure expression
+**🧮 Weights are expressions, not files.** A tensor's value is a pure expression
 tree — `dequantize`, `add-lora`, `concat`, `slice` — evaluated lazily by the
 runtime. Fine-tunes and quantizations cost their delta, not a copy.
 
-**The format knows nothing about architectures.** Transformers, Mamba, diffusion
+**🔌 The format knows nothing about architectures.** Transformers, Mamba, diffusion
 and whatever comes in 2050 are all *dialect plugins* with versioned op schemas
 and WebAssembly reference semantics.
 
-**Hardware never touches the canonical model.** TensorRT engines, autotuned
+**⚡ Hardware never touches the canonical model.** TensorRT engines, autotuned
 kernels and materialized fp8 copies are cache objects keyed by the digest of
 what produced them, and may always be deleted.
 
-**Unknown things are not errors.** PNG-style criticality bits mean a reader from
+**🔭 Unknown things are not errors.** PNG-style criticality bits mean a reader from
 2026 can validate, copy, sign and partially execute a file written in 2071.
 
-## Try it
+## Getting started
+
+The reference implementation has zero dependencies, so installing the CLI is a
+clone and one `cargo install`:
 
 ```console
-$ cd reference && cargo build --release && cargo test
-$ cd ../examples && ../reference/target/release/omni example toy.omni
-$ ../reference/target/release/omni inspect toy.omni
-$ ../reference/target/release/omni verify  toy.omni
+$ git clone https://github.com/JGalego/Omni && cd Omni
+$ cargo install --path reference/omni-cli
 ```
 
-`examples/toy.omni` is a real, complete, byte-reproducible OMNI container.
-[`examples/README.md`](examples/README.md) has annotated hexdumps, CBOR
-diagnostic listings of every object, and an independent digest verification.
+That puts an `omni` binary on your `PATH`. Ask it for a model — a small but
+complete two-layer transformer, byte-reproducible down to the last digest:
+
+```console
+$ omni example toy.omni
+```
+
+Look inside. `inspect` decides everything from metadata alone; no tensor
+payload is ever read:
+
+```console
+$ omni inspect toy.omni
+```
+
+Now make it prove itself — validation levels V0 through V6, from framing and
+hashes up to tensor semantics and recomputed derived objects:
+
+```console
+$ omni verify toy.omni --level 6
+```
+
+The same binary can quantize (`example --quantized`), evaluate tensor
+expressions (`cat`), plan against a runtime's capabilities (`plan`), sign and
+verify (`sign`), diff two models (`delta`), attach adapters (`adapter`),
+tokenize (`tokenize`) and render chat templates (`render`) — the full tour is
+in [`reference/README.md`](reference/README.md).
+
+The committed [`examples/toy.omni`](examples/toy.omni) is the exact container
+`omni example` writes — CI proves it byte-for-byte on every push.
+[`examples/README.md`](examples/README.md) dissects it with annotated hexdumps,
+CBOR diagnostic listings of every object, and an independent digest
+verification. To run the test suite: `cd reference && cargo test`.
 
 ## Repository map
 
