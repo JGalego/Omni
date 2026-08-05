@@ -82,7 +82,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-125 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+132 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -112,12 +112,14 @@ from its recipe to within 1e-6 of the published quantiles, and that a symmetric
 scheme carrying a zero point is refused rather than guessed at; and, for
 sparsity, that each scheme densifies correctly and that a malformed one — an
 index out of range, a non-monotone `indptr`, a 3-in-4 group in a 2:4 tensor, a
-values array that disagrees with its mask — is refused. Every
+values array that disagrees with its mask — is refused; and, for selectors,
+that glob captures index adapter tensors correctly and that catastrophic regex
+backtracking hits a step budget instead of hanging. Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 125 passed; 0 failed
+test result: ok. 132 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -36,6 +36,7 @@ pub mod dtype;
 pub mod expr;
 pub mod layout;
 pub mod model;
+pub mod pattern;
 pub mod quant;
 pub mod recover;
 pub mod sha256;
