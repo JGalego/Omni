@@ -108,6 +108,25 @@ HTTP one range at a time, serve one, or map one onto an OCI registry (`index`,
 fidelity report rather than a shrug (`import`, `export`) — the full tour is in
 [`reference/README.md`](reference/README.md).
 
+## Look inside one
+
+[`docs/explorer.html`](docs/explorer.html) is an interactive explorer over the
+committed [`examples/toy.omni`](examples/toy.omni) — one self-contained file, no
+dependencies and no network, that opens straight from disk. Click the file bar to
+walk the segments, walk the object graph from the root, and watch the hex pane
+highlight the exact bytes a digest covers.
+
+![The OMNI container explorer: the file to scale, the object graph, and the bytes
+each object is](assets/explorer.gif)
+
+Every offset, digest, byte and validation line in it was read out of the real
+container by the real tool — `omni ls`, `omni dump`, `omni verify` — by
+[`tools/build-explorer.py`](tools/build-explorer.py), and CI regenerates the page
+and diffs it, so a diagram of the format cannot drift from the format. The
+recording above is a scripted tour of that page
+([`tools/record-explorer.mjs`](tools/record-explorer.mjs)); the pointer is drawn
+by the script, because a headless browser has none to film.
+
 The committed [`examples/toy.omni`](examples/toy.omni) is the exact container
 `omni example` writes — CI proves it byte-for-byte on every push.
 [`examples/README.md`](examples/README.md) dissects it with annotated hexdumps,

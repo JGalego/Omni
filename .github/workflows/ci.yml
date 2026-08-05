@@ -409,6 +409,64 @@ jobs:
           PY
           echo "the plugin host runs what the model shipped, and only that"
 
+      # A diagram of a binary format that has drifted from the format is worse
+      # than no diagram, so the explorer is generated from the container and this
+      # step is what keeps it that way.
+      - name: The container explorer matches the container
+        run: |
+          cp docs/explorer.html /tmp/explorer.committed.html
+          python3 tools/build-explorer.py
+          if ! cmp -s /tmp/explorer.committed.html docs/explorer.html; then
+            echo "::error::docs/explorer.html is stale — run python3 tools/build-explorer.py"
+            exit 1
+          fi
+          # And what it embeds is really the container: the whole file as hex, the
+          # root the header names, and every object the index lists.
+          python3 - <<'PY_EXP'
+          import json, pathlib, re, subprocess
+          page = pathlib.Path("docs/explorer.html").read_text()
+          m = re.search(r"const OMNI = (\{.*?\});\n", page, re.S)
+          assert m, "no embedded data in the explorer"
+          d = json.loads(m.group(1))
+          raw = pathlib.Path("examples/toy.omni").read_bytes()
+          assert d["size"] == len(raw), (d["size"], len(raw))
+          assert d["hex"] == raw.hex(), "the embedded bytes are not the container's"
+          assert d["root"] == raw[64:96].hex(), "the root is not the one the header names"
+          ls = subprocess.run(["reference/target/release/omni", "ls",
+                               "examples/toy.omni", "--full"],
+                              capture_output=True, text=True, check=True).stdout
+          rows = [r.split() for r in ls.splitlines()[1:] if r.strip()]
+          assert len(d["objects"]) == len(rows), (len(d["objects"]), len(rows))
+          for o, r in zip(d["objects"], rows):
+              assert o["digest"] == r[0] and o["type"] == r[1], (o, r)
+              assert o["off"] == int(r[2]) and o["len"] == int(r[3]), (o, r)
+          # The validation lines are the verifier's, not prose.
+          v = subprocess.run(["reference/target/release/omni", "verify",
+                              "examples/toy.omni", "--level", "6"],
+                             capture_output=True, text=True, check=True).stdout
+          for line in d["verify"]:
+              assert line in v, f"the explorer claims a line the verifier did not print: {line}"
+          print(f"the explorer embeds {len(d['objects'])} objects and "
+                f"{len(raw)} bytes, all of them the container's")
+          PY_EXP
+
+          # The recording is committed rather than built in CI — headless Chromium
+          # is not a build dependency — so what CI checks is that it is a GIF of
+          # the size the page is recorded at, and that it did not rot.
+          python3 - <<'PY_GIF'
+          import pathlib, struct
+          g = pathlib.Path("assets/explorer.gif").read_bytes()
+          assert g[:6] == b"GIF89a", g[:6]
+          w, h = struct.unpack("<HH", g[6:10])
+          assert (w, h) == (1160, 660), (w, h)
+          assert g[-1:] == b"\x3b", "the GIF has no terminator"
+          assert b"NETSCAPE2.0" in g[:800], "the GIF does not declare looping"
+          frames = g.count(b"\x21\xf9\x04")
+          assert frames > 50, f"only {frames} frames"
+          print(f"assets/explorer.gif: {w}x{h}, {frames} frames, "
+                f"{len(g)/1024/1024:.2f} MiB")
+          PY_GIF
+
       # §13.5: the OCI mapping. The argument for it is parasitic adoption —
       # registries, mirrors, CDNs and signing already exist — so the layout has
       # to be one the existing tools actually read.
@@ -1275,6 +1333,11 @@ jobs:
           import re, os, glob, sys
           bad = []
           for f in glob.glob('**/*.md', recursive=True):
+              # A contributor who has run `npm i` or `cargo build` in the tree
+              # should not be told their dependencies' READMEs have broken links.
+              parts = f.split(os.sep)
+              if {'node_modules', 'target', '.git'} & set(parts):
+                  continue
               d = os.path.dirname(f)
               for m in re.finditer(r'\[([^\]]*)\]\(([^)#\s]+)(#[^)]*)?\)', open(f, encoding='utf-8').read()):
                   t = m.group(2)
