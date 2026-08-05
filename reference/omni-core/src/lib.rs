@@ -6,7 +6,7 @@
 //! typing, identity, evaluation and range pushdown, plus the quantization
 //! sparsity and quantization scheme catalogues of §04.6 and §05. Above those:
 //! OMNI-IR (§07), training state (§09), a WebAssembly plugin host (§11.6),
-//! streaming transport (§13), and safetensors import and export.
+//! streaming transport (§13), and safetensors, PEFT, GPTQ and AWQ import.
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
 //!
@@ -29,8 +29,10 @@
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
-//! in `docs/design/import-export.md` §3, [`safetensors`] and [`peft`] are the
-//! two that are implemented; a request to import another is refused by name.
+//! in `docs/design/import-export.md` §3, four are implemented — [`safetensors`],
+//! [`peft`], and GPTQ and AWQ in [`hfquant`] — and a request to import another is
+//! refused by name. Only safetensors exports, so a GPTQ import can be
+//! dequantized out but not written back as GPTQ.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -48,6 +50,7 @@ pub mod delta;
 pub mod dtype;
 pub mod ed25519;
 pub mod expr;
+pub mod hfquant;
 pub mod ir;
 pub mod json;
 pub mod layout;

@@ -123,6 +123,11 @@ VERBS:
     import  peft <adapter-dir> --base <base.omni> -o <out.omni>
                               A PEFT LoRA as an §08 Adapter, pinned to that base
                               by digest rather than by the name PEFT gives it
+    import  gptq|awq <model-dir> -o <out.omni> [--arch FAMILY]
+                              A packed-integer checkpoint as one dequantize
+                              expression per layer (§05.2.2, §05.2.3): the words
+                              go in unchanged, and every layer is dequantized and
+                              compared against the source before it is claimed
     export  safetensors <in.omni> [-o <out.safetensors>] [--plan]
                               [--allow-lossy]
                               Emit into another format. --plan says what would
@@ -3799,11 +3804,14 @@ fn cmd_import(args: &[String]) -> R {
     if format == "peft" {
         return cmd_import_peft(args, input);
     }
+    if let Some(method) = omni_core::hfquant::Method::parse(format) {
+        return cmd_import_hfquant(args, input, method);
+    }
     if format != "safetensors" {
         prr!(
-            "omni: no importer for `{format}`. This build imports safetensors and \
-             peft; `docs/design/import-export.md` §3 lists what the others would \
-             need\n"
+            "omni: no importer for `{format}`. This build imports safetensors, \
+             peft, gptq and awq; `docs/design/import-export.md` §3 lists what the \
+             others would need\n"
         );
         return Ok(2);
     }
@@ -3987,6 +3995,169 @@ fn cmd_import_peft(args: &[String], input: &str) -> R {
     );
     pr!("  check it     omni adapter check {base_path} {out}");
     Ok(0)
+}
+
+/// `omni import gptq` / `omni import awq` — a packed-integer checkpoint as
+/// expressions over its own bytes.
+///
+/// The quantized weights are not converted: the packed words go in unchanged and
+/// come back out through a `dequantize` node, so the container is smaller than the
+/// source rather than larger, and requantizing or attaching a LoRA to it is an
+/// ordinary expression rather than a conversion.
+fn cmd_import_hfquant(args: &[String], input: &str, method: omni_core::hfquant::Method) -> R {
+    use omni_core::hfquant::{import, ImportOpts};
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+
+    // The config lives in `quantize_config.json` (AutoGPTQ) or under
+    // `quantization_config` in a Hugging Face `config.json` (both, now). Given a
+    // file, it is the config and the weights sit beside it.
+    let path = std::path::Path::new(input);
+    let (config_path, weights_path) = if path.is_dir() {
+        let cfg = [
+            "quantize_config.json",
+            "quantization_config.json",
+            "config.json",
+        ]
+        .iter()
+        .map(|n| path.join(n))
+        .find(|p| p.exists());
+        let Some(cfg) = cfg else {
+            prr!(
+                "omni: {} has no quantize_config.json and no config.json; there is \
+                 nothing that says how to read the packed words\n",
+                path.display()
+            );
+            return Ok(2);
+        };
+        (cfg, single_safetensors(path)?)
+    } else {
+        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+        (path.to_path_buf(), single_safetensors(parent)?)
+    };
+    let Some(weights_path) = weights_path else {
+        prr!(
+            "omni: no single .safetensors file beside {}; a sharded checkpoint needs \
+             every shard, and this build reads one file\n",
+            config_path.display()
+        );
+        return Ok(2);
+    };
+
+    let hash = if flag(args, "--hash") == Some("sha256") {
+        HashAlgo::Sha256
+    } else {
+        HashAlgo::Blake3_256
+    };
+    let imported = import(
+        &std::fs::read(&config_path)?,
+        &std::fs::read(&weights_path)?,
+        method,
+        &ImportOpts {
+            name: flag(args, "--name")
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("imported/{}", stem(input))),
+            config_path: config_path.display().to_string(),
+            weights_path: weights_path.display().to_string(),
+            hash,
+            chunk_size: flag(args, "--chunk")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1 << 20),
+            license: flag(args, "--license").map(str::to_string),
+            arch: flag(args, "--arch").map(str::to_string),
+            max_verify_elems: flag(args, "--verify-elems")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1 << 22),
+        },
+    )?;
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+
+    let r = &imported.report;
+    pr!("imported {} -> {out}", weights_path.display());
+    pr!(
+        "  source       {}, {}, {}",
+        r.format,
+        human(r.source_size),
+        short(hash, &r.source_digest)
+    );
+    pr!(
+        "  layers       {} quantized, {} tensor(s) imported unchanged",
+        commas(imported.layers.len() as u64),
+        commas(imported.plain as u64)
+    );
+    for l in imported.layers.iter().take(4) {
+        pr!(
+            "     {}  [{}, {}]  {} group(s) of {}{}",
+            l.prefix,
+            l.out_features,
+            l.in_features,
+            l.groups,
+            l.group_size,
+            if l.act_order { ", act-order" } else { "" }
+        );
+    }
+    if imported.layers.len() > 4 {
+        pr!("     … {} more", imported.layers.len() - 4);
+    }
+    pr!(
+        "  tensors      {} verified byte-for-byte against the source ({}) — I4",
+        commas(r.verified_tensors as u64),
+        human(r.verified_bytes)
+    );
+    // The check that matters for a quantized import: byte identity only proves
+    // the words were copied, not that they are being read correctly.
+    pr!(
+        "  dequantized  {} element(s) compared against an independent \
+         dequantization of the source",
+        commas(r.dequant_checked)
+    );
+    pr!("  represented  {}", r.represented.join(", "));
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    if !r.warnings.is_empty() {
+        pr!("  warnings");
+        for w in &r.warnings {
+            pr!("     {w}");
+        }
+    }
+    pr!(
+        "  size         {} -> {} ({:.1} %)",
+        human(r.source_size),
+        human(packed.len() as u64),
+        100.0 * packed.len() as f64 / r.source_size.max(1) as f64
+    );
+    pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// The one `.safetensors` file in a directory, or `None` if there is not exactly
+/// one. A sharded checkpoint is `None` rather than a guess at which shard to read.
+fn single_safetensors(dir: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let named = dir.join("model.safetensors");
+    if named.exists() {
+        return Ok(Some(named));
+    }
+    let mut found = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        if p.extension().is_some_and(|x| x == "safetensors") {
+            found.push(p);
+        }
+    }
+    Ok(if found.len() == 1 { found.pop() } else { None })
 }
 
 /// `omni export` — emit into another format, refusing to lie about what was lost.

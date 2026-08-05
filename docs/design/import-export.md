@@ -294,6 +294,63 @@ dimension means — so asserting the requirement made every attach report as
 *invalid* rather than merely unchecked. The shapes are still checked (R-A02),
 which is what can actually be decided from the tensors.
 
+GPTQ and AWQ are the third and fourth rows, and they are the ones that test §05's
+central claim rather than the object model's:
+
+```console
+$ omni import gptq ./model-gptq -o model.omni
+$ omni import awq  ./model-awq  -o model.omni
+```
+
+Quantization is a transformation, not a file type, so nothing is converted. The
+packed 32-bit words go into the container unchanged and each layer's weight
+becomes an expression over them:
+
+```
+weight = permute(dequantize(reshape(permute(qweight)), {affine-sub, block:[gs,1],
+                                                       scale, zero}))
+```
+
+The int4-in-int32 packing is §04.4's `packed` layout. AWQ's GEMM interleave — its
+kernel wants a word's columns in the order `0 2 4 6 1 3 5 7` — is a `gather`.
+GPTQ's act-order is a `gather` too, over the scale and zero tensors rather than
+over the weight, so the stored bytes are never rearranged. None of it is a special
+case in the evaluator, which is what §05.2 claims and what this checks.
+
+Two things are worth recording, because both are the kind of thing that produces a
+container full of plausible wrong numbers rather than an error.
+
+**Byte identity is not enough for a quantized import.** The packed words are
+copied verbatim, so comparing them proves they were copied and says nothing about
+whether they are being *read* correctly. So I4 here is two checks: byte identity,
+and every layer dequantized through the expression graph and compared against
+scalar code that shares nothing with the evaluator. The fidelity report says
+`byte-identity + sample-dequant` and carries the element count. CI goes one step
+further and compares against arithmetic done in Python on a fixture packed by the
+formats' own rules, so the mapping is checked against GPTQ and AWQ rather than
+against OMNI.
+
+**The zero-point convention is the corruption §05.1 was written for.** §05.1 makes
+`formula` a closed enumeration because *whether the zero point is subtracted
+before or after scaling is a recurring source of silent corruption when converting
+between GPTQ, AWQ and GGUF*. AutoGPTQ's original checkpoint format stores every
+zero point one *less* than its true value and adds one back in
+`QuantLinear.forward`; `checkpoint_format: "gptq_v2"` dropped that. The two differ
+by exactly one quantization step in every weight and nothing in the tensors
+distinguishes them. So the offset is read from `checkpoint_format`, written as an
+explicit `+1` node in the expression rather than folded into a constant, and named
+in the report — and an unrecognised `checkpoint_format` is **refused**, because
+that is precisely the case where a guess corrupts the whole model. 3-bit GPTQ is
+refused for a different reason: its values straddle the 32-bit word boundary, so
+it is not a `packed` layout at all. AWQ's `gemv` and `marlin` versions interleave
+differently from `gemm` and are refused by name.
+
+Export back to GPTQ and AWQ does not exist yet, so §5.3's lossless round-trip
+claim for these two rows is *not* demonstrated. What is demonstrated is that the
+import is lossless: every source tensor is in the container, byte for byte, except
+an ascending `g_idx`, which is checked to be `i / group_size` and left out because
+`group_size` already says it.
+
 Every other row of the matrix in §3 is unimplemented. A request to import one is
 refused by name, with a pointer to this document, rather than half-attempted.
 

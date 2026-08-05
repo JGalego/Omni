@@ -383,6 +383,15 @@ pub struct Fidelity {
     /// Tensors re-read through the object graph and compared with the source.
     pub verified_tensors: usize,
     pub verified_bytes: u64,
+    /// How the check above was made. A quantized import cannot stop at byte
+    /// identity — the packed words are copied verbatim, so comparing them proves
+    /// nothing about whether they are being *read* correctly — so it also
+    /// dequantizes and compares, and says so here.
+    pub verify_method: &'static str,
+    /// Elements dequantized through the object graph and compared against an
+    /// independent computation from the source bytes. Zero for formats where
+    /// there is nothing to dequantize.
+    pub dequant_checked: u64,
     pub warnings: Vec<String>,
 }
 
@@ -400,6 +409,8 @@ impl Default for Fidelity {
             assumptions: Vec::new(),
             verified_tensors: 0,
             verified_bytes: 0,
+            verify_method: "byte-identity",
+            dequant_checked: 0,
             warnings: Vec::new(),
         }
     }
@@ -456,14 +467,21 @@ impl Fidelity {
             ("assumptions", notes(&self.assumptions)),
             (
                 "verification",
-                C::map(vec![
-                    // Not "sample-dequant": nothing here is a block format, so
-                    // every tensor is compared in full rather than sampled.
-                    ("method", C::text("byte-identity")),
-                    ("tensors_checked", C::U(self.verified_tensors as u64)),
-                    ("bytes_checked", C::U(self.verified_bytes)),
-                    ("bit_exact", C::Bool(true)),
-                ]),
+                C::map({
+                    let mut v = vec![
+                        // "byte-identity" alone for a format with nothing to
+                        // dequantize: every tensor is compared in full rather
+                        // than sampled.
+                        ("method", C::text(self.verify_method)),
+                        ("tensors_checked", C::U(self.verified_tensors as u64)),
+                        ("bytes_checked", C::U(self.verified_bytes)),
+                        ("bit_exact", C::Bool(true)),
+                    ];
+                    if self.dequant_checked > 0 {
+                        v.push(("elements_dequantized", C::U(self.dequant_checked)));
+                    }
+                    v
+                }),
             ),
             (
                 "warnings",

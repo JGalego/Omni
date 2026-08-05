@@ -45,6 +45,8 @@ $ ./target/release/omni strip model.omni --weights -o catalogue.omni   # §13.8
 $ ./target/release/omni import safetensors w.safetensors -o w.omni  # with a report
 $ ./target/release/omni export safetensors w.omni --plan            # what it would cost
 $ ./target/release/omni import peft ./lora --base w.omni -o lora.omni  # a LoRA, pinned
+$ ./target/release/omni import gptq ./model-gptq -o m.omni    # §05.2.2, as expressions
+$ ./target/release/omni import awq ./model-awq -o m.omni      # §05.2.3
 $ ./target/release/omni serve model.omni --port 8080    # §13.4.3 object server
 $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with oras
 ```
@@ -53,7 +55,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors and PEFT import, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors, PEFT, GPTQ and AWQ import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
@@ -225,6 +227,27 @@ implemented:
   when the base actually names its axes: a base imported from safetensors names
   none, because safetensors says nothing about them, and asserting a requirement
   the base cannot meet made every attach *invalid* instead of merely unchecked
+- **GPTQ and AWQ import**, which is where §05's claim gets tested: quantization is
+  a transformation and not a file type, so a packed 4-bit weight becomes
+  `permute(dequantize(reshape(permute(qweight)), scheme))` and needs nothing new
+  in the evaluator. The int4-in-int32 packing is a `packed` layout, AWQ's GEMM
+  interleave is a `gather`, GPTQ's act-order is a `gather`, and the arithmetic is
+  one `dequantize` whose `formula` comes from §05.1's closed set. The packed words
+  go in unchanged, so the container is expressions *over the source bytes* rather
+  than a conversion of them.
+  Byte identity is not enough to claim that, and the implementation says so: the
+  words are copied verbatim, so comparing them proves nothing about whether they
+  are being *read* right. Every layer is therefore dequantized through the
+  expression graph and compared against scalar code that shares nothing with the
+  evaluator — the check that catches a wrong interleave, a transposed axis, or a
+  zero-point convention applied backwards. §05.1 says the closed `formula` set
+  exists because *whether the zero point is subtracted before or after scaling is
+  a recurring source of silent corruption when converting between GPTQ, AWQ and
+  GGUF*; this is where that bites, because AutoGPTQ's original checkpoint format
+  stores every zero point one low and nothing in the tensors says so. The offset
+  is read from `checkpoint_format`, written as an explicit `+1` node, and named in
+  the report — and an unrecognised `checkpoint_format` is refused rather than
+  guessed, because guessing shifts every weight by one quantization step
 - **safetensors, both directions**, with the importer and exporter contracts of
   `docs/design/import-export.md` §1 implemented rather than paraphrased: every
   tensor verified byte-for-byte against the source before the import claims to
@@ -258,10 +281,13 @@ What is **not** implemented, and is reported as such rather than faked:
   layout, but the push itself needs bearer-token auth and chunked blob uploads
   against a live registry, which is a client rather than a format concern
 - `omni mount` (§13.9), which needs FUSE
-- Every importer and exporter except safetensors and PEFT. The capability matrix
-  in `docs/design/import-export.md` §3 has 25 rows and this build implements two
-  of them; GGUF, PyTorch, ONNX, GPTQ and AWQ do not exist, and a request for one
-  is refused by name rather than half-attempted
+- Every importer and exporter except safetensors, PEFT, GPTQ and AWQ. The
+  capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
+  build implements four of them; GGUF, PyTorch, ONNX and EXL2 do not exist, and a
+  request for one is refused by name rather than half-attempted. Export is
+  narrower still: safetensors only, so a GPTQ import can be dequantized out but
+  not written back as GPTQ. 3-bit GPTQ and AWQ's `gemv`/`marlin` versions are
+  refused for the reasons named above
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
@@ -273,7 +299,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-392 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+405 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -436,6 +462,22 @@ that the imported adapter pins its base by digest, declares it as a non-required
 parent that `delta::parents` can actually read back, and attaches to that base
 binding each layer's own factors while touching nothing it did not train.
 
+And, for GPTQ and AWQ, the tests that would notice a wrong answer rather than a
+crash: that a fixture packed by the formats' own rules dequantizes to values
+computed in the test, so the transpose, the interleave and the grouping are each
+checked against arithmetic and not against the importer; that reading AWQ's
+`qweight` with GPTQ's layout gives a *different* answer, because a test that
+passed either way would be testing nothing; that the two `checkpoint_format`
+conventions differ by exactly one scale in every weight, and that which one was
+assumed is in the report; that `g_idx` decides whether act-order is a gather and
+`desc_act` does not, with the disagreement reported; that an ascending `g_idx` is
+checked to be ascending rather than ignored, and is the one source tensor not
+stored because `group_size` already says it; that 3-bit GPTQ, 8-bit AWQ, `gemv`,
+an unknown checkpoint format and a config naming the other method are each refused
+by name; that a `scales` grid disagreeing with `group_size` is an error rather
+than a plausible dequantization; and that a layer too large to dequantize whole
+says so instead of being silently skipped.
+
 [OCI image layout]: https://github.com/opencontainers/image-spec/blob/main/image-layout.md
 And, for the WebAssembly host: that
 arithmetic, locals, a real loop, memory loads and stores, `call`,
@@ -480,7 +522,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 392 passed; 0 failed
+test result: ok. 405 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -755,6 +755,197 @@ jobs:
                     http://127.0.0.1:18781/served.omni)" = 100
           echo "the object server serves both layouts of §13.4 and refuses the rest"
 
+      # §05's central claim is that quantization is a transformation and not a
+      # file type: a GPTQ or AWQ weight is `dequantize(packed_words, scheme)` and
+      # needs no new mechanism. The test of that claim is not that the importer
+      # runs — it is that the numbers come out right, so the fixture is built
+      # from the two formats' own packing rules in Python and the dequantized
+      # result is compared against Python's arithmetic, not against OMNI's.
+      - name: A GPTQ and an AWQ checkpoint dequantize to the right numbers
+        run: |
+          OMNI=reference/target/release/omni
+
+          python3 - <<'PY_Q'
+          import json, os, struct
+          # AutoAWQ's REVERSE_AWQ_PACK_ORDER: its GEMM kernel wants a word's
+          # columns in the order 0 2 4 6 1 3 5 7, so a sequential unpack comes
+          # out permuted and something has to undo it.
+          AWQ_REVERSE = [0, 4, 1, 5, 2, 6, 3, 7]
+          ROWS, COLS, GS = 32, 16, 16          # in_features, out_features, group
+          GROUPS = ROWS // GS
+          LAYERS = ["model.layers.0.self_attn.q_proj", "model.layers.0.mlp.down_proj"]
+
+          def q_of(n):  return [[(i * 7 + j * 11 + n * 3) % 16 for j in range(COLS)]
+                                for i in range(ROWS)]
+          def z_of():   return [[5 + ((g + j) % 3) for j in range(COLS)]
+                                for g in range(GROUPS)]
+          # Powers of two, so every product is exact in f16 and a mismatch is a
+          # real mismatch rather than rounding.
+          def s_of():   return [[0.25 * (1 << ((g + j) % 3)) for j in range(COLS)]
+                                for g in range(GROUPS)]
+
+          def pack_down_in(q, bits=4):
+              epw, out = 32 // bits, b""
+              for r in range(len(q) // epw):
+                  for j in range(len(q[0])):
+                      w = 0
+                      for s in range(epw):
+                          w |= q[r * epw + s][j] << (bits * s)
+                      out += struct.pack("<I", w)
+              return out
+
+          def pack_along_out(q, bits=4, interleave=False):
+              epw, out = 32 // bits, b""
+              for row in q:
+                  for g in range(len(row) // epw):
+                      w = 0
+                      for c in range(epw):
+                          slot = AWQ_REVERSE[c] if interleave else c
+                          w |= row[g * epw + c] << (bits * slot)
+                      out += struct.pack("<I", w)
+              return out
+
+          def write_st(path, entries):
+              data, head = b"", {}
+              for name, dtype, shape, payload in entries:
+                  head[name] = {"dtype": dtype, "shape": shape,
+                                "data_offsets": [len(data), len(data) + len(payload)]}
+                  data += payload
+              h = json.dumps(head).encode()
+              open(path, "wb").write(struct.pack("<Q", len(h)) + h + data)
+
+          for method in ("gptq", "awq"):
+              d = f"/tmp/{method}-model"
+              os.makedirs(d, exist_ok=True)
+              entries = []
+              for n, prefix in enumerate(LAYERS):
+                  q, z, s = q_of(n), z_of(), s_of()
+                  if method == "gptq":
+                      qw, shape = pack_down_in(q), [ROWS // 8, COLS]
+                  else:
+                      qw, shape = pack_along_out(q, interleave=True), [ROWS, COLS // 8]
+                  entries += [
+                      (f"{prefix}.qweight", "I32", shape, qw),
+                      (f"{prefix}.qzeros", "I32", [GROUPS, COLS // 8],
+                       pack_along_out(z, interleave=(method == "awq"))),
+                      (f"{prefix}.scales", "F16", [GROUPS, COLS],
+                       b"".join(struct.pack("<e", x) for row in s for x in row)),
+                      (f"{prefix}.bias", "F16", [COLS],
+                       b"".join(struct.pack("<e", 0.0) for _ in range(COLS))),
+                  ]
+                  if method == "gptq":
+                      entries.append((f"{prefix}.g_idx", "I32", [ROWS],
+                                      b"".join(struct.pack("<i", i // GS)
+                                               for i in range(ROWS))))
+              # The tensors nobody quantized, which must survive untouched.
+              entries.append(("model.norm.weight", "F16", [COLS],
+                              b"".join(struct.pack("<e", 1.0) for _ in range(COLS))))
+              write_st(f"{d}/model.safetensors", entries)
+
+          json.dump({"bits": 4, "group_size": GS, "desc_act": False, "sym": True,
+                     "quant_method": "gptq", "checkpoint_format": "gptq"},
+                    open("/tmp/gptq-model/quantize_config.json", "w"))
+          json.dump({"quantization_config": {"bits": 4, "group_size": GS,
+                                             "zero_point": True, "quant_method": "awq",
+                                             "version": "gemm"}},
+                    open("/tmp/awq-model/config.json", "w"))
+
+          # What the dequantized q_proj weight must be, in [out, in] order. The
+          # `+1` is AutoGPTQ's original format storing each zero point one low;
+          # AWQ stores them as they are. That one step is the difference §05.1's
+          # closed `formula` set exists to make unambiguous.
+          for method, plus in (("gptq", 1), ("awq", 0)):
+              q, z, s = q_of(0), z_of(), s_of()
+              want = b""
+              for j in range(COLS):
+                  for i in range(ROWS):
+                      g = i // GS
+                      want += struct.pack("<e", (q[i][j] - (z[g][j] + plus)) * s[g][j])
+              open(f"/tmp/{method}-want.bin", "wb").write(want)
+          print("fixtures: 2 layers x 2 formats, from the formats' own packing rules")
+          PY_Q
+
+          for m in gptq awq; do
+            "$OMNI" import "$m" "/tmp/$m-model" -o "/tmp/$m.omni" | tee "/tmp/$m-imp.txt"
+            # I4 for a quantized import cannot stop at byte identity: the packed
+            # words are copied verbatim, so comparing them proves nothing about
+            # whether they are read correctly. Both layers are dequantized whole
+            # and compared. 2 layers x 32 x 16 = 1,024 elements.
+            grep -q '1,024 element(s) compared against an independent' "/tmp/$m-imp.txt"
+            grep -q '2 quantized, 3 tensor(s) imported unchanged' "/tmp/$m-imp.txt"
+            "$OMNI" verify "/tmp/$m.omni" --level 6 | grep -q '^valid'
+            # The container is expressions over the source bytes, so the packed
+            # words are stored once and never expanded.
+            "$OMNI" ls "/tmp/$m.omni" | grep -q Provenance
+          done
+
+          # Which zero-point convention was assumed is in the report, not in
+          # someone's head (I3).
+          grep -q "zero point — one added, as AutoGPTQ's QuantLinear does" /tmp/gptq-imp.txt
+          grep -q 'zero point — used as stored' /tmp/awq-imp.txt
+          # g_idx was checked to be the ascending grouping rather than ignored.
+          grep -q 'g_idx — checked to equal i/16' /tmp/gptq-imp.txt
+
+          # And now the claim itself: export the dequantized weights and compare
+          # them with the arithmetic Python did, byte for byte.
+          for m in gptq awq; do
+            "$OMNI" export safetensors "/tmp/$m.omni" -o "/tmp/$m-deq.safetensors" \
+              --allow-lossy > /dev/null
+            python3 - "$m" <<'PY_CHECK'
+          import json, struct, sys
+          m = sys.argv[1]
+          raw = open(f"/tmp/{m}-deq.safetensors", "rb").read()
+          n = struct.unpack("<Q", raw[:8])[0]
+          head = json.loads(raw[8:8 + n])
+          e = head["model.layers.0.self_attn.q_proj.weight"]
+          assert e["dtype"] == "F16", e["dtype"]
+          assert e["shape"] == [16, 32], e["shape"]
+          lo, hi = e["data_offsets"]
+          got = raw[8 + n + lo:8 + n + hi]
+          want = open(f"/tmp/{m}-want.bin", "rb").read()
+          if got != want:
+              bad = [i for i in range(0, len(want), 2) if got[i:i+2] != want[i:i+2]]
+              raise SystemExit(f"{m}: {len(bad)} of {len(want)//2} elements differ, "
+                               f"first at {bad[0]//2}")
+          print(f"{m}: {len(want)//2} dequantized elements match Python exactly")
+          PY_CHECK
+          done
+
+          # What is refused, is refused by name rather than read as the other
+          # thing. Reading an AWQ qweight as GPTQ's differs by a transpose: it
+          # would not fail, it would be wrong.
+          set +e
+          "$OMNI" import gptq /tmp/awq-model -o /tmp/wrong.omni > /tmp/cross.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'quant_method' /tmp/cross.txt
+
+          # An unknown checkpoint format is exactly the case where guessing the
+          # zero-point convention shifts every weight by one step.
+          python3 -c "import json; json.dump({'bits':4,'group_size':16,\
+            'quant_method':'gptq','checkpoint_format':'gptq_v9'},\
+            open('/tmp/gptq-model/quantize_config.json','w'))"
+          set +e
+          "$OMNI" import gptq /tmp/gptq-model -o /tmp/wrong.omni > /tmp/fmt.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'gptq_v9' /tmp/fmt.txt
+          # 3-bit GPTQ straddles the 32-bit word boundary, so it is not a packed
+          # layout at all.
+          python3 -c "import json; json.dump({'bits':3,'group_size':16,\
+            'quant_method':'gptq'}, open('/tmp/gptq-model/quantize_config.json','w'))"
+          set +e
+          "$OMNI" import gptq /tmp/gptq-model -o /tmp/wrong.omni > /tmp/bits.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'straddle' /tmp/bits.txt
+          test ! -f /tmp/wrong.omni
+
+          echo "GPTQ and AWQ import as expressions, and dequantize to the numbers Python computes"
+
       # Phase 1's premise: OMNI is worth nothing if it cannot absorb the
       # existing world without losing anything. safetensors is the format with
       # the least excuse, and the capability matrix calls its round-trip

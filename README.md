@@ -104,8 +104,9 @@ templates (`render`), print, verify and lower an execution graph (`graph`), run
 an embedded WebAssembly plugin (`plugin`), and separate a training checkpoint
 from the weights it shares (`strip`, `log`, `reshard`), read a container over
 HTTP one range at a time, serve one, or map one onto an OCI registry (`index`,
-`fetch`, `serve`, `oci`), and absorb or emit safetensors with a
-fidelity report rather than a shrug (`import`, `export`) — the full tour is in
+`fetch`, `serve`, `oci`), and absorb safetensors, a PEFT LoRA or a GPTQ/AWQ
+checkpoint — and emit safetensors — with a fidelity report rather than a shrug
+(`import`, `export`) — the full tour is in
 [`reference/README.md`](reference/README.md).
 
 ## Look inside one
@@ -190,9 +191,12 @@ typing and range pushdown, quantization and sparsity, compression (including
 and deltas, OMNI-IR with its dialects and rewrites, capability negotiation,
 signatures, training state, a WebAssembly host for plugins, HTTP range transport
 with the detached index sidecar, an object server and the OCI mapping, and
-lossless safetensors import and export, and PEFT LoRA import. What is *not* implemented is stated in
+lossless safetensors import and export, and PEFT LoRA, GPTQ and AWQ import — the
+last two as expressions over the packed words rather than as a conversion of them,
+checked by dequantizing every layer and comparing against arithmetic done in
+Python. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
-it — every importer and exporter except safetensors and PEFT, `https://` (TLS
+it — every importer but those four and every exporter but safetensors, `https://` (TLS
 needs a dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
 plugin host, and the MAY-level codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See
