@@ -247,6 +247,26 @@ jobs:
           "$OMNI" inspect /tmp/ct.omni | grep -q 'chat template omni-ct/1'
           echo "the template renders identically, or says why not"
 
+      # §02.7 and §04.7.4 are claims about I/O, and an implementation that reads
+      # the whole file cannot demonstrate either. This measures them.
+      - name: Opening a container reads its framing, not its weights
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" open examples/toy.omni | tee /tmp/open.txt
+          grep -q '4 reads' /tmp/open.txt
+          # A partial read moves exactly what the plan said, and nothing else.
+          "$OMNI" open examples/toy.omni --tensor model.embed_tokens.weight \
+            --range 0:64 | tee /tmp/range.txt
+          grep -q 'plan         1 chunk read(s), 128 B' /tmp/range.txt
+          grep -q 'payload      1 reads, 128 B moved for 128 B planned' /tmp/range.txt
+          python3 - <<'PY'
+          import re
+          txt = open('/tmp/range.txt').read()
+          pct = float(re.search(r'total .*\(([\d.]+) % of the file\)', txt).group(1))
+          assert pct < 10, f"reading 64 elements touched {pct} % of the file"
+          print(f"64 of 16384 elements cost {pct} % of the file")
+          PY
+
       # §09.1: training state is separable, and the rule is normative — the
       # inference artifact and the checkpoint must never be the same download.
       - name: A checkpoint separates from its own weights

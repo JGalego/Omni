@@ -68,7 +68,7 @@ pub use expr::{Expr, Tensor};
 pub use layout::Layout;
 pub use model::{ModelBuilder, TensorSpec};
 pub use sha256::hex;
-pub use store::{ContainerStore, DirStore, MemoryStore, Store, WritableStore};
+pub use store::{ContainerStore, DirStore, FileStore, MemoryStore, Store, WritableStore};
 
 /// The specification version this implementation targets.
 pub const SPEC_VERSION: &str = "OMNI/1.0-draft";

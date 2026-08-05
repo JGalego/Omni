@@ -132,6 +132,9 @@ VERBS:
                               --tokenizer attaches a byte-level tokenizer and
                               --chat-template an OMNI-CT template, both with
                               conformance vectors
+    open    <file.omni> [--tensor <name>] [--range A:B]
+                              Open the file the way §02.7 says a seek-capable
+                              reader should, and report the I/O it cost
     bench   [--objects N] [--lookups N]
                               Measure index lookup latency against Gate 0
 
@@ -172,6 +175,7 @@ fn main() -> ExitCode {
         "delta" => cmd_delta(&args),
         "adapter" => cmd_adapter(&args),
         "bench" => cmd_bench(&args),
+        "open" => cmd_open(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
         other => {
@@ -3053,6 +3057,141 @@ fn cmd_fsck(args: &[String]) -> R {
 /// Gate 0 requires index lookup p99 under 500 ns at 10⁶ objects, and says that
 /// if the index cannot hit it, the index format changes now rather than later.
 /// This is the measurement that decides.
+/// `omni open` — what reading a container actually costs.
+///
+/// §02.7 claims a two-read open and §04.7.4 claims a partial tensor read fetches
+/// only its bytes. Both are claims about I/O, and neither can be demonstrated by
+/// an implementation that starts by reading the whole file — which is what
+/// `Container::open` does. This verb uses the random-access store instead and
+/// prints the reads and bytes, so the numbers are measured rather than argued.
+fn cmd_open(args: &[String]) -> R {
+    use omni_core::store::FileStore;
+    let Some(path) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let total = std::fs::metadata(path)?.len();
+    let s = FileStore::open(path)?;
+    let (reads, bytes) = s.io();
+    pr!("{path}  {}", human(total));
+    pr!(
+        "  open         {reads} reads, {} ({:.4} % of the file)",
+        human(bytes),
+        100.0 * bytes as f64 / total as f64
+    );
+    pr!("  index        {} objects", commas(s.index().len() as u64));
+    pr!("  hash         {}", s.header().hash.name());
+    pr!(
+        "  root         {}",
+        short(s.header().hash, &s.header().root_digest)
+    );
+
+    // Reading a tensor through the same store: the manifest, the model, the
+    // table, the descriptor, then the chunk — and for a range, only the range.
+    if let Some(name) = flag(args, "--tensor") {
+        let before = s.io();
+        let root = omni_core::cbor::decode(
+            &Store::resolve(&s, &s.header().root_digest)?.ok_or("no root object")?,
+        )?;
+        let model_d = root
+            .get("assets")
+            .and_then(|a| a.get("model"))
+            .and_then(as_ref_digest)
+            .ok_or("no model asset")?;
+        let model = omni_core::cbor::decode(
+            &Store::resolve(&s, &model_d)?.ok_or("the model object is absent")?,
+        )?;
+        let table_d = model
+            .get("tensors")
+            .and_then(as_ref_digest)
+            .ok_or("no tensor table")?;
+        let table = TensorTable::from_value(&omni_core::cbor::decode(
+            &Store::resolve(&s, &table_d)?.ok_or("the tensor table is absent")?,
+        )?)?;
+        let Some(desc_ref) = table.get(name) else {
+            prr!("omni: no tensor named `{name}`\n");
+            return Ok(2);
+        };
+        let desc = TensorDesc::from_value(&omni_core::cbor::decode(
+            &Store::resolve(&s, &desc_ref.1)?.ok_or("the descriptor is absent")?,
+        )?)?;
+        let metadata = s.io();
+        pr!(
+            "  metadata     {} reads, {} to reach `{name}`",
+            metadata.0 - before.0,
+            human(metadata.1 - before.1)
+        );
+
+        let ctx = Ctx::new(&s);
+        let range = flag(args, "--range").and_then(|r| {
+            let (a, b) = r.split_once(':')?;
+            Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
+        });
+        if let Some((a, b)) = range {
+            {
+                // §04.7.4's pushdown as a plan, then the reads it plans. The
+                // point of this verb is that the second matches the first.
+                let deps = desc.value.deps((a, b));
+                let want: u64 = deps.iter().map(|d| d.bytes.1 - d.bytes.0).sum();
+                pr!(
+                    "  plan         {} chunk read(s), {} of tensor payload{}",
+                    deps.len(),
+                    human(want),
+                    if deps.iter().all(|d| d.exact) {
+                        ""
+                    } else {
+                        " (a superset: the expression is not monotone in the index)"
+                    }
+                );
+                let mut got = 0u64;
+                for d in &deps {
+                    let Some(src) = d.source else {
+                        prr!("omni: this tensor depends on an external locator; nothing to read here\n");
+                        return Ok(3);
+                    };
+                    let n = d.bytes.1 - d.bytes.0;
+                    match Store::resolve_range(&s, &src.1, d.bytes.0, n)? {
+                        Some(bytes) => got += bytes.len() as u64,
+                        None => {
+                            prr!("omni: chunk {} is absent\n", short(s.header().hash, &src.1));
+                            return Ok(5);
+                        }
+                    }
+                }
+                let after = s.io();
+                pr!(
+                    "  payload      {} reads, {} moved for {} planned",
+                    after.0 - metadata.0,
+                    human(after.1 - metadata.1),
+                    human(got)
+                );
+                pr!(
+                    "  total        {} reads, {} ({:.4} % of the file) for elements {a}..{b}",
+                    after.0,
+                    human(after.1),
+                    100.0 * after.1 as f64 / total as f64
+                );
+                return Ok(0);
+            }
+        }
+        let value = desc.value.eval(&ctx)?;
+        let after = s.io();
+        pr!(
+            "  payload      {} reads, {} for {} element(s)",
+            after.0 - metadata.0,
+            human(after.1 - metadata.1),
+            commas(value.data.len() as u64)
+        );
+        pr!(
+            "  total        {} reads, {} ({:.2} % of the file)",
+            after.0,
+            human(after.1),
+            100.0 * after.1 as f64 / total as f64
+        );
+    }
+    Ok(0)
+}
+
 fn cmd_bench(args: &[String]) -> R {
     let n: usize = flag(args, "--objects")
         .and_then(|s| s.parse().ok())

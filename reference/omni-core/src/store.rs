@@ -816,3 +816,342 @@ mod tests {
         p
     }
 }
+
+// ------------------------------------------------------- random-access file --
+
+/// A container read from a file, one range at a time.
+///
+/// [`crate::Container`] takes a `Vec<u8>` — the whole file in memory. That is
+/// fine for a toy and wrong for the thing OMNI is for: §02.7's two-read open and
+/// §04.7.4's partial reads are both claims about *I/O*, and neither can be
+/// demonstrated by an implementation that has already read everything. This
+/// store issues real reads and counts them.
+///
+/// It is not `mmap`. `mmap` needs `unsafe` and this crate forbids it (§12.4), and
+/// the interesting property — that a reader touches only the bytes it needs — is
+/// a property of the access pattern, not of the syscall. What a production
+/// implementation gains from `mmap` is the page cache doing the buffering; what
+/// it does not gain is a different parse.
+pub struct FileStore {
+    file: std::cell::RefCell<std::fs::File>,
+    header: crate::container::Header,
+    superblock: Value,
+    index: Vec<crate::container::IndexEntry>,
+    /// Reads issued and bytes moved, so the cost of an open is a measurement.
+    reads: std::cell::Cell<u64>,
+    bytes_read: std::cell::Cell<u64>,
+}
+
+impl FileStore {
+    /// Opens a container the way §02.7 says a seek-capable reader should:
+    /// trailer, then one jump to the superblock, then the index.
+    ///
+    /// Four reads, not two: the header (which carries the digest algorithm the
+    /// superblock check needs), the trailer, the superblock, the index. §02.7's
+    /// "two reads" counts the ones that scale — superblock and index — and a
+    /// reader that already knows the file's first and last 128 bytes issues
+    /// exactly those two. Both numbers are reported rather than rounded.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Res<FileStore> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
+        let size = file.metadata().map_err(Error::Io)?.len();
+        let reads = std::cell::Cell::new(0);
+        let bytes_read = std::cell::Cell::new(0);
+        let at = |f: &mut std::fs::File, off: u64, n: usize| -> Res<Vec<u8>> {
+            if off.saturating_add(n as u64) > size {
+                return Err(Error::Corrupt("read past the end of the file".into()));
+            }
+            f.seek(SeekFrom::Start(off)).map_err(Error::Io)?;
+            let mut buf = vec![0u8; n];
+            f.read_exact(&mut buf).map_err(Error::Io)?;
+            reads.set(reads.get() + 1);
+            bytes_read.set(bytes_read.get() + n as u64);
+            Ok(buf)
+        };
+
+        const HEADER_SIZE: usize = 128;
+        const TRAILER_SIZE: usize = 64;
+        if size < (HEADER_SIZE + TRAILER_SIZE) as u64 {
+            return Err(Error::Corrupt("file too small to be a container".into()));
+        }
+        let head = at(&mut file, 0, HEADER_SIZE)?;
+        let tail = at(&mut file, size - TRAILER_SIZE as u64, TRAILER_SIZE)?;
+
+        // The framing checks that do not need the body: the same rules
+        // `Container::open` applies, against the same bytes.
+        let header = crate::container::parse_header_bytes(&head, size)
+            .map_err(|e| Error::Corrupt(e.to_string()))?;
+        let sb_off = u64::from_le_bytes(tail[0..8].try_into().unwrap());
+        let sb_len = u64::from_le_bytes(tail[8..16].try_into().unwrap());
+        let sb_digest: Digest = tail[16..48].try_into().unwrap();
+        if tail[56..64] != *b"\x1a\x0a\x0dINMO\x89" {
+            return Err(Error::Corrupt("trailer magic mismatch (R-C09)".into()));
+        }
+        let tcrc = u32::from_le_bytes(tail[52..56].try_into().unwrap());
+        if crate::crc32c::crc32c(&tail[0..52]) != tcrc {
+            return Err(Error::Corrupt("trailer CRC mismatch (R-C09)".into()));
+        }
+        if sb_len > 1 << 24 {
+            return Err(Error::Corrupt("superblock is implausibly large".into()));
+        }
+        let sb_bytes = at(&mut file, sb_off, sb_len as usize)?;
+        if header.hash.digest(&sb_bytes) != sb_digest {
+            return Err(Error::Corrupt("superblock digest mismatch (R-C09)".into()));
+        }
+        let superblock =
+            crate::cbor::decode(&sb_bytes).map_err(|e| Error::Corrupt(e.to_string()))?;
+        let idx = superblock
+            .get("index")
+            .ok_or_else(|| Error::Corrupt("superblock has no index".into()))?;
+        let ioff = idx.get("off").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ilen = idx.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+        if ilen > 1 << 32 {
+            return Err(Error::Corrupt("index is implausibly large".into()));
+        }
+        // §02.6: the index is a fixed-layout table. One read, whatever its size.
+        const IDX_HEADER: u64 = 64;
+        let index_bytes = at(
+            &mut file,
+            ioff.saturating_sub(IDX_HEADER),
+            (ilen + IDX_HEADER) as usize,
+        )?;
+        let index =
+            crate::container::parse_index_bytes(&index_bytes, IDX_HEADER as usize, ilen as usize)
+                .map_err(|e| Error::Corrupt(e.to_string()))?;
+
+        Ok(FileStore {
+            file: std::cell::RefCell::new(file),
+            header,
+            superblock,
+            index,
+            reads,
+            bytes_read,
+        })
+    }
+
+    pub fn header(&self) -> &crate::container::Header {
+        &self.header
+    }
+
+    pub fn superblock(&self) -> &Value {
+        &self.superblock
+    }
+
+    pub fn index(&self) -> &[crate::container::IndexEntry] {
+        &self.index
+    }
+
+    /// `(reads issued, bytes moved)` so far.
+    pub fn io(&self) -> (u64, u64) {
+        (self.reads.get(), self.bytes_read.get())
+    }
+
+    pub fn find(&self, d: &Digest) -> Option<&crate::container::IndexEntry> {
+        let i = self.index.binary_search_by(|e| e.digest.cmp(d)).ok()?;
+        self.index.get(i)
+    }
+
+    fn read_at(&self, off: u64, n: usize) -> Res<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = self.file.borrow_mut();
+        f.seek(SeekFrom::Start(off)).map_err(Error::Io)?;
+        let mut buf = vec![0u8; n];
+        f.read_exact(&mut buf).map_err(Error::Io)?;
+        self.reads.set(self.reads.get() + 1);
+        self.bytes_read.set(self.bytes_read.get() + n as u64);
+        Ok(buf)
+    }
+
+    /// The stored (possibly compressed) bytes of an object.
+    fn stored(&self, e: &crate::container::IndexEntry) -> Res<Vec<u8>> {
+        self.read_at(e.offset, e.stored_len as usize)
+    }
+}
+
+impl Store for FileStore {
+    fn hash(&self) -> HashAlgo {
+        self.header.hash
+    }
+
+    fn resolve(&self, d: &Digest) -> Res<Option<Vec<u8>>> {
+        let Some(e) = self.find(d) else {
+            return Ok(None);
+        };
+        if e.oflags & crate::container::oflags::EXTERNAL != 0 {
+            return Ok(None);
+        }
+        let stored = self.stored(e)?;
+        let codec = crate::codec::Codec::from_id(e.codec);
+        let logical = match codec {
+            crate::codec::Codec::Raw => stored,
+            other => other
+                .decode(&stored, e.logical_len, false)
+                .map_err(|err| Error::Corrupt(err.to_string()))?,
+        };
+        // The digest is the whole point of reading it this way.
+        if self.header.hash.digest(&logical) != *d {
+            return Err(Error::Corrupt(format!(
+                "R-O01: digest mismatch for {}",
+                crate::sha256::hex(d)
+            )));
+        }
+        Ok(Some(logical))
+    }
+
+    /// A range read that really is one: §04.7.4's partial loading is worth
+    /// nothing if the reader pulls the whole object first.
+    ///
+    /// Only uncompressed objects can be served this way. A compressed one has to
+    /// be decoded from its start, and pretending otherwise would return the
+    /// wrong bytes — so it falls back to the whole object, which is the honest
+    /// cost of compressing a thing you meant to read in pieces.
+    fn resolve_range(&self, d: &Digest, off: u64, n: u64) -> Res<Option<Vec<u8>>> {
+        let Some(e) = self.find(d) else {
+            return Ok(None);
+        };
+        if e.codec != crate::codec::id::RAW || e.oflags & crate::container::oflags::EXTERNAL != 0 {
+            let whole = self.resolve(d)?;
+            return Ok(whole.map(|b| {
+                let s = (off as usize).min(b.len());
+                let end = s.saturating_add(n as usize).min(b.len());
+                b[s..end].to_vec()
+            }));
+        }
+        if off >= e.logical_len {
+            return Ok(Some(Vec::new()));
+        }
+        let take = n.min(e.logical_len - off);
+        Ok(Some(self.read_at(e.offset + off, take as usize)?))
+    }
+
+    fn has(&self, d: &Digest) -> Res<bool> {
+        Ok(self.find(d).is_some())
+    }
+}
+
+impl EnumerableStore for FileStore {
+    fn iter(&self) -> Res<Vec<Digest>> {
+        Ok(self.index.iter().map(|e| e.digest).collect())
+    }
+}
+
+#[cfg(test)]
+mod file_store_tests {
+    use super::*;
+    use crate::container::{pack, PackOptions};
+
+    fn checkpoint_file(name: &str) -> (std::path::PathBuf, Digest, Vec<Digest>) {
+        // A container with a few megabytes of tensor, so "reads only what it
+        // needs" is a statement about something.
+        let data: Vec<u8> = (0..(2 << 20u32)).map(|i| (i % 251) as u8).collect();
+        let (objects, root) = crate::model::ModelBuilder::new("test/file-store")
+            .chunk_size(1 << 20)
+            .tensor(crate::model::TensorSpec {
+                name: "w".into(),
+                shape: vec![1024, 1024],
+                dtype: crate::dtype::DType::BF16,
+                axes: None,
+                semantic: "weight",
+                data,
+            })
+            .build();
+        let bytes = pack(&objects, &root, &PackOptions::default()).unwrap();
+        // Each test gets its own directory: these run in parallel, and a shared
+        // one would have them deleting each other's files.
+        let dir = std::env::temp_dir().join(format!("omni-filestore-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.omni");
+        std::fs::write(&path, &bytes).unwrap();
+        let blobs: Vec<Digest> = crate::container::Container::open(bytes)
+            .unwrap()
+            .index
+            .iter()
+            .filter(|e| e.otype == otype::BLOB)
+            .map(|e| e.digest)
+            .collect();
+        (path, root, blobs)
+    }
+
+    #[test]
+    fn opening_a_container_reads_the_framing_and_nothing_else() {
+        let (path, root, blobs) = checkpoint_file("open");
+        let total = std::fs::metadata(&path).unwrap().len();
+        let s = FileStore::open(&path).unwrap();
+        let (reads, bytes) = s.io();
+        // Header, trailer, superblock, index: four reads, and none of them the
+        // tensor.
+        assert_eq!(reads, 4, "an open should not need more than four reads");
+        assert!(bytes * 100 < total, "opening read {bytes} of {total} bytes");
+        assert_eq!(s.header().root_digest, root);
+        assert!(!s.index().is_empty());
+
+        // The root parses from what the open already read plus one object.
+        let before = s.io().0;
+        let manifest = s.resolve(&root).unwrap().unwrap();
+        assert!(!manifest.is_empty());
+        assert_eq!(s.io().0, before + 1);
+
+        // A range read of a 1 MiB chunk touches its bytes, not the chunk.
+        let big = blobs
+            .iter()
+            .find(|d| s.find(d).is_some_and(|e| e.logical_len > 1 << 19))
+            .expect("a large chunk");
+        let (_, before) = s.io();
+        let part = s.resolve_range(big, 4096, 512).unwrap().unwrap();
+        let (_, after) = s.io();
+        assert_eq!(part.len(), 512);
+        assert_eq!(
+            after - before,
+            512,
+            "a range read moved more than its range"
+        );
+
+        // And the whole object still verifies, which is what a range read cannot
+        // do on its own (§13.3 is the answer to that, not this).
+        let whole = s.resolve(big).unwrap().unwrap();
+        assert_eq!(whole[4096..4608], part[..]);
+        assert_eq!(s.hash().digest(&whole), *big);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_file_store_refuses_a_damaged_container() {
+        let (path, _, _) = checkpoint_file("damaged");
+        let mut bytes = std::fs::read(&path).unwrap();
+        // A wrecked trailer: the open must fail, not read garbage offsets.
+        let n = bytes.len();
+        bytes[n - 40] ^= 0xff;
+        let bad = path.with_extension("bad");
+        std::fs::write(&bad, &bytes).unwrap();
+        assert!(FileStore::open(&bad).is_err());
+
+        // A corrupted object body: the open succeeds — the framing is intact —
+        // and the *read* fails, which is where the digest lives.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let s = FileStore::open(&path).unwrap();
+        let victim = s
+            .index()
+            .iter()
+            .find(|e| e.otype == otype::BLOB)
+            .unwrap()
+            .clone();
+        drop(s);
+        bytes[victim.offset as usize + 7] ^= 1;
+        let tampered = path.with_extension("tampered");
+        std::fs::write(&tampered, &bytes).unwrap();
+        let s = FileStore::open(&tampered).unwrap();
+        assert!(matches!(s.resolve(&victim.digest), Err(Error::Corrupt(_))));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_file_store_layers_like_any_other() {
+        // §01.8: stores compose. A file-backed one is not a special case.
+        let (path, root, _) = checkpoint_file("layered");
+        let file = FileStore::open(&path).unwrap();
+        let empty = MemoryStore::new(file.hash());
+        let layered = Layered::new(vec![&empty as &dyn Store, &file as &dyn Store]).unwrap();
+        assert!(layered.resolve(&root).unwrap().is_some());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+}

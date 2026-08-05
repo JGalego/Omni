@@ -22,6 +22,7 @@ $ ./target/release/omni adapter check base.omni lora.omni
 $ ./target/release/omni example --tokenizer tok.omni
 $ ./target/release/omni verify tok.omni --tokenizer     # runs its §06.7.1 vectors
 $ ./target/release/omni tokenize tok.omni --text "hello"
+$ ./target/release/omni open model.omni --tensor w --range 0:64   # what a read costs
 $ ./target/release/omni example --training ckpt.omni    # a checkpoint with Adam state
 $ ./target/release/omni strip ckpt.omni --training -o infer.omni   # weights, unchanged
 $ ./target/release/omni reshard ckpt.omni --mesh tp=2 -o resharded.omni
@@ -42,7 +43,7 @@ $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_
 | Crate | Contents | Spec |
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, model builder | §01–§08, §10, §12, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · graph · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · tokenize · render · graph · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -169,13 +170,18 @@ What is **not** implemented, and is reported as such rather than faked:
 - §03.7's MAY-level codecs `lz4`, `brotli`, `xz`, `ans-lut` and the two lossy
   ones: reported as unsupported rather than half-decoded · §13 HTTP/OCI
   transport
-- `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
+- `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
+  for here: a container opened and read one range at a time, counting its reads,
+  so §02.7's two-read open and §04.7.4's partial reads are measurements
+  (`omni open`) rather than constructions. What a production reader gains from
+  `mmap` is the page cache doing the buffering; what it does not gain is a
+  different parse
 
 See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-312 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+315 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -187,7 +193,11 @@ dangling-ref-is-incomplete-not-invalid rule; and, for Bao, that the outboard
 root equals the object digest at every granularity, that each group verifies
 alone, that corruption stays localised, and that a tampered tree, a
 misdelivered range and an unverifiable request are all refused; and, for
-stores, a container→directory→container round trip that is byte-exact,
+stores, that opening a file-backed container costs four reads and under a percent
+of the file, that a range read moves exactly its range and no more, that a
+damaged trailer fails the open while a corrupted object body fails the *read*
+where the digest is, and a container→directory→container round trip that is
+byte-exact,
 type recovery from refs alone, detection of a file whose name lies about its
 contents, and refusal to mix digest algorithms; and, for recovery, that a
 container stripped of its index, superblock and trailer rebuilds byte-identically
@@ -293,7 +303,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 312 passed; 0 failed
+test result: ok. 315 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -1292,6 +1292,32 @@ pub fn scan_segments(bytes: &[u8]) -> Res<Vec<(usize, u16, u64)>> {
     Ok(out)
 }
 
+/// [`parse_header`] against a buffer that holds only the header, with the file's
+/// real length supplied separately — what a reader that has not read the file
+/// has.
+pub fn parse_header_bytes(head: &[u8], file_size: u64) -> Res<Header> {
+    if head.len() < HEADER_SIZE {
+        return Err(rule("R-C01", "header is shorter than 128 bytes"));
+    }
+    let mut h = parse_header(head)?;
+    if h.file_size != file_size {
+        return Err(rule(
+            "R-C01",
+            format!(
+                "header declares {} bytes, the file has {file_size}",
+                h.file_size
+            ),
+        ));
+    }
+    h.file_size = file_size;
+    Ok(h)
+}
+
+/// [`parse_index`] against a buffer holding just the index and its header.
+pub fn parse_index_bytes(b: &[u8], off: usize, len: usize) -> Res<Vec<IndexEntry>> {
+    parse_index(b, off, len)
+}
+
 pub fn parse_header(b: &[u8]) -> Res<Header> {
     if b.len() < HEADER_SIZE {
         return Err(rule("R-C01", "file too small to hold a header"));
