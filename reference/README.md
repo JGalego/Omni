@@ -19,6 +19,7 @@ $ ./target/release/omni verify  model.omni
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, model builder | §01–§04, §13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · pack · unpack · fsck · example` | design/cli.md |
+| `omni-conformance` | corpus generator and cross-implementation test runner | §15.3 |
 
 ## Deliberate constraints
 
@@ -50,6 +51,7 @@ implemented:
 - §13.3 Bao outboard trees: pruned encoding, range verification, proof sizing
 - §01.8 stores: memory, `.omnid/` directory, container, layered resolution
 - §02.8 recovery by segment scan (`omni fsck --rebuild`)
+- §15.3 conformance corpus v0 and runner protocol
 - §01 object model, refs, reachability, dangling-ref detection
 - §04.3 dtype descriptors and packed sizing
 - §15.1 validation levels V0–V4

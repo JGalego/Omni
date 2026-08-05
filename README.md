@@ -85,6 +85,7 @@ diagnostic listings of every object, and an independent digest verification.
 | [`docs/spec/`](docs/spec) | Normative specification (OMNI/1.0 draft) |
 | [`docs/design/`](docs/design) | Engineering proposal: import/export, CLI, SDK, performance, comparisons, roadmap |
 | [`docs/rationale/`](docs/rationale) | Design rationale and rejected alternatives |
+| [`conformance/`](conformance) | Conformance corpus: valid, invalid and forward-compatibility cases |
 | [`examples/`](examples) | Worked example files, CBOR diagnostic listings, hexdumps |
 | [`reference/`](reference) | Rust reference implementation (`omni-core`, `omni-cli`) |
 

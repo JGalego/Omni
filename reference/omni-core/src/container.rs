@@ -1033,12 +1033,31 @@ pub fn verify(c: &Container) -> Res<Report> {
         }
     }
 
-    // Every byte not covered by a segment header or payload must be zero.
+    // R-C07: every byte that is not part of the header, the trailer, a
+    // segment header, a superblock, the index or an object must be zero.
+    //
+    // Note what this deliberately does *not* treat as covered: a PAD segment's
+    // payload, and the gaps between objects inside OBJ and BLOB segments.
+    // Those are padding by definition, and exempting them would leave the
+    // format with several megabytes of unexamined space per container — a
+    // place to hide data that no reader parses and no digest covers.
     let mut covered = vec![false; c.bytes.len()];
     covered[..HEADER_SIZE].fill(true);
-    for (off, _, plen) in &segments {
-        let end = *off + SEG_HEADER_SIZE + *plen as usize;
-        covered[*off..end].fill(true);
+    for (off, kind, plen) in &segments {
+        covered[*off..*off + SEG_HEADER_SIZE].fill(true);
+        // Superblock and index payloads are content; OBJ and BLOB payloads are
+        // covered object by object below; PAD payloads are never covered.
+        if matches!(*kind, seg::SUPER | seg::INDEX | seg::SIG) {
+            let p = *off + SEG_HEADER_SIZE;
+            covered[p..p + *plen as usize].fill(true);
+        }
+    }
+    for e in &c.index {
+        let s = e.offset as usize;
+        let n = e.stored_len as usize;
+        if s.checked_add(n).is_some_and(|x| x <= covered.len()) {
+            covered[s..s + n].fill(true);
+        }
     }
     covered[c.bytes.len() - TRAILER_SIZE..].fill(true);
     let padding_ok = covered

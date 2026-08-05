@@ -187,6 +187,34 @@ jobs:
           check('/tmp/sha.omni', lambda b: hashlib.sha256(b).digest(), 'hashlib SHA-256')
           PY
 
+  conformance-suite:
+    name: conformance suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        working-directory: reference
+        run: cargo build --release
+
+      # The committed corpus must be reproducible from source. A corpus of
+      # opaque blobs nobody can regenerate stops being trustworthy the first
+      # time someone edits one by hand.
+      - name: Committed corpus matches a fresh generation
+        run: |
+          reference/target/release/omni-conformance generate /tmp/corpus
+          if ! diff -r /tmp/corpus conformance; then
+            echo "::error::the committed corpus differs from a fresh generation."
+            echo "Regenerate it: reference/target/release/omni-conformance generate conformance"
+            exit 1
+          fi
+          echo "corpus is reproducible from source"
+
+      - name: The reference implementation passes its own suite
+        run: |
+          reference/target/release/omni-conformance run conformance \
+            --impl reference/target/release/omni
+
   docs:
     name: docs
     runs-on: ubuntu-latest

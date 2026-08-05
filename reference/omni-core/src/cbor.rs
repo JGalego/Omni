@@ -57,7 +57,7 @@ impl std::fmt::Display for Error {
             Error::IndefiniteLength => write!(f, "indefinite-length item (D2)"),
             Error::DuplicateKey => write!(f, "duplicate map key (D4)"),
             Error::UnsortedKeys => write!(f, "map keys not in canonical order (D3)"),
-            Error::BadUtf8 => write!(f, "invalid UTF-8 in text string"),
+            Error::BadUtf8 => write!(f, "invalid UTF-8 in text string (R-E03)"),
             Error::Reserved(b) => write!(f, "reserved/unsupported initial byte 0x{b:02x}"),
             Error::UnregisteredTag(t) => write!(f, "unregistered tag {t} (D7)"),
             Error::LengthOverflow => write!(f, "declared length exceeds available input"),
