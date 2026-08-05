@@ -72,12 +72,16 @@ implemented:
 - §04.2 reader-side `TensorTable` and `TensorDesc` views, with the V5 tensor
   rules: R-T01 (declared type equals inferred type), R-T02 (chunk sizing),
   R-T03, R-T04, R-T05, R-T06, R-T07 and R-M01
+- §08.1–§08.5 adapters: the object, selectors and attachment rules with
+  R-A01–R-A03, the eight arithmetic methods built from core nodes, graph-level
+  methods carried as rewrites, and composition
 - §15.1 validation levels V0–V4 (V5 rules are implemented; the CLI ladder still
   stops at V4)
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §07 OMNI-IR · §08 adapters and deltas · §09 training state
+- §07 OMNI-IR · §09 training state
+- §08.6–§08.7 delta representations and parent resolution
 - §10 capability negotiation · §11 WASM plugins · §12.5 signatures
 - §03.7 compression codecs (only `raw`) · §13 HTTP/OCI transport
 - `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
@@ -86,7 +90,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-147 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+166 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -121,12 +125,17 @@ that glob captures index adapter tensors correctly and that catastrophic regex
 backtracking hits a step budget instead of hanging; and, for the V5 rules, that
 a declared shape, chunk total, layout, quantization scheme or statistic that
 disagrees with the value is reported as invalid while an unimplemented plugin or
-an absent object is reported as indeterminate. Every
+an absent object is reported as indeterminate; and, for adapters, that a LoRA
+attaches to a base it has never seen and binds each layer's own factors, that an
+unmatched selector, an unsatisfiable binding, a shape that cannot work and a
+violated `require` are each reported with their rule, that an absent base is
+incomplete rather than invalid, and that TIES, DARE and SLERP are reproducible
+from their recipes. Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 147 passed; 0 failed
+test result: ok. 166 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

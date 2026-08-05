@@ -18,7 +18,7 @@
 //!
 //! ## Not implemented here
 //!
-//! OMNI-IR (§07), adapters (§08), capability negotiation (§10), the WASM plugin host (§11), signatures (§12.5),
+//! OMNI-IR (§07), delta models (§08.6), capability negotiation (§10), the WASM plugin host (§11), signatures (§12.5),
 //! compression codecs (§03.7) and every transport beyond the local filesystem.
 //! Bao trees (§13.3) are implemented, but nothing yet fetches over a network to
 //! use them.
@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod adapter;
 pub mod bao;
 pub mod blake3;
 pub mod cbor;

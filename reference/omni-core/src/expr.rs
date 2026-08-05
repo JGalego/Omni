@@ -263,7 +263,9 @@ impl Scalar {
         }
     }
 
-    fn reduced(self) -> Scalar {
+    /// Lowest terms, and an integer when the denominator divides out. §04.7.5
+    /// requires exact rational arithmetic for `scale` canonicalization.
+    pub fn reduced(self) -> Scalar {
         let (mut n, mut d) = self.ratio();
         if d == 0 {
             return Scalar::Float(f64::NAN);
@@ -281,7 +283,8 @@ impl Scalar {
         }
     }
 
-    fn to_value(self) -> Value {
+    /// The canonical encoding: an integer, a float, or tag 30's exact rational.
+    pub fn to_value(self) -> Value {
         match self {
             Scalar::Int(n) => int_value(n),
             Scalar::Float(f) => Value::F64(f),
@@ -292,7 +295,8 @@ impl Scalar {
         }
     }
 
-    fn from_value(v: &Value) -> Res<Scalar> {
+    /// Parses a scalar, accepting tag 30 rationals.
+    pub fn from_value(v: &Value) -> Res<Scalar> {
         Ok(match v {
             Value::U(n) => Scalar::Int(*n as i64),
             Value::I(n) => Scalar::Int(*n),
@@ -2188,15 +2192,20 @@ impl Expr {
     pub fn normalize(&self, algo: HashAlgo) -> Expr {
         let e = self.map_children(&|c| c.normalize(algo));
         match &e {
-            // scale(scale(x, a), b) -> scale(x, a*b), exactly.
-            Expr::Scale { x, k } => match x.as_ref() {
-                Expr::Scale { x: inner, k: k2 } => Expr::Scale {
-                    x: inner.clone(),
-                    k: k.times(*k2),
-                },
-                _ if *k == Scalar::Int(1) => (**x).clone(),
-                _ => e.clone(),
-            },
+            // scale(scale(x, a), b) -> scale(x, a*b), exactly, and every
+            // rational in lowest terms — so a publisher writing alpha/r as
+            // 32/16 and one writing 2 produce the same identity.
+            Expr::Scale { x, k } => {
+                let k = k.reduced();
+                match x.as_ref() {
+                    Expr::Scale { x: inner, k: k2 } => Expr::Scale {
+                        x: inner.clone(),
+                        k: k.times(*k2),
+                    },
+                    _ if k == Scalar::Int(1) => (**x).clone(),
+                    _ => Expr::Scale { x: x.clone(), k },
+                }
+            }
             // permute(permute(x, p), q) -> permute(x, p∘q); the identity
             // permutation disappears, which is how transpose(transpose(x))
             // collapses.
@@ -3009,6 +3018,13 @@ fn random_at(dist: Dist, seed: u64, index: u64) -> f64 {
             mean + std * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * b).cos()
         }
     }
+}
+
+/// One reproducible uniform in [0, 1) from a seed and an index. Exposed because
+/// §08.5's DARE draws its drop mask from a declared seed, and that draw has to
+/// be the same everywhere.
+pub fn uniform01(seed: u64, index: u64) -> f64 {
+    chacha20_pair(seed, index).0
 }
 
 /// Two uniforms in [0, 1) from one ChaCha20 block.
