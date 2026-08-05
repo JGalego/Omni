@@ -1043,33 +1043,43 @@ pub fn verify(c: &Container) -> Res<Report> {
     })
 }
 
-/// Collects `[otype, digest]` references from a decoded structure object.
-pub fn collect_refs(v: &Value, out: &mut Vec<Digest>) {
+/// Collects `[otype, digest]` references from a decoded structure object,
+/// keeping the type. Object types live in refs rather than in objects, so this
+/// is how a reader learns what an object is before fetching it.
+pub fn collect_typed_refs(v: &Value, out: &mut Vec<(u16, Digest)>) {
     match v {
         Value::Array(a) => {
             if a.len() == 2 {
-                if let (Some(_t), Some(b)) = (a[0].as_u64(), a[1].as_bytes()) {
-                    if b.len() == 32 {
+                if let (Some(t), Some(b)) = (a[0].as_u64(), a[1].as_bytes()) {
+                    if b.len() == 32 && t <= u16::MAX as u64 {
                         let mut d = [0u8; 32];
                         d.copy_from_slice(b);
-                        out.push(d);
+                        out.push((t as u16, d));
                         return;
                     }
                 }
             }
             for x in a {
-                collect_refs(x, out);
+                collect_typed_refs(x, out);
             }
         }
         Value::Map(m) => {
             for (k, val) in m {
-                collect_refs(k, out);
-                collect_refs(val, out);
+                collect_typed_refs(k, out);
+                collect_typed_refs(val, out);
             }
         }
-        Value::Tag(_, inner) => collect_refs(inner, out),
+        Value::Tag(_, inner) => collect_typed_refs(inner, out),
         _ => {}
     }
+}
+
+/// Collects reference digests, discarding the types. Callers that only need
+/// reachability — the verifier, `fsck` — do not care what an object is.
+pub fn collect_refs(v: &Value, out: &mut Vec<Digest>) {
+    let mut typed = Vec::new();
+    collect_typed_refs(v, &mut typed);
+    out.extend(typed.into_iter().map(|(_, d)| d));
 }
 
 #[cfg(test)]

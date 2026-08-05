@@ -33,6 +33,7 @@ pub mod container;
 pub mod crc32c;
 pub mod model;
 pub mod sha256;
+pub mod store;
 
 pub use bao::BaoTree;
 pub use blake3::blake3 as blake3_256;
@@ -42,6 +43,7 @@ pub use container::{
 };
 pub use model::{DType, ModelBuilder, TensorSpec};
 pub use sha256::hex;
+pub use store::{ContainerStore, DirStore, MemoryStore, Store, WritableStore};
 
 /// The specification version this implementation targets.
 pub const SPEC_VERSION: &str = "OMNI/1.0-draft";
