@@ -714,6 +714,122 @@ impl DType {
         }
     }
 
+    /// Reads an element from an arbitrary *bit* position rather than an element
+    /// index. A layout (§04.4) computes bit positions that need not be a
+    /// multiple of the element width — a `blocked-scaled` layout interleaves
+    /// scales between blocks — so this is the accessor layout-aware code needs.
+    ///
+    /// Only defined for types whose width is a whole number of bits;
+    /// fractional-width packings (base-3 ternary) are addressed by element
+    /// index because their elements do not start on bit boundaries.
+    pub fn decode_bits(&self, bytes: &[u8], bit: u64) -> Option<f64> {
+        let (num, den) = self.bits_rational();
+        if den != 1 {
+            return None;
+        }
+        let w = num as u16;
+        match self {
+            DType::Binary => Some(if read_bits(bytes, bit, 1)? == 0 {
+                -1.0
+            } else {
+                1.0
+            }),
+            DType::Bool => Some(if read_bits(bytes, bit, 1)? == 0 {
+                0.0
+            } else {
+                1.0
+            }),
+            DType::Ternary {
+                pack: TernPack::Naive,
+            } => Some(match read_bits(bytes, bit, 2)? {
+                0 => -1.0,
+                1 => 0.0,
+                _ => 1.0,
+            }),
+            DType::Float(f) => Some(f.decode(read_bits(bytes, bit, w)?)),
+            DType::Int { signed, .. } => {
+                let raw = read_bits(bytes, bit, w)?;
+                Some(if *signed {
+                    sign_extend(raw, w) as f64
+                } else {
+                    raw as f64
+                })
+            }
+            DType::Fixed { signed, frac, .. } => {
+                let raw = read_bits(bytes, bit, w)?;
+                let v = if *signed {
+                    sign_extend(raw, w) as f64
+                } else {
+                    raw as f64
+                };
+                Some(ldexp(v, -(*frac as i32)))
+            }
+            DType::Posit { w: pw, es } => Some(decode_posit(read_bits(bytes, bit, *pw)?, *pw, *es)),
+            DType::LogDom { base, frac, .. } => {
+                let raw = read_bits(bytes, bit, w)?;
+                let l = ldexp(sign_extend(raw, w) as f64, -(*frac as i32));
+                Some((*base as f64).powf(l))
+            }
+            DType::Codebook { w: cw, .. } => Some(read_bits(bytes, bit, *cw)? as f64),
+            DType::Complex { .. }
+            | DType::Ternary { .. }
+            | DType::Opaque { .. }
+            | DType::Str
+            | DType::Struct { .. } => None,
+        }
+    }
+
+    /// The inverse of [`DType::decode_bits`].
+    pub fn encode_bits(&self, bytes: &mut [u8], bit: u64, x: f64, round: Round) -> bool {
+        let (num, den) = self.bits_rational();
+        if den != 1 {
+            return false;
+        }
+        let w = num as u16;
+        match self {
+            DType::Binary => write_bits(bytes, bit, 1, if x < 0.0 { 0 } else { 1 }),
+            DType::Bool => write_bits(bytes, bit, 1, if x == 0.0 { 0 } else { 1 }),
+            DType::Ternary {
+                pack: TernPack::Naive,
+            } => write_bits(
+                bytes,
+                bit,
+                2,
+                if x < -0.5 {
+                    0
+                } else if x > 0.5 {
+                    2
+                } else {
+                    1
+                },
+            ),
+            DType::Float(f) => write_bits(bytes, bit, w, f.encode(x, round)),
+            DType::Int { signed, .. } => {
+                let (lo, hi) = int_range(w, *signed);
+                let r = round.apply(x.abs(), x.is_sign_negative());
+                let v = if x.is_sign_negative() { -r } else { r };
+                write_bits(bytes, bit, w, (v.clamp(lo, hi) as i64) as u64 & mask64(w))
+            }
+            DType::Fixed { signed, frac, .. } => {
+                let scaled = ldexp(x, *frac as i32);
+                let (lo, hi) = int_range(w, *signed);
+                let r = round.apply(scaled.abs(), scaled.is_sign_negative());
+                let v = if scaled.is_sign_negative() { -r } else { r };
+                write_bits(bytes, bit, w, (v.clamp(lo, hi) as i64) as u64 & mask64(w))
+            }
+            DType::Codebook { w: cw, .. } => {
+                write_bits(bytes, bit, *cw, (x.max(0.0) as u64) & mask64(*cw))
+            }
+            DType::Posit { .. }
+            | DType::LogDom { .. }
+            | DType::Complex { .. }
+            | DType::Ternary { .. }
+            | DType::Opaque { .. }
+            | DType::Str
+            | DType::Struct { .. } => false,
+        }
+    }
+
     /// Writes element `i` into a dense bit stream. Returns false for types
     /// without defined element semantics.
     pub fn encode(&self, bytes: &mut [u8], i: u64, x: f64, round: Round) -> bool {

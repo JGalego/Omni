@@ -17,7 +17,7 @@ $ ./target/release/omni verify  model.omni
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, model builder | §01–§04, §13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, model builder | §01–§04, §13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · pack · unpack · fsck · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
@@ -54,13 +54,22 @@ implemented:
 - §02.8 recovery by segment scan (`omni fsck --rebuild`)
 - §15.3 conformance corpus v0 and runner protocol
 - §01 object model, refs, reachability, dangling-ref detection
-- §04.3 dtype descriptors and packed sizing
+- §04.3 the numeric type algebra: every dtype kind, bit-exact element decode and
+  encode, all five rounding modes, the alias registry
+- §04.4 layouts: strided, tiled, packed, blocked-scaled, interleaved — including
+  the bit position of any element and the R-T03 sufficiency check
+- §04.7 the tensor expression algebra: the closed core node set, static shape and
+  dtype inference (R-T01), normalization and expression identity (§04.7.5),
+  evaluation, declared determinism (§04.7.6), plugin fallbacks, and range
+  pushdown so partial loading is automatic (§04.7.4)
 - §15.1 validation levels V0–V4
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §04.7 tensor expression evaluation (only bare `literal` values are read)
-- §05 quantization · §07 OMNI-IR · §08 adapters and deltas · §09 training state
+- §04.6 sparsity schemes and §05 quantization schemes: the `sparse`,
+  `dequantize` and `quantize` nodes parse, type-check and push ranges down, but
+  evaluating them reports *indeterminate*
+- §07 OMNI-IR · §08 adapters and deltas · §09 training state
 - §10 capability negotiation · §11 WASM plugins · §12.5 signatures
 - §03.7 compression codecs (only `raw`) · §13 HTTP/OCI transport
 - `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
@@ -69,7 +78,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-53 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+95 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -85,12 +94,18 @@ stores, a container→directory→container round trip that is byte-exact,
 type recovery from refs alone, detection of a file whose name lies about its
 contents, and refusal to mix digest algorithms; and, for recovery, that a
 container stripped of its index, superblock and trailer rebuilds byte-identically
-and that a corrupted data object is reported missing rather than accepted. Every container-level test runs
-under both mandatory digest algorithms.
+and that a corrupted data object is reported missing rather than accepted; and,
+for the tensor layer, f32/f64 encoding against the host's own IEEE
+implementation, the documented maxima of every OCP microscaling type, all four
+directed rounding modes on a tie, element placement under each layout kind, a
+round-trip case for every core expression node, that equivalent expression
+trees normalize to one identity, that a range request through a structural
+chain reads only the bytes it needs, and that ChaCha20 matches RFC 8439. Every
+container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 53 passed; 0 failed
+test result: ok. 95 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

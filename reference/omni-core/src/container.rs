@@ -83,6 +83,26 @@ impl HashAlgo {
         }
     }
 
+    /// A domain-separated digest for everything that is not an object
+    /// (§03.5.3): expression identities, plan keys, derived encryption keys.
+    ///
+    /// BLAKE3 has a derive-key mode built for exactly this. SHA-256 has no
+    /// such mode, so the context string is prefixed with a separator that
+    /// cannot occur inside it; the property that matters is that a digest
+    /// computed for one purpose can never be replayed as another.
+    pub fn domain_digest(self, context: &str, data: &[u8]) -> Digest {
+        match self {
+            HashAlgo::Blake3_256 => crate::blake3::derive_key(context, data),
+            HashAlgo::Sha256 => {
+                let mut buf = Vec::with_capacity(context.len() + data.len() + 1);
+                buf.extend_from_slice(context.as_bytes());
+                buf.push(0x00);
+                buf.extend_from_slice(data);
+                crate::sha256::sha256(&buf)
+            }
+        }
+    }
+
     /// Parses a CLI-facing name. Accepts both the multihash name and the
     /// common short form.
     pub fn parse(s: &str) -> Option<HashAlgo> {
