@@ -18,7 +18,7 @@
 //!
 //! ## Not implemented here
 //!
-//! Training state (§09), the WASM plugin host (§11) and every
+//! The WASM plugin host (§11) and every
 //! transport beyond the local filesystem. Bao trees (§13.3) are implemented, but
 //! nothing yet fetches over a network to use them. Of §03.7's codecs, `zstd`
 //! (the MUST) and `deflate` are here; the MAY-level ones are reported as
@@ -54,6 +54,7 @@ pub mod sparse;
 pub mod store;
 pub mod tensor;
 pub mod tokenizer;
+pub mod train;
 pub mod zstd;
 
 pub use bao::BaoTree;

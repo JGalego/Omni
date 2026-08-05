@@ -11,7 +11,7 @@ use omni_core::expr::{Ctx, Expr};
 use omni_core::layout::Layout;
 use omni_core::recover::recover;
 use omni_core::store::{copy_reachable, walk, DirStore, EnumerableStore, Store};
-use omni_core::tensor::{Severity, TensorDesc, TensorTable};
+use omni_core::tensor::{Materialize, Severity, TensorDesc, TensorTable};
 use omni_core::{
     hex, pack, quant, verify, Container, ContainerStore, DType, HashAlgo, ModelBuilder,
     PackOptions, TensorSpec,
@@ -55,7 +55,7 @@ USAGE:
 
 VERBS:
     inspect <file>            Summarize a container without reading tensor payloads
-    verify  <file> [--level N] [--tokenizer] [--template]
+    verify  <file> [--level N] [--tokenizer] [--template] [--reproducible]
                               Validate (V0-V6); exit 1 invalid, 3 indeterminate;
                               --tokenizer and --template also run their
                               conformance vectors
@@ -92,6 +92,16 @@ VERBS:
                               derived, droppable module (§07.2)
     graph   migrate <file.omni> -o <out.omni>
                               Apply shipped op-version rewrites (§07.4.1)
+    strip   <file.omni> --training [--caches] -o <out.omni>
+                              Drop training state by reachability; every tensor
+                              digest unchanged (§09.1)
+    log     <file.omni> [--with <prev.omni>]…
+                              The checkpoint chain: step, loss, and what each
+                              one costs over its parent (§09.6)
+    reshard <ckpt.omni> --mesh dp=8,tp=8 -o <out.omni>
+                              Re-express the shard map over a different mesh;
+                              no tensor bytes move when the chunking permits
+                              (§09.4.2)
     fsck    <file> [--rebuild -o <out.omni>]
                               Diagnose damage; rebuild by segment scan (§02.8)
     caps    [--out caps.cbor]  Emit this build's CapabilitySet (§10.2)
@@ -111,7 +121,8 @@ VERBS:
     adapter check <base.omni> <adapter.omni>
                               Validate attachment before loading weights (§08.3)
     example <out.omni> [--hash blake3|sha256] [--quantized] [--tune N]
-                              [--tokenizer] [--chat-template]
+                              [--tokenizer] [--chat-template] [--graph]
+                              [--training [--step N] [--parent <prev.omni>]]
                               Build a small but complete example container;
                               --quantized exercises the value layer (int4 +
                               per-group scales + a LoRA, all as expressions);
@@ -147,6 +158,9 @@ fn main() -> ExitCode {
         "unpack" => cmd_unpack(&args),
         "repack" => cmd_repack(&args),
         "graph" => cmd_graph(&args),
+        "strip" => cmd_strip(&args),
+        "log" => cmd_log(&args),
+        "reshard" => cmd_reshard(&args),
         // fsck must work on files that do not open, so it does not go through
         // `run`, which opens the container first.
         "fsck" => cmd_fsck(&args),
@@ -630,6 +644,54 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
             );
         }
     }
+    // §09.1's third rule: training state is reported *separately* from weights,
+    // because the whole point is that they are not the same download.
+    match training_of(c) {
+        Ok(Some((_, t))) => {
+            let sep = separation(c).unwrap_or_default();
+            pr!(
+                "training      step {} · {} · {}",
+                commas(t.step),
+                t.optimizer.kind,
+                match t.optimizer.learning_rate() {
+                    Some(lr) => format!("lr {lr:.3e}"),
+                    None => "no lr recorded".into(),
+                }
+            );
+            pr!(
+                "  separable    {} object(s), {} — removable by dropping one ref (§09.1)",
+                sep.training_only.len(),
+                human(sep.training_bytes)
+            );
+            pr!("  inference    {}", human(sep.inference_bytes));
+            if let Some(n) = t.tokens_seen {
+                pr!("  seen         {} tokens", commas(n));
+            }
+            let np = t.non_portable_rng().len();
+            pr!(
+                "  rng          {} stream(s), {}",
+                t.rng.len(),
+                if np == 0 {
+                    "all counter-based (portable, §09.3)".to_string()
+                } else {
+                    format!("{np} stateful and therefore not portable")
+                }
+            );
+            if t.gradients.is_some() {
+                // §09.7 wants this prominent, because storing gradients is
+                // almost never what anyone meant to do.
+                pr!("  gradients    present — rarely worth persisting (§09.7)");
+            }
+            if !sep.violations.is_empty() {
+                pr!(
+                    "  ✗ {} inference object(s) reference training state (R-N02)",
+                    sep.violations.len()
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => pr!("training      ⚠ {e}"),
+    }
     let adapters = c.index.iter().filter(|e| e.otype == otype::ADAPTER).count();
     // §07.5 spells out what to print in both cases, and the weights-only case is
     // the interesting one: it is an honest statement of a real limitation.
@@ -829,19 +891,42 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         r.objects_verified,
         human(r.bytes_verified)
     );
-    if r.dangling.is_empty() {
+    // R-O05 is about dangling refs that are *required*. A parent declared
+    // `required: false` — the previous checkpoint in a chain (§09.6), a base a
+    // reader may or may not want — is an expected absence, and reporting it as
+    // "incomplete" would make every checkpoint after the first one incomplete.
+    let optional_parents: Vec<Digest> = c
+        .root()
+        .ok()
+        .and_then(|m| omni_core::delta::parents(&m).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter(|p| !p.required)
+        .map(|p| p.reference.1)
+        .collect();
+    let (expected, missing): (Vec<&Digest>, Vec<&Digest>) = r
+        .dangling
+        .iter()
+        .partition(|d| optional_parents.contains(d));
+    if missing.is_empty() {
         pr!(
             "V4 graph       ✓ {} objects reachable from root",
             r.reachable
         );
+        for d in &expected {
+            pr!(
+                "     {} declared optional and not present (§01.4)",
+                short(c.header.hash, *d)
+            );
+        }
     } else {
         pr!(
             "V4 graph       ⚠ {} reachable, {} dangling ref(s):",
             r.reachable,
-            r.dangling.len()
+            missing.len()
         );
-        for d in &r.dangling {
-            pr!("     {}", short(c.header.hash, d));
+        for d in &missing {
+            pr!("     {}", short(c.header.hash, *d));
         }
         pr!("\nincomplete: valid container, objects missing from all stores");
         return Ok(5);
@@ -898,6 +983,48 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
             Err(e) => {
                 pr!("V5 semantics   ⚠ {e}");
                 indeterminate += 1;
+            }
+        }
+    }
+
+    // V5 also covers §09's structure: a shard map that does not tile its tensors
+    // makes every resharding claim false, and a separability violation makes the
+    // 1.7 TB inseparable from the 140 GB.
+    if level >= 5 {
+        if let Ok(Some((_, t))) = training_of(c) {
+            let mut findings: Vec<String> = Vec::new();
+            if let Some((_, map_d)) = t.shards {
+                match c
+                    .get_value(&map_d)
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| {
+                        omni_core::train::ShardMap::from_value(&v).map_err(|e| e.to_string())
+                    }) {
+                    Ok(map) => findings.extend(map.check()),
+                    Err(e) => {
+                        indeterminate += 1;
+                        findings.push(format!("shard map: {e}"));
+                    }
+                }
+            }
+            let sep = separation(c).unwrap_or_default();
+            findings.extend(sep.violations.iter().cloned());
+            let bad = findings.iter().filter(|f| f.starts_with("R-N")).count();
+            invalid += bad;
+            pr!(
+                "V5 training    {} step {}, {} training-only object(s), {} — {}",
+                if bad > 0 { "✗" } else { "✓" },
+                commas(t.step),
+                sep.training_only.len(),
+                human(sep.training_bytes),
+                if findings.is_empty() {
+                    "shards tile, nothing inference-side depends on it".to_string()
+                } else {
+                    format!("{} finding(s)", findings.len())
+                }
+            );
+            for f in findings.iter().take(10) {
+                pr!("     {f}");
             }
         }
     }
@@ -1044,6 +1171,39 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
             "V6 derived     {} {checked} derived object(s) recomputed, {wrong} mismatched",
             if wrong > 0 { "✗" } else { "✓" }
         );
+    }
+
+    // --reproducible: §09.3's promise is narrow, and this is where the narrowness
+    // becomes visible. A checkpoint is replayable only if every stream that fed
+    // it was captured, and portably replayable only if each of those is
+    // counter-based.
+    if args.iter().any(|a| a == "--reproducible") {
+        match training_of(c) {
+            Ok(None) => {
+                pr!("reproducible   ⚠ this container has no training state");
+                indeterminate += 1;
+            }
+            Ok(Some((_, t))) => {
+                let notes = t.reproducibility();
+                if notes.is_empty() {
+                    pr!(
+                        "reproducible   ✓ {} counter-based RNG stream(s) and an exact dataloader \
+                         position: this run can be replayed elsewhere",
+                        t.rng.len()
+                    );
+                } else {
+                    pr!("reproducible   ⚠ replayable here, not portably:");
+                    for n in &notes {
+                        pr!("     {n}");
+                    }
+                    indeterminate += notes.len();
+                }
+            }
+            Err(e) => {
+                pr!("reproducible   ⚠ {e}");
+                indeterminate += 1;
+            }
+        }
     }
 
     // --tokenizer: run the conformance vectors of §06.7.1. A tokenizer that
@@ -1786,6 +1946,427 @@ fn codec_flag(args: &[String]) -> Result<Option<omni_core::codec::Codec>, String
         });
     }
     Ok(Some(c))
+}
+
+/// The `TrainingState` a container carries, from `Model.training` (§00.4).
+fn training_of(
+    c: &Container,
+) -> Result<Option<(Digest, omni_core::train::TrainingState)>, Box<dyn std::error::Error>> {
+    let manifest = c.root()?;
+    let Some(model_d) = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+    else {
+        return Ok(None);
+    };
+    let model = c.get_value(&model_d)?;
+    let Some(d) = model.get("training").and_then(as_ref_digest) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        d,
+        omni_core::train::TrainingState::from_value(&c.get_value(&d)?)?,
+    )))
+}
+
+/// How a container's objects split between inference and training (§09.1).
+fn separation(c: &Container) -> Result<omni_core::train::Separation, Box<dyn std::error::Error>> {
+    let training = training_of(c)?.map(|(d, _)| d);
+    let resolve = |d: &Digest| -> Option<(u16, Vec<u8>)> {
+        let e = c.find(d)?;
+        Some((e.otype, c.read(d).ok()?))
+    };
+    Ok(omni_core::train::separate(
+        &c.header.root_digest,
+        training,
+        &resolve,
+    ))
+}
+
+/// `omni strip <file> --training -o <out>` — §09.1's separability, executed.
+fn cmd_strip(args: &[String]) -> R {
+    let (Some(input), Some(out)) = (args.get(1), flag(args, "-o").or(flag(args, "--out"))) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let want_training = args.iter().any(|a| a == "--training");
+    let want_caches = args.iter().any(|a| a == "--caches");
+    if !want_training && !want_caches {
+        prr!("omni: strip needs --training and/or --caches\n");
+        return Ok(2);
+    }
+    let c = Container::open(std::fs::read(input)?)?;
+    let hash = c.header.hash;
+
+    // The tensor digests before, so the claim can be checked rather than
+    // asserted.
+    let before: Vec<Digest> = c
+        .index
+        .iter()
+        .filter(|e| e.otype == otype::BLOB)
+        .map(|e| e.digest)
+        .collect();
+    let sep = separation(&c)?;
+    let training = training_of(&c)?;
+
+    let mut objects = container_objects(&c)?;
+    let mut removed_training = 0usize;
+    let mut removed_caches = 0usize;
+    let mut root = c.header.root_digest;
+
+    if want_training {
+        if training.is_none() {
+            pr!("no training state to strip");
+        } else {
+            // Cut the one edge §09.1 allows, then rebuild the objects above it.
+            let manifest_v = c.root()?;
+            let model_d = manifest_v
+                .get("assets")
+                .and_then(|a| a.get("model"))
+                .and_then(as_ref_digest)
+                .ok_or("no model asset")?;
+            let model_v = c.get_value(&model_d)?;
+            let new_model = omni_core::Object::structure(
+                otype::MODEL,
+                &omni_core::train::without_training(&model_v),
+            );
+            let new_model_d = new_model.digest(hash);
+            objects.push(new_model);
+            let mut mpairs: Vec<(Value, Value)> = match &manifest_v {
+                Value::Map(m) => m.clone(),
+                _ => return Err("the manifest is not a map".into()),
+            };
+            for (k, v) in mpairs.iter_mut() {
+                if k.as_str() == Some("assets") {
+                    if let Value::Map(assets) = v {
+                        for (slot, target) in assets.iter_mut() {
+                            if slot.as_str() == Some("model") {
+                                *target = Value::Array(vec![
+                                    Value::U(otype::MODEL as u64),
+                                    Value::Bytes(new_model_d.to_vec()),
+                                ]);
+                            }
+                        }
+                    }
+                }
+            }
+            let new_manifest = omni_core::Object::structure(otype::MANIFEST, &Value::Map(mpairs));
+            root = new_manifest.digest(hash);
+            objects.push(new_manifest);
+            removed_training = sep.training_only.len();
+        }
+    }
+    if want_caches {
+        let cacheable: Vec<Digest> = c
+            .index
+            .iter()
+            .filter(|e| e.oflags & omni_core::container::oflags::CACHEABLE != 0)
+            .map(|e| e.digest)
+            .collect();
+        removed_caches = cacheable.len();
+        objects.retain(|o| !cacheable.contains(&o.digest(hash)));
+    }
+
+    let reachable = reachable_from(&objects, &root, hash);
+    objects.retain(|o| reachable.contains(&o.digest(hash)));
+    let opts = PackOptions {
+        hash,
+        log2_align: c.header.log2_align,
+        ..Default::default()
+    };
+    let bytes = pack(&objects, &root, &opts)?;
+
+    // R-N01: the weights must come through untouched. Not "mostly", and not
+    // "the same shapes" — the same digests.
+    let fresh = Container::open(bytes.clone())?;
+    let after: Vec<Digest> = fresh
+        .index
+        .iter()
+        .filter(|e| e.otype == otype::BLOB)
+        .map(|e| e.digest)
+        .collect();
+    let mut lost = 0usize;
+    for d in &before {
+        if !after.contains(d) && !sep.training_only.contains(d) {
+            lost += 1;
+        }
+    }
+    if lost > 0 {
+        return Err(format!(
+            "R-N01: stripping would drop {lost} data object(s) the inference model needs; \
+             refusing to write the result"
+        )
+        .into());
+    }
+    std::fs::write(out, &bytes)?;
+    let old_size = std::fs::metadata(input)?.len();
+    pr!("stripped {input} -> {out}");
+    if want_training {
+        pr!("  training     {removed_training} object(s) removed");
+    }
+    if want_caches {
+        pr!("  caches       {removed_caches} object(s) removed");
+    }
+    pr!(
+        "  weights      {} data objects, every digest unchanged (R-N01)",
+        after.len()
+    );
+    pr!(
+        "  size         {} -> {} ({:.1} %)",
+        human(old_size),
+        human(bytes.len() as u64),
+        100.0 * bytes.len() as f64 / old_size as f64
+    );
+    Ok(0)
+}
+
+/// `omni log` — the checkpoint chain of §09.6.
+fn cmd_log(args: &[String]) -> R {
+    let Some(input) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    // Later checkpoints are given first; each `--with` is an earlier one, which
+    // is how a chain spread over several files is read (§01.8's layering).
+    let mut paths = vec![input.clone()];
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--with" {
+            if let Some(p) = args.get(i + 1) {
+                paths.push(p.clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let mut containers = Vec::new();
+    for p in &paths {
+        containers.push(Container::open(std::fs::read(p)?)?);
+    }
+    let head = &containers[0];
+    let hash = head.header.hash;
+
+    // Walk the parent chain, resolving each manifest in whichever container has
+    // it.
+    let find = |d: &Digest| -> Option<(usize, Value)> {
+        containers
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| c.get_value(d).ok().map(|v| (i, v)))
+    };
+    let mut at = Some(head.header.root_digest);
+    let mut shown = 0usize;
+    let mut missing = 0usize;
+    while let Some(d) = at {
+        let Some((ci, manifest)) = find(&d) else {
+            pr!(
+                "  {} … not present (§01.4: incomplete, not wrong)",
+                short(hash, &d)
+            );
+            missing += 1;
+            break;
+        };
+        let c = &containers[ci];
+        let step = training_of(c).ok().flatten().map(|(_, t)| t.step);
+        let sep = separation(c).unwrap_or_default();
+        // What this checkpoint costs that the *next* one along the chain does
+        // not: the objects only it has.
+        let unique: u64 = c
+            .index
+            .iter()
+            .filter(|e| {
+                containers
+                    .iter()
+                    .enumerate()
+                    .all(|(j, other)| j == ci || other.find(&e.digest).is_none())
+            })
+            .map(|e| e.logical_len)
+            .sum();
+        pr!(
+            "{} {:<10} {:<12} Δ {} of {}",
+            short(hash, &d),
+            match step {
+                Some(s) => format!("step {s}"),
+                None => "no step".into(),
+            },
+            paths[ci].clone(),
+            human(unique),
+            human(sep.inference_bytes + sep.training_bytes)
+        );
+        shown += 1;
+        let parents = omni_core::delta::parents(&manifest).unwrap_or_default();
+        at = parents
+            .iter()
+            .find(|p| p.role == "previous" || p.role == "base" || p.role == "parent")
+            .or_else(|| parents.first())
+            .map(|p| p.reference.1);
+        if shown > 1024 {
+            break;
+        }
+    }
+    if shown == 0 {
+        pr!("no checkpoints found");
+        return Ok(2);
+    }
+    pr!();
+    pr!(
+        "{shown} checkpoint(s){}",
+        if missing > 0 { ", chain truncated" } else { "" }
+    );
+    Ok(if missing > 0 { 5 } else { 0 })
+}
+
+/// `omni reshard` — §09.4.2, which is metadata surgery when the chunking allows.
+fn cmd_reshard(args: &[String]) -> R {
+    use omni_core::train;
+    let (Some(input), Some(out), Some(mesh)) = (
+        args.get(1),
+        flag(args, "-o").or(flag(args, "--out")),
+        flag(args, "--mesh"),
+    ) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let target = match train::Mesh::parse(mesh) {
+        Ok(m) => m,
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(2);
+        }
+    };
+    let c = Container::open(std::fs::read(input)?)?;
+    let hash = c.header.hash;
+    let Some((state_d, state)) = training_of(&c)? else {
+        prr!("omni: {input} carries no training state, so there is no shard map (§09.4)\n");
+        return Ok(3);
+    };
+    let Some((_, map_d)) = state.shards else {
+        prr!("omni: this checkpoint declares no shard map; it is not sharded\n");
+        return Ok(3);
+    };
+    let map = train::ShardMap::from_value(&c.get_value(&map_d)?)?;
+    let result = match train::reshard(&map, &target) {
+        Ok(r) => r,
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(1);
+        }
+    };
+    let new_map = result.map.expect("reshard returns a map on success");
+    let problems = new_map.check();
+    if !problems.is_empty() {
+        for p in &problems {
+            prr!("omni: {p}\n");
+        }
+        return Ok(1);
+    }
+
+    // Only the ShardMap changes. Everything the tensors are made of is reused,
+    // which is the whole claim of §09.4.2.
+    let mut objects = container_objects(&c)?;
+    let map_obj = omni_core::Object::structure(otype::SHARD_MAP, &new_map.to_value());
+    let new_map_d = map_obj.digest(hash);
+    objects.push(map_obj);
+    let mut new_state = state.clone();
+    new_state.shards = Some((otype::SHARD_MAP, new_map_d));
+    let state_obj = omni_core::Object::structure(otype::TRAINING_STATE, &new_state.to_value());
+    let new_state_d = state_obj.digest(hash);
+    objects.push(state_obj);
+
+    let manifest_v = c.root()?;
+    let model_d = manifest_v
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+        .ok_or("no model asset")?;
+    let model_v = c.get_value(&model_d)?;
+    let mut pairs: Vec<(Value, Value)> = match &model_v {
+        Value::Map(m) => m.clone(),
+        _ => return Err("the model asset is not a map".into()),
+    };
+    for (k, v) in pairs.iter_mut() {
+        if k.as_str() == Some("training") {
+            *v = Value::Array(vec![
+                Value::U(otype::TRAINING_STATE as u64),
+                Value::Bytes(new_state_d.to_vec()),
+            ]);
+        }
+    }
+    let new_model = omni_core::Object::structure(otype::MODEL, &Value::Map(pairs));
+    let new_model_d = new_model.digest(hash);
+    objects.push(new_model);
+    let mut mpairs: Vec<(Value, Value)> = match &manifest_v {
+        Value::Map(m) => m.clone(),
+        _ => return Err("the manifest is not a map".into()),
+    };
+    for (k, v) in mpairs.iter_mut() {
+        if k.as_str() == Some("assets") {
+            if let Value::Map(assets) = v {
+                for (slot, target) in assets.iter_mut() {
+                    if slot.as_str() == Some("model") {
+                        *target = Value::Array(vec![
+                            Value::U(otype::MODEL as u64),
+                            Value::Bytes(new_model_d.to_vec()),
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+    let new_manifest = omni_core::Object::structure(otype::MANIFEST, &Value::Map(mpairs));
+    let root = new_manifest.digest(hash);
+    objects.push(new_manifest);
+    let reachable = reachable_from(&objects, &root, hash);
+    objects.retain(|o| reachable.contains(&o.digest(hash)));
+    let opts = PackOptions {
+        hash,
+        log2_align: c.header.log2_align,
+        ..Default::default()
+    };
+    let bytes = pack(&objects, &root, &opts)?;
+    std::fs::write(out, &bytes)?;
+
+    // The data objects are the same ones. Reporting it is the point.
+    let fresh = Container::open(bytes.clone())?;
+    let moved = c
+        .index
+        .iter()
+        .filter(|e| e.otype == otype::BLOB && fresh.find(&e.digest).is_none())
+        .count();
+    pr!("resharded {input} -> {out}");
+    pr!(
+        "  mesh         {} -> {}",
+        map.mesh.describe(),
+        target.describe()
+    );
+    pr!("  strategy     {}", new_map.strategy);
+    pr!(
+        "  metadata     {} tensor(s) re-expressed with no bytes moved",
+        result.metadata_only.len()
+    );
+    if !result.needs_copy.is_empty() {
+        pr!(
+            "  rechunk      {} tensor(s) whose new ranges cut across chunk boundaries:",
+            result.needs_copy.len()
+        );
+        for n in result.needs_copy.iter().take(5) {
+            pr!("               {n}");
+        }
+        pr!("               (this build rewrites the map only; the reads are ranges)");
+    }
+    pr!(
+        "  data objects {} unchanged, {} rewritten",
+        fresh
+            .index
+            .iter()
+            .filter(|e| e.otype == otype::BLOB)
+            .count(),
+        moved
+    );
+    pr!("  old state    {}", short(hash, &state_d));
+    Ok(0)
 }
 
 /// `omni graph` — the §07 verb: print, verify, synthesize, lower, migrate.
@@ -2606,7 +3187,13 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn cmd_example(args: &[String]) -> R {
     // Options come in two shapes: valueless switches, and `--name value`
     // pairs whose value must not be mistaken for the positional output path.
-    const SWITCHES: &[&str] = &["--quantized", "--tokenizer", "--chat-template", "--graph"];
+    const SWITCHES: &[&str] = &[
+        "--quantized",
+        "--tokenizer",
+        "--chat-template",
+        "--graph",
+        "--training",
+    ];
     let tune: Option<u64> = flag(args, "--tune").and_then(|s| s.parse().ok());
     let mut positional = Vec::new();
     let mut i = 1;
@@ -2739,6 +3326,29 @@ fn cmd_example(args: &[String]) -> R {
     }
     if args.iter().any(|a| a == "--chat-template") {
         b = add_chat_template(b);
+    }
+    if args.iter().any(|a| a == "--training") {
+        let step = flag(args, "--step")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(128_000);
+        b = add_training_state(b, step);
+        // §09.6: a checkpoint chain is manifests with `parents[]`. Pointing at
+        // the previous checkpoint is all it takes; the objects they share are
+        // shared by content addressing, not by bookkeeping.
+        if let Some(parent) = flag(args, "--parent") {
+            let prev = Container::open(std::fs::read(parent)?)?;
+            b = b.manifest_key(
+                "parents",
+                Value::Array(vec![omni_core::delta::Parent {
+                    reference: (otype::MANIFEST, prev.header.root_digest),
+                    role: "previous".into(),
+                    name: Some(parent.to_string()),
+                    locators: vec![],
+                    required: false,
+                }
+                .to_value()]),
+            );
+        }
     }
     if args.iter().any(|a| a == "--graph") {
         // §07.5's upgrade path, exercised end to end: the graph is synthesized
@@ -2947,7 +3557,6 @@ fn add_chat_template(mut b: ModelBuilder) -> ModelBuilder {
 /// `omni verify --level 5` and `omni cat`.
 fn add_quantized_layer(mut b: ModelBuilder) -> ModelBuilder {
     use omni_core::expr::{BinOp, Scalar, Sum};
-    use omni_core::tensor::Materialize;
 
     let (out_f, in_f, group, rank) = (32u64, 64u64, 32u64, 8u64);
     let groups = in_f / group;
@@ -3094,6 +3703,236 @@ fn add_quantized_layer(mut b: ModelBuilder) -> ModelBuilder {
 }
 
 /// `omni caps` — publish what this build can do (§10.2).
+/// Adds a §09 training state: Adam moments for every weight, a shard map, RNG
+/// streams of both kinds, a dataloader position and a loss history.
+///
+/// The moments are ordinary tensors in an ordinary table, which is the point:
+/// they chunk, dedup and delta like everything else, and `omni strip --training`
+/// removes them by dropping one reference.
+fn add_training_state(mut b: ModelBuilder, step: u64) -> ModelBuilder {
+    use omni_core::train::*;
+    let hash = b.hash;
+    let weights: Vec<(String, Vec<u64>)> = b
+        .tensors
+        .iter()
+        .filter(|t| t.semantic == "weight")
+        .map(|t| (t.name.clone(), t.shape.clone()))
+        .collect();
+
+    // exp_avg and exp_avg_sq per weight, in f32 as a real Adam state is.
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    let mut order: Vec<Value> = Vec::new();
+    let mut extra: Vec<omni_core::Object> = Vec::new();
+    for (name, shape) in &weights {
+        for moment in ["exp_avg", "exp_avg_sq"] {
+            let numel: u64 = shape.iter().product();
+            let key = format!("{name}.{moment}");
+            let data = floats(&DType::F32, numel as usize, &key, 0.01);
+            let expr = b.literal(&data, DType::F32, shape, omni_core::Layout::default());
+            let desc = omni_core::tensor::TensorDesc {
+                shape: omni_core::expr::dims(shape),
+                dtype: DType::F32,
+                layout: Layout::default(),
+                value: expr,
+                semantic: Some("optimizer".into()),
+                role: None,
+                axes: None,
+                device_hint: None,
+                materialize: Materialize::Lazy,
+                stats: None,
+                digest_materialized: None,
+            };
+            let obj = omni_core::Object::structure(otype::TENSOR_DESC, &desc.to_value());
+            let d = obj.digest(hash);
+            extra.push(obj);
+            entries.push((
+                Value::text(key.clone()),
+                Value::Array(vec![
+                    Value::U(otype::TENSOR_DESC as u64),
+                    Value::Bytes(d.to_vec()),
+                ]),
+            ));
+            order.push(Value::text(key));
+        }
+    }
+    let table = omni_core::Object::structure(
+        otype::TENSOR_TABLE,
+        &Value::map(vec![
+            ("t", Value::text("omni.tensor/table")),
+            ("v", Value::U(1)),
+            ("tensors", Value::Map(entries)),
+            ("order", Value::Array(order)),
+        ]),
+    );
+    let states_d = table.digest(hash);
+    extra.push(table);
+
+    // A shard map for the first weight: tensor-parallel over four ranks, which
+    // is the case §09.4.2's resharding example is about.
+    let shards: Vec<Shard> = (0..4u64)
+        .map(|i| {
+            let rows = weights[0].1[0];
+            let step = rows / 4;
+            Shard {
+                coord: vec![("tp".into(), i)],
+                range: vec![(i * step, (i + 1) * step), (0, weights[0].1[1])],
+                value: None,
+            }
+        })
+        .collect();
+    let map = ShardMap {
+        world_size: 4,
+        mesh: Mesh {
+            dims: vec!["tp".into()],
+            shape: vec![4],
+        },
+        strategy: "megatron".into(),
+        placements: vec![(
+            weights[0].0.clone(),
+            Placement {
+                logical_shape: weights[0].1.clone(),
+                sharding: vec![Sharding {
+                    axis: 0,
+                    mesh_dim: "tp".into(),
+                    parts: 4,
+                }],
+                shards,
+            },
+        )],
+        flat_params: Vec::new(),
+    };
+    let map_obj = omni_core::Object::structure(otype::SHARD_MAP, &map.to_value());
+    let map_d = map_obj.digest(hash);
+    extra.push(map_obj);
+
+    // The loss history is a tensor like any other, and the training config is
+    // kept verbatim as a blob: §09.2 stores what the framework wrote, not an
+    // interpretation of it.
+    let loss = floats(&DType::F32, 128, "loss", 2.0);
+    let loss_expr = b.literal(&loss, DType::F32, &[128], omni_core::Layout::default());
+    let loss_desc = omni_core::tensor::TensorDesc {
+        shape: omni_core::expr::dims(&[128]),
+        dtype: DType::F32,
+        layout: Layout::default(),
+        value: loss_expr,
+        semantic: Some("statistic".into()),
+        role: None,
+        axes: None,
+        device_hint: None,
+        materialize: Materialize::Lazy,
+        stats: None,
+        digest_materialized: None,
+    };
+    let loss_obj = omni_core::Object::structure(otype::TENSOR_DESC, &loss_desc.to_value());
+    let loss_d = loss_obj.digest(hash);
+    extra.push(loss_obj);
+
+    let config = omni_core::Object::blob(b"{\"lr\": 3e-4, \"seq_len\": 2048}".to_vec());
+    let config_d = config.digest(hash);
+    extra.push(config);
+    let rng_blob = omni_core::Object::blob(vec![0x5a; 2500]);
+    let rng_d = rng_blob.digest(hash);
+    extra.push(rng_blob);
+
+    b.extra_objects.extend(extra);
+
+    let state = TrainingState {
+        framework: vec![
+            ("name".into(), Value::text("pytorch")),
+            ("version".into(), Value::text("2.9.0")),
+            ("trainer".into(), Value::text("megatron-core")),
+        ],
+        step,
+        epoch: Some(2),
+        samples_seen: Some(4_194_304_000),
+        tokens_seen: Some(8_589_934_592_000),
+        wall_clock_s: Some(1_382_400),
+        optimizer: Optimizer {
+            kind: "adamw".into(),
+            hyper: vec![
+                ("lr".into(), Value::F64(3e-4)),
+                (
+                    "betas".into(),
+                    Value::Array(vec![Value::F64(0.9), Value::F64(0.95)]),
+                ),
+                ("eps".into(), Value::F64(1e-8)),
+                ("weight_decay".into(), Value::F64(0.1)),
+            ],
+            schedule: vec![
+                ("kind".into(), Value::text("cosine")),
+                ("warmup".into(), Value::U(2000)),
+                ("total".into(), Value::U(500_000)),
+                ("min_lr_ratio".into(), Value::F64(0.1)),
+            ],
+            states: Some((otype::TENSOR_TABLE, states_d)),
+            master_weights: None,
+            state_dtype: Some(DType::F32),
+        },
+        gradients: None,
+        ema: Vec::new(),
+        grad_scaler: vec![
+            ("kind".into(), Value::text("dynamic")),
+            ("scale".into(), Value::F64(65536.0)),
+            ("growth_interval".into(), Value::U(2000)),
+        ],
+        rng: vec![
+            RngStream {
+                scope: "cuda".into(),
+                implementation: "philox".into(),
+                kind: RngKind::Counter,
+                device: Some(0),
+                worker: None,
+                key: Vec::new(),
+                seed: Some(1234),
+                counter: Some(98_304),
+                offset: None,
+                state: None,
+            },
+            RngStream {
+                scope: "dropout".into(),
+                implementation: "counter".into(),
+                kind: RngKind::Counter,
+                device: None,
+                worker: None,
+                key: vec![1234, 0],
+                seed: None,
+                counter: Some(8_812_345),
+                offset: None,
+                state: None,
+            },
+            // And one that cannot be reproduced elsewhere, because real
+            // checkpoints have them and pretending otherwise would make
+            // `verify --reproducible` useless.
+            RngStream {
+                scope: "global".into(),
+                implementation: "pytorch-cpu".into(),
+                kind: RngKind::Opaque,
+                device: None,
+                worker: None,
+                key: Vec::new(),
+                seed: None,
+                counter: None,
+                offset: None,
+                state: Some((otype::BLOB, rng_d)),
+            },
+        ],
+        shards: Some((otype::SHARD_MAP, map_d)),
+        dataloader: Some(Dataloader {
+            kind: "streaming".into(),
+            shard: Some(41),
+            offset: Some(9_182_734),
+            seed: Some(1234),
+            shuffle_buffer: Some(10_000),
+            epoch: Some(2),
+            consumed_digest: None,
+            sample_bitmap: None,
+        }),
+        loss_history: Some((otype::TENSOR_DESC, loss_d)),
+        config: Some((otype::BLOB, config_d)),
+    };
+    b.training(state)
+}
+
 fn cmd_caps(args: &[String]) -> R {
     let caps = omni_core::plan::Capabilities::reference();
     let bytes = caps.to_value().encode();
@@ -3512,7 +4351,6 @@ fn cmd_sign(args: &[String]) -> R {
 /// rather than invalid.
 fn cmd_delta(args: &[String]) -> R {
     use omni_core::delta::{analyze, literal_of, Kind, Options, Parent, Report};
-    use omni_core::tensor::Materialize;
 
     let base_path = args
         .get(1)
@@ -3619,8 +4457,9 @@ fn cmd_delta(args: &[String]) -> R {
         );
     }
 
-    // §08.7: the parent is pinned by digest.
-    b.extra.push((
+    // §08.7: the parent is pinned by digest — on the *manifest*, which is the
+    // object a reader verifies and a signature covers (§01.7).
+    b.manifest_extra.push((
         "parents".into(),
         Value::Array(vec![Parent {
             reference: (otype::MANIFEST, base.header.root_digest),
@@ -3688,7 +4527,6 @@ fn cmd_adapter(args: &[String]) -> R {
 /// by digest.
 fn cmd_adapter_make(args: &[String]) -> R {
     use omni_core::adapter::lora_adapter_value;
-    use omni_core::tensor::Materialize;
 
     let base_path = args
         .get(2)

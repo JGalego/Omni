@@ -51,6 +51,13 @@ pub struct ModelBuilder {
     /// The execution graph (§07), with the rewrites the model ships so a
     /// runtime that does not know a dialect can lower it (§07.2).
     pub graph: Option<(crate::ir::Module, Vec<crate::ir::Rewrite>)>,
+    /// Training state (§09), reached from `Model.training` so that removing one
+    /// ref removes the whole 1.7 TB of it.
+    pub training: Option<crate::train::TrainingState>,
+    /// Extra *manifest* keys. `parents[]` belongs here and nowhere else (§01.7):
+    /// it is what makes a delta a delta and a checkpoint chain a chain, and a
+    /// reader looks for it on the manifest it just verified the signature of.
+    pub manifest_extra: Vec<(String, Value)>,
 }
 
 impl ModelBuilder {
@@ -68,7 +75,22 @@ impl ModelBuilder {
             assets: Vec::new(),
             hash: HashAlgo::default(),
             graph: None,
+            training: None,
+            manifest_extra: Vec::new(),
         }
+    }
+
+    /// Adds a manifest-level key, such as `parents[]`.
+    pub fn manifest_key(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.manifest_extra.push((key.into(), value));
+        self
+    }
+
+    /// Attaches training state. Everything it reaches becomes removable by
+    /// dropping one reference (§09.1).
+    pub fn training(mut self, state: crate::train::TrainingState) -> Self {
+        self.training = Some(state);
+        self
     }
 
     /// Attaches an OMNI-IR module, with the rewrites a runtime may need.
@@ -366,6 +388,21 @@ impl ModelBuilder {
                 ]),
             ),
         ];
+        let training_ref = self.training.as_ref().map(|t| {
+            let obj = Object::structure(otype::TRAINING_STATE, &t.to_value());
+            let d = obj.digest(self.hash);
+            objects.push(obj);
+            d
+        });
+        if let Some(d) = training_ref {
+            model_pairs.push((
+                "training",
+                Value::Array(vec![
+                    Value::U(otype::TRAINING_STATE as u64),
+                    Value::Bytes(d.to_vec()),
+                ]),
+            ));
+        }
         if let Some(d) = graph_ref {
             model_pairs.push((
                 "graph",
@@ -442,37 +479,38 @@ impl ModelBuilder {
             ));
         }
 
-        let manifest = Object::structure(
-            otype::MANIFEST,
-            &Value::map(vec![
-                ("t", Value::text("omni.core/manifest")),
-                ("v", Value::U(1)),
-                ("kind", Value::text("model")),
-                ("created", Value::U(0)),
-                (
-                    "meta",
-                    Value::Array(vec![
-                        Value::U(otype::METADATA as u64),
-                        Value::Bytes(meta_digest.to_vec()),
-                    ]),
-                ),
-                ("assets", Value::Map(asset_entries)),
-                ("entry", Value::text("model")),
-                (
-                    "features",
-                    Value::map(vec![
-                        (
-                            "required",
-                            Value::Array(vec![
-                                Value::text("omni.core/1.0"),
-                                Value::text("omni.tensor/expr.1"),
-                            ]),
-                        ),
-                        ("optional", Value::Array(vec![])),
-                    ]),
-                ),
-            ]),
-        );
+        let mut manifest_pairs: Vec<(&str, Value)> = vec![
+            ("t", Value::text("omni.core/manifest")),
+            ("v", Value::U(1)),
+            ("kind", Value::text("model")),
+            ("created", Value::U(0)),
+            (
+                "meta",
+                Value::Array(vec![
+                    Value::U(otype::METADATA as u64),
+                    Value::Bytes(meta_digest.to_vec()),
+                ]),
+            ),
+            ("assets", Value::Map(asset_entries)),
+            ("entry", Value::text("model")),
+            (
+                "features",
+                Value::map(vec![
+                    (
+                        "required",
+                        Value::Array(vec![
+                            Value::text("omni.core/1.0"),
+                            Value::text("omni.tensor/expr.1"),
+                        ]),
+                    ),
+                    ("optional", Value::Array(vec![])),
+                ]),
+            ),
+        ];
+        for (k, v) in &self.manifest_extra {
+            manifest_pairs.push((Box::leak(k.clone().into_boxed_str()), v.clone()));
+        }
+        let manifest = Object::structure(otype::MANIFEST, &Value::map(manifest_pairs));
         let root = manifest.digest(self.hash);
         objects.push(manifest);
 

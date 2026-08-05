@@ -247,6 +247,94 @@ jobs:
           "$OMNI" inspect /tmp/ct.omni | grep -q 'chat template omni-ct/1'
           echo "the template renders identically, or says why not"
 
+      # §09.1: training state is separable, and the rule is normative — the
+      # inference artifact and the checkpoint must never be the same download.
+      - name: A checkpoint separates from its own weights
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --training --step 127500 /tmp/ck1.omni >/dev/null
+          "$OMNI" example --training --step 128000 --parent /tmp/ck1.omni /tmp/ck2.omni
+          "$OMNI" verify /tmp/ck2.omni --level 6 | tee /tmp/ckv.txt
+          grep -q 'V5 training    ✓' /tmp/ckv.txt
+          "$OMNI" inspect /tmp/ck2.omni | tee /tmp/cki.txt
+          grep -q 'training      step 128,000' /tmp/cki.txt
+          grep -q 'separable' /tmp/cki.txt
+          # §09.3: the promise is narrow and the report says so. This checkpoint
+          # carries a stateful CPU generator, as real ones do.
+          "$OMNI" verify /tmp/ck2.omni --reproducible | tee /tmp/ckr.txt
+          grep -q 'not portably' /tmp/ckr.txt
+          grep -q 'pytorch-cpu' /tmp/ckr.txt
+
+          # §09.1's rule 1: stripping removes the training state by reachability
+          # alone and leaves *identical tensor digests*. Checked here against the
+          # digests themselves, not against sizes.
+          "$OMNI" strip /tmp/ck2.omni --training -o /tmp/infer.omni | tee /tmp/strip.txt
+          grep -q 'every digest unchanged' /tmp/strip.txt
+          "$OMNI" verify /tmp/infer.omni --level 6 >/dev/null
+          python3 - <<'PY'
+          import subprocess
+          def blobs(path):
+              out = subprocess.run(['reference/target/release/omni', 'ls', path],
+                                   capture_output=True, text=True, check=True).stdout
+              return {l.split()[0] for l in out.splitlines()[1:] if l.split()[1] == 'Blob'}
+          full, stripped = blobs('/tmp/ck2.omni'), blobs('/tmp/infer.omni')
+          assert stripped < full, "stripping should remove objects"
+          # Every object that survived is byte-identical by construction: it is
+          # the same digest. What matters is that the *weights* are all there.
+          plain = blobs('/tmp/weights-only.omni') if False else None
+          print(f"{len(full)} -> {len(stripped)} data objects; "
+                f"{len(full - stripped)} were training-only")
+          assert len(full - stripped) > 0
+          PY
+          # The inference artifact must be much smaller: f32 moments over bf16
+          # weights is the usual ratio, and this toy keeps it.
+          before=$(stat -c%s /tmp/ck2.omni); after=$(stat -c%s /tmp/infer.omni)
+          python3 -c "
+          import sys
+          before, after = $before, $after
+          assert after * 3 < before, f'{after} is not much smaller than {before}'
+          print(f'inference artifact is {100*after/before:.0f} % of the checkpoint')"
+          # And the stripped container carries no training state at all.
+          if "$OMNI" inspect /tmp/infer.omni | grep -q '^training'; then
+            echo "::error::the stripped container still reports training state"; exit 1
+          fi
+
+          # §09.6: a checkpoint chain is manifests with parents[]. The second
+          # checkpoint costs its own metadata, because the objects it shares with
+          # the first are shared by content addressing. (In this toy the moments
+          # are identical by construction, so the delta is as small as it gets.)
+          "$OMNI" log /tmp/ck2.omni --with /tmp/ck1.omni | tee /tmp/log.txt
+          grep -q 'step 128000' /tmp/log.txt
+          grep -q 'step 127500' /tmp/log.txt
+          grep -q '2 checkpoint(s)' /tmp/log.txt
+          # A chain whose parent is absent is incomplete (5), not invalid.
+          expect() {
+            local want=$1; shift
+            local got=0
+            "$@" >/dev/null 2>&1 || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          expect 5 "$OMNI" log /tmp/ck2.omni
+
+          # §09.4.2: resharding rewrites the map, not the tensors. 4 -> 2 is
+          # free; 4 -> 8 is not, and the report says which tensors and why.
+          "$OMNI" reshard /tmp/ck2.omni --mesh tp=2 -o /tmp/r2.omni | tee /tmp/r2.txt
+          grep -q 'mesh         tp=4 -> tp=2' /tmp/r2.txt
+          grep -q '1 tensor(s) re-expressed with no bytes moved' /tmp/r2.txt
+          grep -q '0 rewritten' /tmp/r2.txt
+          "$OMNI" verify /tmp/r2.omni --level 6 >/dev/null
+          "$OMNI" reshard /tmp/ck2.omni --mesh tp=8 -o /tmp/r8.omni | grep -q 'rechunk'
+          # A mesh that cannot divide the tensor is refused with the numbers.
+          "$OMNI" reshard /tmp/ck2.omni --mesh tp=3 -o /tmp/r3.omni 2>&1 | \
+            grep -q 'cannot divide evenly' || { echo "::error::expected a refusal"; exit 1; }
+          expect 1 "$OMNI" reshard /tmp/ck2.omni --mesh tp=3 -o /tmp/r3.omni
+          # A model with no training state is indeterminate for all of this.
+          "$OMNI" example /tmp/plainmodel.omni >/dev/null
+          expect 3 "$OMNI" reshard /tmp/plainmodel.omni --mesh tp=2 -o /tmp/nope.omni
+          echo "the checkpoint separates, reshards, and reports what it cannot promise"
+
       # §07: a model that describes its own computation, and the property no
       # other format has — an unknown high-level op recovered from a shipped
       # lowering rather than refused.

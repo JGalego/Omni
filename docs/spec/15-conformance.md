@@ -101,6 +101,19 @@ conformance violation.
   declares `allow_unmatched`.
 - R-A03 Shapes and `require` constraints hold for every match.
 
+### Training state (V5)
+
+- R-N01 Every object reachable only through `TrainingState` is removable by
+  reachability alone, leaving the weight tensors' digests unchanged (§09.1).
+- R-N02 No inference-relevant object references a training object. The
+  `Model.training` reference itself is the one permitted edge.
+- R-N03 `omni inspect` reports training-state size separately from weights.
+- R-N04 A `ShardMap` placement's shards tile its logical tensor exactly: no gaps,
+  no overlaps.
+- R-N05 Every sharding and shard coordinate names a mesh dimension that exists,
+  with an extent that matches the declared number of parts.
+- R-N06 A `flat_params` entry's `numel` equals the product of its `orig_shape`.
+
 ### Graph / OMNI-IR (V5)
 
 - R-I01 Every value is defined exactly once within its function (SSA).

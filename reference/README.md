@@ -22,6 +22,10 @@ $ ./target/release/omni adapter check base.omni lora.omni
 $ ./target/release/omni example --tokenizer tok.omni
 $ ./target/release/omni verify tok.omni --tokenizer     # runs its §06.7.1 vectors
 $ ./target/release/omni tokenize tok.omni --text "hello"
+$ ./target/release/omni example --training ckpt.omni    # a checkpoint with Adam state
+$ ./target/release/omni strip ckpt.omni --training -o infer.omni   # weights, unchanged
+$ ./target/release/omni reshard ckpt.omni --mesh tp=2 -o resharded.omni
+$ ./target/release/omni log ckpt.omni --with prev.omni  # the checkpoint chain
 $ ./target/release/omni example --graph graph.omni      # a synthesized OMNI-IR graph
 $ ./target/release/omni graph graph.omni                # print the module (§07)
 $ ./target/release/omni graph graph.omni --verify        # V5 IR rules, against the weights
@@ -38,7 +42,7 @@ $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_
 | Crate | Contents | Spec |
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, model builder | §01–§08, §10, §12, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · graph · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · graph · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -118,6 +122,19 @@ implemented:
   that knows only `omni.tensor` applies the lowering the *model* ships and
   proceeds, and `omni graph lower` names every op no shipped rule covers rather
   than pretending it lowered everything
+- §09 training state: the `TrainingState` object with its optimizer, schedule,
+  EMA, gradient scaler and step counters; RNG streams with the §09.3 distinction
+  that decides what can be promised (counter-based streams reproduce anywhere,
+  stateful ones are stored honestly as opaque blobs and reported as
+  non-portable); the `ShardMap` of §09.4 with its mesh, strategy, per-tensor
+  placements and FSDP flat-parameter table, checked under R-N04–R-N06; §09.4.2
+  resharding, which rewrites the map alone when the boundaries permit and names
+  the tensors that would need bytes moved when they do not; §09.5's dataloader
+  position, including whether it is exact enough to continue a run rather than
+  restart it; §09.6 checkpoint chains through `omni log`; and §09.1's
+  separability, executed by `omni strip --training` and *proved* rather than
+  asserted — the tensor digests are compared before and after, and a strip that
+  would drop one refuses to write its output
 - §10 capability negotiation: capability sets with the three-valued support of
   §10.2, candidate enumeration, the deterministic resolver of §10.5 under all
   five objectives, budget retry, and the informative failures of §10.5.2
@@ -148,7 +165,6 @@ implemented:
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §09 training state
 - §11 WASM plugins
 - §03.7's MAY-level codecs `lz4`, `brotli`, `xz`, `ans-lut` and the two lossy
   ones: reported as unsupported rather than half-decoded · §13 HTTP/OCI
@@ -159,7 +175,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-306 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+312 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -261,14 +277,23 @@ lowered without ops for building a mask — keeps its high-level form and is
 reported; that an approximate rewrite is refused unless allowed; that the §07.9
 binary encoding round-trips nested regions and ten thousand ops and refuses a
 truncated one; and that synthesis fails by naming the weight it wanted rather
-than by inventing one. And that an object whose `t`
+than by inventing one. And, for §09: that a
+training state and a shard map round-trip through canonical CBOR; that shards
+which leave a gap, overlap, name a mesh dimension that does not exist or disagree
+with its extent are each reported with their rule; that resharding four ranks to
+two moves no bytes while four to eight says which tensor must be rechunked and a
+mesh that cannot divide the tensor is refused with the numbers; that
+reproducibility is *reported* rather than claimed, naming the stateful generator
+and the vague dataloader position that limit it; and that stripping a checkpoint
+removes the training state by reachability while every weight digest survives.
+And that an object whose `t`
 contradicts the index's otype is invalid (R-O02).
 Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 306 passed; 0 failed
+test result: ok. 312 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
