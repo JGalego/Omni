@@ -94,6 +94,8 @@ impl HashAlgo {
     }
 }
 
+/// The object-type registry of §01.9. Values `0x0000–0x7FFF` are reserved for
+/// the specification; `0x8000` and above belong to plugin namespaces.
 pub mod otype {
     pub const BLOB: u16 = 0x0000;
     pub const MANIFEST: u16 = 0x0001;
@@ -102,10 +104,32 @@ pub mod otype {
     pub const TENSOR_TABLE: u16 = 0x0004;
     pub const TENSOR_DESC: u16 = 0x0005;
     pub const CHUNK_LIST: u16 = 0x0006;
+    pub const CODEBOOK: u16 = 0x0007;
+    pub const GRAPH_MODULE: u16 = 0x0008;
+    pub const DIALECT_REF: u16 = 0x0009;
     pub const TOKENIZER: u16 = 0x000A;
+    pub const CHAT_TEMPLATE: u16 = 0x000B;
+    pub const ADAPTER: u16 = 0x000C;
+    pub const TRAINING_STATE: u16 = 0x000D;
+    pub const SHARD_MAP: u16 = 0x000E;
+    pub const RUNTIME_CACHE: u16 = 0x000F;
+    pub const CAPABILITY_SET: u16 = 0x0010;
+    pub const PLAN: u16 = 0x0011;
     pub const SIGNATURE: u16 = 0x0012;
+    pub const PROVENANCE: u16 = 0x0013;
+    pub const BAO_TREE: u16 = 0x0014;
     pub const OBJECT_INDEX: u16 = 0x0015;
+    pub const NAME_INDEX: u16 = 0x0016;
+    pub const SCHEMA: u16 = 0x0017;
     pub const ROSETTA: u16 = 0x0018;
+    pub const FOREIGN: u16 = 0x0019;
+    pub const DATASET: u16 = 0x001A;
+    pub const PIN: u16 = 0x001B;
+    pub const SHARDED_MAP: u16 = 0x001C;
+    pub const ALT_DIGEST: u16 = 0x001D;
+    pub const PLUGIN_MODULE: u16 = 0x001E;
+    pub const EXTENSION: u16 = 0x001F;
+    pub const EVALUATION: u16 = 0x0020;
 
     pub fn name(t: u16) -> &'static str {
         match t {
@@ -116,13 +140,63 @@ pub mod otype {
             TENSOR_TABLE => "TensorTable",
             TENSOR_DESC => "TensorDesc",
             CHUNK_LIST => "ChunkList",
+            CODEBOOK => "Codebook",
+            GRAPH_MODULE => "GraphModule",
+            DIALECT_REF => "DialectRef",
             TOKENIZER => "Tokenizer",
+            CHAT_TEMPLATE => "ChatTemplate",
+            ADAPTER => "Adapter",
+            TRAINING_STATE => "TrainingState",
+            SHARD_MAP => "ShardMap",
+            RUNTIME_CACHE => "RuntimeCache",
+            CAPABILITY_SET => "CapabilitySet",
+            PLAN => "Plan",
             SIGNATURE => "Signature",
+            PROVENANCE => "Provenance",
+            BAO_TREE => "BaoTree",
             OBJECT_INDEX => "ObjectIndex",
+            NAME_INDEX => "NameIndex",
+            SCHEMA => "Schema",
             ROSETTA => "Rosetta",
+            FOREIGN => "Foreign",
+            DATASET => "Dataset",
+            PIN => "Pin",
+            SHARDED_MAP => "ShardedMap",
+            ALT_DIGEST => "AltDigest",
+            PLUGIN_MODULE => "PluginModule",
+            EXTENSION => "Extension",
+            EVALUATION => "Evaluation",
             _ if t >= 0x8000 => "Extension(plugin)",
             _ => "Unknown",
         }
+    }
+
+    /// The schema URI (`t`) a given object type must carry, where the
+    /// specification fixes one. Used by R-O02: the index's `otype` and the
+    /// object's own `t` must agree.
+    pub fn schema_uri(t: u16) -> Option<&'static str> {
+        Some(match t {
+            MANIFEST => "omni.core/manifest",
+            METADATA => "omni.meta/model",
+            MODEL => "omni.core/model",
+            TENSOR_TABLE => "omni.tensor/table",
+            TENSOR_DESC => "omni.tensor/desc",
+            CHUNK_LIST => "omni.tensor/chunklist",
+            CODEBOOK => "omni.tensor/codebook",
+            GRAPH_MODULE => "omni.ir/module",
+            TOKENIZER => "omni.meta/tokenizer",
+            CHAT_TEMPLATE => "omni.meta/chat-template",
+            ADAPTER => "omni.adapt/adapter",
+            TRAINING_STATE => "omni.train/state",
+            SHARD_MAP => "omni.train/shardmap",
+            CAPABILITY_SET => "omni.rt/capabilities",
+            PLAN => "omni.rt/plan",
+            SIGNATURE => "omni.sec/signature",
+            BAO_TREE => "omni.stream/bao",
+            DATASET => "omni.meta/dataset",
+            EVALUATION => "omni.meta/evaluation",
+            _ => return None,
+        })
     }
 }
 

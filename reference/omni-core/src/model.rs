@@ -1,104 +1,14 @@
 //! Model-level helpers: a minimal builder that produces the object graph of
-//! §00.4, and the small slice of the tensor/dtype algebra needed to describe
-//! and size a `literal` tensor.
+//! §00.4 for a model whose tensors are bare `literal`s.
 //!
-//! This is deliberately not a complete implementation of §04–§08. It is enough
-//! to build real containers, prove the binary format, and generate the worked
-//! examples in `examples/`.
+//! The dtype algebra it uses lives in [`crate::dtype`]; expressions over those
+//! tensors live in [`crate::expr`]. This module is the convenience layer that
+//! turns "here are some named byte buffers" into a valid object graph, and it
+//! generates the worked examples in `examples/`.
 
 use crate::cbor::Value;
 use crate::container::{otype, Digest, HashAlgo, Object};
-
-// ------------------------------------------------------------------ dtypes --
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum DType {
-    /// (total bits, exponent bits, mantissa bits)
-    Float {
-        w: u16,
-        e: u16,
-        m: u16,
-    },
-    Int {
-        w: u16,
-        signed: bool,
-    },
-    Bool,
-}
-
-impl DType {
-    pub const F32: DType = DType::Float { w: 32, e: 8, m: 23 };
-    pub const F16: DType = DType::Float { w: 16, e: 5, m: 10 };
-    pub const BF16: DType = DType::Float { w: 16, e: 8, m: 7 };
-    pub const F8E4M3: DType = DType::Float { w: 8, e: 4, m: 3 };
-    pub const I8: DType = DType::Int { w: 8, signed: true };
-    pub const U4: DType = DType::Int {
-        w: 4,
-        signed: false,
-    };
-
-    /// Bits per element. Fractional widths (e.g. base-3 ternary packing) would
-    /// return a rational here; the registered types in this subset are all
-    /// integral.
-    pub fn bits(&self) -> u32 {
-        match self {
-            DType::Float { w, .. } => *w as u32,
-            DType::Int { w, .. } => *w as u32,
-            DType::Bool => 1,
-        }
-    }
-
-    /// Bytes required for `n` densely packed elements (§04.3.5 clause 2).
-    pub fn packed_bytes(&self, n: u64) -> u64 {
-        let bits = self.bits() as u64 * n;
-        bits.div_ceil(8)
-    }
-
-    pub fn alias(&self) -> Option<&'static str> {
-        Some(match *self {
-            DType::F32 => "f32",
-            DType::F16 => "f16",
-            DType::BF16 => "bf16",
-            DType::F8E4M3 => "f8e4m3",
-            DType::I8 => "i8",
-            DType::U4 => "u4",
-            DType::Float {
-                w: 64,
-                e: 11,
-                m: 52,
-            } => "f64",
-            DType::Bool => "bool",
-            _ => return None,
-        })
-    }
-
-    /// The structural descriptor of §04.3. Writers emit the alias *and* the
-    /// expansion, so a reader that has never heard of the alias is unaffected.
-    pub fn to_value(&self) -> Value {
-        let mut pairs: Vec<(&str, Value)> = Vec::new();
-        if let Some(a) = self.alias() {
-            pairs.push(("alias", Value::text(a)));
-        }
-        match *self {
-            DType::Float { w, e, m } => {
-                pairs.push(("k", Value::text("float")));
-                pairs.push(("w", Value::U(w as u64)));
-                pairs.push(("e", Value::U(e as u64)));
-                pairs.push(("m", Value::U(m as u64)));
-            }
-            DType::Int { w, signed } => {
-                pairs.push(("k", Value::text("int")));
-                pairs.push(("w", Value::U(w as u64)));
-                pairs.push(("signed", Value::Bool(signed)));
-            }
-            DType::Bool => {
-                pairs.push(("k", Value::text("bool")));
-                pairs.push(("w", Value::U(1)));
-            }
-        }
-        Value::map(pairs)
-    }
-}
+use crate::dtype::DType;
 
 // ------------------------------------------------------------------ builder --
 
@@ -399,24 +309,6 @@ impl ModelBuilder {
 mod tests {
     use super::*;
     use crate::container::{pack, verify, Container, PackOptions};
-
-    #[test]
-    fn dtype_sizing() {
-        assert_eq!(DType::BF16.packed_bytes(10), 20);
-        assert_eq!(DType::U4.packed_bytes(10), 5);
-        assert_eq!(DType::U4.packed_bytes(9), 5); // rounds up
-        assert_eq!(DType::Bool.packed_bytes(9), 2);
-        assert_eq!(DType::F8E4M3.packed_bytes(1000), 1000);
-    }
-
-    #[test]
-    fn dtype_descriptor_carries_alias_and_expansion() {
-        let v = DType::BF16.to_value();
-        assert_eq!(v.get("alias").and_then(|x| x.as_str()), Some("bf16"));
-        assert_eq!(v.get("w").and_then(|x| x.as_u64()), Some(16));
-        assert_eq!(v.get("e").and_then(|x| x.as_u64()), Some(8));
-        assert_eq!(v.get("m").and_then(|x| x.as_u64()), Some(7));
-    }
 
     #[test]
     fn end_to_end_build_pack_verify() {

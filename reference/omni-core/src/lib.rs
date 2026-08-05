@@ -31,6 +31,7 @@ pub mod blake3;
 pub mod cbor;
 pub mod container;
 pub mod crc32c;
+pub mod dtype;
 pub mod model;
 pub mod recover;
 pub mod sha256;
@@ -42,7 +43,8 @@ pub use cbor::Value;
 pub use container::{
     otype, pack, seg, verify, Container, Digest, HashAlgo, Object, PackOptions, Report,
 };
-pub use model::{DType, ModelBuilder, TensorSpec};
+pub use dtype::{DType, FloatFmt, Round};
+pub use model::{ModelBuilder, TensorSpec};
 pub use sha256::hex;
 pub use store::{ContainerStore, DirStore, MemoryStore, Store, WritableStore};
 
