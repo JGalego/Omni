@@ -24,8 +24,8 @@
 //! coalescing and per-object verification, but TLS needs a cryptographic
 //! transport stack and there are no dependencies to provide one, so an
 //! `https://` URL is refused with that reason rather than downgraded. The OCI
-//! mapping of §13.5 and `omni mount` (§13.9) are unimplemented; [`serve`] is the
-//! object server of §13.4.3.
+//! `omni mount` (§13.9) is unimplemented, and so is the registry client behind
+//! [`oci`]'s §13.5 mapping; [`serve`] is the object server of §13.4.3.
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
@@ -52,6 +52,7 @@ pub mod ir;
 pub mod json;
 pub mod layout;
 pub mod model;
+pub mod oci;
 pub mod pattern;
 pub mod plan;
 pub mod plugin;

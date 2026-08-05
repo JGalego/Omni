@@ -409,6 +409,111 @@ jobs:
           PY
           echo "the plugin host runs what the model shipped, and only that"
 
+      # §13.5: the OCI mapping. The argument for it is parasitic adoption —
+      # registries, mirrors, CDNs and signing already exist — so the layout has
+      # to be one the existing tools actually read.
+      - name: A container maps onto an OCI image layout and back
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          "$OMNI" example --tune 4 /tmp/oci-src.omni >/dev/null
+          rm -rf /tmp/layout
+          "$OMNI" oci export /tmp/oci-src.omni -o /tmp/layout --ref 'omni/toy:1' \
+            | tee /tmp/oci.txt
+          grep -q 'application/vnd.omni.model.v1' /tmp/oci.txt
+          grep -q 'the OMNI Manifest object itself' /tmp/oci.txt
+
+          # The layout is checked against the image-spec's own rules rather than
+          # against this implementation's opinion: the marker file, the index, the
+          # descriptors, and every blob living at the path its own sha256 names.
+          python3 - <<'PY_OCI'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path("/tmp/layout")
+          layout = json.loads((root / "oci-layout").read_text())
+          assert layout == {"imageLayoutVersion": "1.0.0"}, layout
+          index = json.loads((root / "index.json").read_text())
+          assert index["schemaVersion"] == 2, index
+          assert index["mediaType"] == "application/vnd.oci.image.index.v1+json"
+          assert len(index["manifests"]) == 1, index
+
+          def blob(desc):
+              algo, hexd = desc["digest"].split(":")
+              assert algo == "sha256", desc
+              p = root / "blobs" / algo / hexd
+              b = p.read_bytes()
+              # The property a registry relies on: a blob is at the path its
+              # content hashes to, and the descriptor's size is its size.
+              assert hashlib.sha256(b).hexdigest() == hexd, f"{p} is misnamed"
+              assert desc["size"] == len(b), desc
+              return b
+
+          md = index["manifests"][0]
+          assert md["mediaType"] == "application/vnd.oci.image.manifest.v1+json"
+          assert md["annotations"]["org.opencontainers.image.ref.name"] == "omni/toy:1"
+          m = json.loads(blob(md))
+          assert m["schemaVersion"] == 2
+          assert m["artifactType"] == "application/vnd.omni.model.v1", m
+          # The config is the OMNI Manifest object, per §13.5 — CBOR, not JSON.
+          assert m["config"]["mediaType"] == "application/vnd.omni.manifest.v1+cbor"
+          config = blob(m["config"])
+          # Layers: packs, then the object index, in that order.
+          kinds = [l["mediaType"] for l in m["layers"]]
+          assert kinds[-1] == "application/vnd.omni.index.v1", kinds
+          assert set(kinds[:-1]) == {"application/vnd.omni.pack.v1"}, kinds
+          # Concatenating them in order is the container, and each layer says
+          # where it belongs.
+          out, at = b"", 0
+          for l in m["layers"]:
+              b = blob(l)
+              off = int(l.get("annotations", {}).get("dev.omni.offset", at))
+              assert off == at, f"layer claims offset {off}, assembled {at}"
+              out += b
+              at += len(b)
+          src = pathlib.Path("/tmp/oci-src.omni").read_bytes()
+          assert out == src, f"reassembled {len(out)} bytes, source is {len(src)}"
+          # The annotations a registry UI would show are read from the model, and
+          # every path in the layout is relative with no traversal in it.
+          ann = m["annotations"]
+          assert ann["dev.omni.canonical-digest"].startswith("b3:"), ann
+          assert ann["dev.omni.file-size"] == str(len(src)), ann
+          assert int(ann["dev.omni.params"]) > 0, ann
+          for dirpath, _, files in os.walk(root):
+              for f in files:
+                  rel = os.path.relpath(os.path.join(dirpath, f), root)
+                  assert ".." not in rel.split(os.sep), rel
+          print(f"a valid OCI image layout: {len(m['layers'])} layers, "
+                f"{len(config)}-byte config, reassembles exactly")
+          PY_OCI
+
+          # And the round trip through the CLI, with every blob verified.
+          "$OMNI" oci import /tmp/layout -o /tmp/oci-back.omni | tee /tmp/ociback.txt
+          cmp /tmp/oci-src.omni /tmp/oci-back.omni
+          grep -q 'verified against their digests' /tmp/ociback.txt
+          "$OMNI" verify /tmp/oci-back.omni --level 6 | grep -q '^valid'
+          echo "a container maps to an OCI layout and back without losing a byte"
+
+          # A tampered blob is what a bad mirror looks like, and it must not
+          # reassemble into a model.
+          python3 - <<'PY_TAMPER'
+          import json, pathlib
+          root = pathlib.Path("/tmp/layout")
+          m = json.loads((root / "index.json").read_text())["manifests"][0]
+          mf = json.loads((root / "blobs" / "sha256" / m["digest"].split(":")[1]).read_bytes())
+          target = mf["layers"][0]["digest"].split(":")[1]
+          p = root / "blobs" / "sha256" / target
+          b = bytearray(p.read_bytes())
+          b[len(b) // 2] ^= 0xFF
+          p.write_bytes(bytes(b))
+          PY_TAMPER
+          rm -f /tmp/oci-bad.omni
+          set +e
+          "$OMNI" oci import /tmp/layout -o /tmp/oci-bad.omni > /tmp/ocibad.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          test ! -f /tmp/oci-bad.omni
+          grep -q 'hashes to' /tmp/ocibad.txt
+          echo "a tampered blob is refused before it becomes a file"
+
       # §13.4.3: the other half of the transport. A hub SHOULD serve both a
       # pack and per-object URLs, and having both here means each is tested
       # against a real implementation of the other rather than against a mock.

@@ -45,14 +45,15 @@ $ ./target/release/omni strip model.omni --weights -o catalogue.omni   # §13.8
 $ ./target/release/omni import safetensors w.safetensors -o w.omni  # with a report
 $ ./target/release/omni export safetensors w.omni --plan            # what it would cost
 $ ./target/release/omni serve model.omni --port 8080    # §13.4.3 object server
+$ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with oras
 ```
 
 ## What is here
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store and object server with the `.omni.idx` sidecar, a JSON codec, safetensors import and export, model builder | §01–§13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors import and export, model builder | §01–§13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -202,6 +203,17 @@ implemented:
   tested against a real implementation of the other rather than against a mock:
   CI runs `omni fetch` against `omni serve` and checks, with `hashlib` rather
   than with this crate, that every object served at a digest hashes to it
+- §13.5 the OCI registry mapping, as an [OCI image layout] `oras`, `skopeo` and
+  `crane` read: the OMNI Manifest object as the config, the container cut into
+  `vnd.omni.pack.v1` layers at object boundaries, the object index as its own
+  layer, and the annotations a registry UI can show without pulling anything.
+  Concatenating the layers reproduces the container byte for byte, and importing
+  verifies every blob against the digest that named it before anything becomes a
+  file. Not a registry *client*: pushing needs the token dance and chunked blob
+  uploads, which `oras cp --from-oci-layout` already does. And the dedup claim is
+  stated precisely rather than optimistically — see the module docs for why it
+  comes from delta containers rather than from two independently packed files
+  happening to slice the same way
 - **safetensors, both directions**, with the importer and exporter contracts of
   `docs/design/import-export.md` §1 implemented rather than paraphrased: every
   tensor verified byte-for-byte against the source before the import claims to
@@ -231,8 +243,10 @@ What is **not** implemented, and is reported as such rather than faked:
   socket, but TLS needs a cryptographic transport stack and this crate has no
   dependencies to provide one. An `https://` URL is refused with that reason
   rather than silently downgraded
-- The OCI mapping of §13.5 and `omni mount` (§13.9). One needs a registry client,
-  the other FUSE
+- A registry *client*: §13.5's mapping is implemented and writes a pushable
+  layout, but the push itself needs bearer-token auth and chunked blob uploads
+  against a live registry, which is a client rather than a format concern
+- `omni mount` (§13.9), which needs FUSE
 - Every importer and exporter except safetensors. The capability matrix in
   `docs/design/import-export.md` §3 has 25 rows and this build implements one of
   them; GGUF, PyTorch, ONNX, PEFT, GPTQ and AWQ do not exist, and a request for
@@ -248,7 +262,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-380 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+386 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -391,7 +405,19 @@ describes and passes R-X02; that an unsatisfiable range is refused rather than
 answered short; that `HEAD` gives the length with no body and leaves the
 connection usable; that an index-only container serves its structure and 404s its
 weights; and that six kinds of malformed request end their own connection and
-nothing else.
+nothing else. And, for the OCI mapping: that the layout is one an OCI reader
+recognises — the marker file, the index, the descriptors, every blob at the path
+its own sha256 names, and no `..` anywhere; that the layers reassemble into the
+same bytes for one, four and nine tensors; that the cuts cover the file exactly
+once with no gap, overlap or empty pack at four pack sizes; that an index-only
+container maps and says it is partial; that a tampered blob, a missing blob, a
+missing marker, an unknown layout version, a missing index and reordered layers
+are each refused; and — asserted so nobody writes it down wrong — that
+re-exporting a model with one tensor changed does *not* share most of its blobs,
+while a delta container's layout is a fraction of the base's, which is where the
+dedup actually comes from.
+
+[OCI image layout]: https://github.com/opencontainers/image-spec/blob/main/image-layout.md
 And, for the WebAssembly host: that
 arithmetic, locals, a real loop, memory loads and stores, `call`,
 `call_indirect`, `br_table`, `if`/`else` and the bulk-memory operations all do
@@ -435,7 +461,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 380 passed; 0 failed
+test result: ok. 386 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

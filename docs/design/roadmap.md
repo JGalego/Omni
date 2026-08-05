@@ -110,7 +110,7 @@ coverage numbers in this gate are the point of it; none of them has a value yet.
 Deliverables:
 - HTTP and object-store stores with range coalescing and resumption.
 - OCI push/pull with `by-novelty` pack partitioning; referrers for adapters and
-  signatures.
+  signatures. ◐ (the mapping and a pushable layout exist; the registry client does not)
 - Verified streaming (Bao) end to end; progressive load.
 - `omni mount` (FUSE) with synthesized safetensors and tokenizer views.
 - `omni serve`: an object server. ✅
@@ -134,9 +134,13 @@ byte-identical to the original. What the gate actually asks for is untouched:
 there is no mirror of 10 000 models, no measured dedup or delta-size or
 load-time figures, no TTFT comparison over a throttled link. `omni serve` implements §13.4.3's
 per-object URLs alongside the pack, so CI exercises the client against a real
-server rather than a mock. `https://` is refused rather than downgraded — TLS
-needs a dependency this crate does not have — and there is no OCI mapping and no
-`mount`, so the *distribution* claims remain claims. The signature stack of §12.5 is implemented
+server rather than a mock. §13.5's mapping is implemented: a container becomes an
+OCI image layout that `oras` can push, with the OMNI Manifest as the config and
+the container cut into pack layers, and CI validates the layout against the
+image-spec's rules and reassembles it byte for byte. `https://` is refused rather
+than downgraded — TLS needs a dependency this crate does not have — there is no
+registry *client* and no `mount`, and nothing has been pushed anywhere, so the
+*distribution* claims remain claims. The signature stack of §12.5 is implemented
 (Ed25519, COSE_Sign1, trust policies) and has had no third-party review.
 
 ## Phase 4 — Ecosystem (months 18–30)

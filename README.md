@@ -103,7 +103,8 @@ runtime's capabilities (`plan`), sign and verify (`sign`), diff two models
 templates (`render`), print, verify and lower an execution graph (`graph`), run
 an embedded WebAssembly plugin (`plugin`), and separate a training checkpoint
 from the weights it shares (`strip`, `log`, `reshard`), read a container over
-HTTP one range at a time or serve one (`index`, `fetch`, `serve`), and absorb or emit safetensors with a
+HTTP one range at a time, serve one, or map one onto an OCI registry (`index`,
+`fetch`, `serve`, `oci`), and absorb or emit safetensors with a
 fidelity report rather than a shrug (`import`, `export`) — the full tour is in
 [`reference/README.md`](reference/README.md).
 
@@ -169,11 +170,12 @@ typing and range pushdown, quantization and sparsity, compression (including
 `zstd`, the one codec §03 marks MUST), tokenizers and chat templates, adapters
 and deltas, OMNI-IR with its dialects and rewrites, capability negotiation,
 signatures, training state, a WebAssembly host for plugins, HTTP range transport
-with the detached index sidecar and an object server, and lossless safetensors
-import and export. What is *not* implemented is stated in the same place it is
-claimed: [`reference/README.md`](reference/README.md) lists it — every importer
-and exporter except safetensors, `https://` (TLS needs a dependency), the OCI
-mapping (§13.5), `mount`, SIMD in the plugin host, and the MAY-level codecs —
+with the detached index sidecar, an object server and the OCI mapping, and
+lossless safetensors import and export. What is *not* implemented is stated in
+the same place it is claimed: [`reference/README.md`](reference/README.md) lists
+it — every importer and exporter except safetensors, `https://` (TLS needs a
+dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
+plugin host, and the MAY-level codecs —
 and every one of them is reported as unsupported at run time rather than guessed
 at. See [the roadmap](docs/design/roadmap.md) for what the gates have and have
 not proven.

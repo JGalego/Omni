@@ -166,6 +166,13 @@ VERBS:
     open    <file.omni> [--tensor <name>] [--range A:B]
                               Open the file the way §02.7 says a seek-capable
                               reader should, and report the I/O it cost
+    oci     export <file.omni> -o <dir> [--pack 1Gi] [--ref <tag>]
+                              Map a container onto an OCI image layout (§13.5)
+                              that `oras`/`skopeo` can push; layers are cut at
+                              object boundaries
+    oci     import <dir> -o <file.omni>
+                              Reassemble a layout, verifying every blob against
+                              the digest that named it
     serve   <file.omni> [--port N] [--addr A] [--requests N]
                               Serve the pack, its index sidecar and every object
                               at its own digest (§13.4.3), read-only, with the
@@ -219,6 +226,7 @@ fn main() -> ExitCode {
         "import" => cmd_import(&args),
         "export" => cmd_export(&args),
         "serve" => cmd_serve(&args),
+        "oci" => cmd_oci(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
         other => {
@@ -3954,6 +3962,122 @@ fn cmd_serve(args: &[String]) -> R {
         misses
     );
     Ok(0)
+}
+
+/// `omni oci` — the §13.5 registry mapping, as a layout on disk.
+///
+/// Not a push: that needs a registry client with the token dance and chunked
+/// blob uploads, which is a client rather than a format concern. What this
+/// writes is what `oras cp --from-oci-layout` pushes today.
+fn cmd_oci(args: &[String]) -> R {
+    use omni_core::oci::{dir_reader, export_layout, import_layout, ExportOpts};
+    let Some(verb) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    match verb.as_str() {
+        "export" => {
+            let (Some(input), Some(out)) = (args.get(2), flag(args, "-o").or(flag(args, "--out")))
+            else {
+                eprint!("{USAGE}");
+                return Ok(2);
+            };
+            let c = Container::open(std::fs::read(input)?)?;
+            let opts = ExportOpts {
+                pack_bytes: match flag(args, "--pack") {
+                    Some(s) => parse_size(s)?,
+                    None => omni_core::oci::DEFAULT_PACK_BYTES,
+                },
+                reference: flag(args, "--ref").map(str::to_string),
+            };
+            let l = export_layout(&c, &opts)?;
+            std::fs::create_dir_all(out)?;
+            l.write(std::path::Path::new(out))?;
+            let blobs = l.files.len() - 2;
+            pr!("wrote {out}  (an OCI image layout)");
+            pr!("  artifact     {}", omni_core::oci::ARTIFACT_TYPE);
+            pr!(
+                "  manifest     sha256:{}  {}",
+                l.manifest_digest,
+                human(l.manifest_size)
+            );
+            let effective = opts.pack_bytes.max(omni_core::oci::MIN_PACK_BYTES);
+            pr!(
+                "  layers       {} pack(s) + 1 index, cut at object boundaries",
+                l.packs
+            );
+            pr!(
+                "  pack target  {}{}",
+                human(effective),
+                if effective != opts.pack_bytes {
+                    format!(
+                        " (raised from {}: §13.5 warns against very many small blobs)",
+                        human(opts.pack_bytes)
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            pr!("  blobs        {blobs}");
+            pr!("  config       the OMNI Manifest object itself (§13.5)");
+            pr!("  push with    oras cp --from-oci-layout {out}:<tag> <registry>/<repo>:<tag>");
+            Ok(0)
+        }
+        "import" => {
+            let (Some(dir), Some(out)) = (args.get(2), flag(args, "-o").or(flag(args, "--out")))
+            else {
+                eprint!("{USAGE}");
+                return Ok(2);
+            };
+            let got = import_layout(&dir_reader(std::path::Path::new(dir)))?;
+            // It already parsed as a container inside `import_layout`; writing it
+            // only after that is what keeps a bad layout from becoming a bad file.
+            std::fs::write(out, &got.bytes)?;
+            pr!(
+                "reassembled {dir} -> {out}  {}",
+                human(got.bytes.len() as u64)
+            );
+            pr!("  manifest     sha256:{}", got.manifest_digest);
+            pr!(
+                "  layers       {} verified against their digests",
+                got.layers
+            );
+            for (k, v) in &got.annotations {
+                if let Some(name) = k.strip_prefix("dev.omni.") {
+                    pr!("  {:<12} {v}", name);
+                }
+            }
+            Ok(0)
+        }
+        other => {
+            prr!("omni: `oci {other}` is not a subcommand; try `export` or `import`\n");
+            Ok(2)
+        }
+    }
+}
+
+/// `1Gi`, `256Mi`, `100M`, or a plain byte count.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let (num, mult) = match s.as_bytes().last() {
+        Some(b'i') => {
+            // `Gi`, `Mi`, `Ki`
+            let body = &s[..s.len() - 1];
+            match body.as_bytes().last() {
+                Some(b'K' | b'k') => (&body[..body.len() - 1], 1u64 << 10),
+                Some(b'M' | b'm') => (&body[..body.len() - 1], 1 << 20),
+                Some(b'G' | b'g') => (&body[..body.len() - 1], 1 << 30),
+                _ => return Err(format!("`{s}` is not a size")),
+            }
+        }
+        Some(b'K' | b'k') => (&s[..s.len() - 1], 1_000),
+        Some(b'M' | b'm') => (&s[..s.len() - 1], 1_000_000),
+        Some(b'G' | b'g') => (&s[..s.len() - 1], 1_000_000_000),
+        _ => (s, 1),
+    };
+    num.trim()
+        .parse::<u64>()
+        .map(|n| n * mult)
+        .map_err(|_| format!("`{s}` is not a size"))
 }
 
 fn cmd_bench(args: &[String]) -> R {
