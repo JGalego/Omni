@@ -106,6 +106,8 @@ VERBS:
                               --tokenizer attaches a byte-level tokenizer and
                               --chat-template an OMNI-CT template, both with
                               conformance vectors
+    bench   [--objects N] [--lookups N]
+                              Measure index lookup latency against Gate 0
 
 EXIT CODES (docs/design/cli.md §10):
     0 ok · 1 invalid · 2 usage · 3 indeterminate · 5 incomplete
@@ -138,6 +140,7 @@ fn main() -> ExitCode {
         "sign" => cmd_sign(&args),
         "delta" => cmd_delta(&args),
         "adapter" => cmd_adapter(&args),
+        "bench" => cmd_bench(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
         other => {
@@ -1746,6 +1749,134 @@ fn cmd_fsck(args: &[String]) -> R {
         }
     }
     Ok(code)
+}
+
+/// `omni bench` — the roadmap's Gate 0 measurement.
+///
+/// Gate 0 requires index lookup p99 under 500 ns at 10⁶ objects, and says that
+/// if the index cannot hit it, the index format changes now rather than later.
+/// This is the measurement that decides.
+fn cmd_bench(args: &[String]) -> R {
+    let n: usize = flag(args, "--objects")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
+    let lookups: usize = flag(args, "--lookups")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200_000);
+
+    pr!("building a {n}-object container…");
+    let t0 = std::time::Instant::now();
+    // Structure objects only: data objects are alignment-aligned (R-C08), so a
+    // million of them at the default 4 KiB would be a 4 GB file measuring
+    // nothing but the page cache.
+    let objects: Vec<omni_core::Object> = (0..n)
+        .map(|i| {
+            omni_core::Object::structure(
+                otype::METADATA,
+                &Value::map(vec![
+                    ("t", Value::text("omni.bench/filler")),
+                    ("v", Value::U(1)),
+                    ("i", Value::U(i as u64)),
+                ]),
+            )
+        })
+        .collect();
+    let root = objects[0].digest(HashAlgo::default());
+    let bytes = pack(&objects, &root, &PackOptions::default())?;
+    let build = t0.elapsed();
+    pr!(
+        "  {} in {:.2} s ({:.1} MB/s)",
+        human(bytes.len() as u64),
+        build.as_secs_f64(),
+        bytes.len() as f64 / build.as_secs_f64() / 1e6
+    );
+
+    // §02.7: a sealed container opens in two reads regardless of size.
+    let t0 = std::time::Instant::now();
+    let c = Container::open(bytes)?;
+    let open = t0.elapsed();
+    pr!(
+        "  open           {:.3} ms for {} index entries",
+        open.as_secs_f64() * 1e3,
+        commas(c.index.len() as u64)
+    );
+    pr!("  index size     {}", human((c.index.len() * 64) as u64));
+
+    // Probe in an order uncorrelated with the index layout: sequential probes
+    // would ride the cache and measure nothing that resembles real use.
+    let mut probes: Vec<omni_core::Digest> = Vec::with_capacity(lookups);
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..lookups {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        probes.push(c.index[(x as usize) % c.index.len()].digest);
+    }
+
+    // Warm the code paths without warming the data.
+    for p in probes.iter().take(1000) {
+        std::hint::black_box(c.find(p));
+    }
+
+    // At a 500 ns target the clock itself is not free, so measure it and say
+    // so rather than quietly reporting it as lookup time.
+    let mut clock: Vec<u64> = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        let t = std::time::Instant::now();
+        clock.push(t.elapsed().as_nanos() as u64);
+    }
+    clock.sort_unstable();
+    let clock_overhead = clock[clock.len() / 2];
+
+    let mut times: Vec<u64> = Vec::with_capacity(lookups);
+    for p in &probes {
+        let t = std::time::Instant::now();
+        let hit = c.find(p);
+        times.push(t.elapsed().as_nanos() as u64);
+        assert!(hit.is_some(), "every probe is an object that exists");
+    }
+    times.sort_unstable();
+
+    let pct = |q: f64| times[((times.len() as f64 * q) as usize).min(times.len() - 1)];
+    pr!();
+    pr!("index lookup over {} probes", commas(lookups as u64));
+    pr!("  p50            {} ns", pct(0.50));
+    pr!("  p90            {} ns", pct(0.90));
+    pr!("  p99            {} ns", pct(0.99));
+    pr!("  p99.9          {} ns", pct(0.999));
+    pr!("  max            {} ns", times[times.len() - 1]);
+    pr!("  (clock overhead {clock_overhead} ns, included in the figures above)");
+
+    let p99 = pct(0.99);
+    pr!();
+    if n >= 1_000_000 {
+        pr!("Gate 0: p99 < 500 ns at 10^6 objects");
+        if p99 < 500 {
+            pr!("  ✓ met ({p99} ns)");
+        } else {
+            pr!("  ✗ NOT met ({p99} ns)");
+        }
+        let bucket = if c.bucket_bits == 0 {
+            "none".to_string()
+        } else {
+            format!(
+                "{}-bit, {} entries/bucket",
+                c.bucket_bits,
+                c.index.len() / (1usize << c.bucket_bits)
+            )
+        };
+        pr!("  bucket table   {bucket}");
+        if c.bucket_bits == 0 {
+            pr!(
+                "  {}-probe binary search over {} of index",
+                (c.index.len() as f64).log2().ceil() as u64,
+                human((c.index.len() * 64) as u64)
+            );
+        }
+    } else {
+        pr!("Gate 0 is stated at 10^6 objects; rerun with --objects 1000000.");
+    }
+    Ok(if n >= 1_000_000 && p99 >= 500 { 1 } else { 0 })
 }
 
 /// Value of a `--name <value>` option, if present.

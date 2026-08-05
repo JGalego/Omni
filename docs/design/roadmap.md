@@ -23,6 +23,16 @@ Deliverables:
 or OOM. *If the index cannot hit that latency, the index format changes now,
 not later.*
 
+**Gate 0 status.** Reproducible packing: met, and enforced by CI. Two-read open:
+met by construction (§02.7), measured at 41 ms for a 10⁶-object index, dominated
+by materialising the entry array rather than by I/O. Fuzzing: the in-CI mutation
+fuzzer is clean over millions of iterations; the 72-hour libFuzzer run is a
+release activity and has not been performed. **Index latency: not met** —
+p99 ≈ 590 ns against a 500 ns target, after a 6.5× improvement from implementing
+the bucket table §02.6.1 already specified. The measurement and what it implies
+are in [`performance.md`](performance.md) §11. The gate has done its job: it
+found the gap while the format is still a draft.
+
 ## Phase 1 — Prove the value layer (months 3–7)
 
 **Goal:** tensor expressions are implementable and actually save bytes.

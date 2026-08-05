@@ -527,9 +527,11 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
 
     let mut obj_payload = vec![0u8; layout.obj_payload_len];
     for p in &layout.structs {
+        // Keyed lookup, not a linear scan: `uniq` is already keyed by exactly
+        // this pair. Scanning here made packing O(n²) in the object count,
+        // which is invisible at 49 objects and fatal at a million.
         let o = uniq
-            .values()
-            .find(|o| o.digest(opts.hash) == p.digest && o.otype == p.otype)
+            .get(&(p.otype, p.digest))
             .expect("placed object exists");
         let rel = p.offset as usize - layout.obj_payload_off;
         let b = o.stored_bytes();
@@ -544,8 +546,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     let mut blob_payload = vec![0u8; layout.blob_payload_len];
     for p in &layout.blobs {
         let o = uniq
-            .values()
-            .find(|o| o.digest(opts.hash) == p.digest && o.otype == otype::BLOB)
+            .get(&(otype::BLOB, p.digest))
             .expect("placed blob exists");
         let rel = p.offset as usize - layout.blob_payload_off;
         let b = o.stored_bytes();
@@ -682,7 +683,7 @@ fn compute_layout(
         index_hdr_off = pad_before_index.unwrap().0 + SEG_HEADER_SIZE + pad_before_index.unwrap().1;
     }
     let n_entries = placed_structs.len() + placed_blobs.len();
-    let index_len = IDX_HEADER_SIZE + n_entries * IDX_ENTRY_SIZE;
+    let index_len = index_bytes(n_entries);
     off = index_hdr_off + SEG_HEADER_SIZE + index_len;
 
     let back_sb_hdr_off = round_up(off, 8);
@@ -726,17 +727,64 @@ fn write_segment(out: &mut [u8], hdr_off: usize, kind: u16, seq: u64, payload: &
     out[p..p + payload.len()].copy_from_slice(payload);
 }
 
+/// Chooses a bucket width for `n` entries (§02.6.1: 0, 8 or 16 bits).
+///
+/// 16 bits, or none at all below ~1000 entries where a flat 256 KiB table
+/// would dwarf the index it accelerates.
+///
+/// Wider tables are permitted by the format and readable by this
+/// implementation, but they are not written, because they measured *worse*.
+/// At 10^6 objects a 20-bit table gives roughly one entry per bucket and
+/// should in theory be two memory accesses; measured, it was 695 ns p99
+/// against 593 ns for 16 bits. The 4 MiB table stops fitting in L2, so the
+/// bucket read becomes a miss of its own, and the win from scanning a
+/// 16-bit bucket's handful of adjacent entries — which the prefetcher
+/// handles — is lost. `omni bench` is what settled it; theory said
+/// otherwise.
+/// Total size of the index segment payload for `n` entries: header, entry
+/// array and bucket table. The layout pass and the writer must agree on this,
+/// so it lives in one place.
+pub fn index_bytes(n: usize) -> usize {
+    let bits = bucket_bits_for(n);
+    let buckets = if bits == 0 { 0 } else { 1usize << bits };
+    IDX_HEADER_SIZE + n * IDX_ENTRY_SIZE + buckets * 4
+}
+
+pub fn bucket_bits_for(n: usize) -> u32 {
+    if n < 1024 {
+        0
+    } else {
+        16
+    }
+}
+
+/// The leading `bits` bits of a digest, which is what the entries are sorted
+/// by. Entries sort byte-lexicographically, so a big-endian prefix is
+/// monotonic in the same order.
+fn bucket_of(d: &Digest, bits: u32) -> usize {
+    if bits == 0 {
+        return 0;
+    }
+    debug_assert!(bits <= 24);
+    let top = ((d[0] as usize) << 16) | ((d[1] as usize) << 8) | d[2] as usize;
+    top >> (24 - bits)
+}
+
 fn build_index(l: &Layout, algo: HashAlgo) -> Vec<u8> {
     let mut entries: Vec<&Placed> = l.structs.iter().chain(l.blobs.iter()).collect();
     entries.sort_by_key(|a| a.digest);
 
-    let mut out = vec![0u8; IDX_HEADER_SIZE + entries.len() * IDX_ENTRY_SIZE];
+    let bits = bucket_bits_for(entries.len());
+    let n_buckets = if bits == 0 { 0 } else { 1usize << bits };
+    let bucket_off = IDX_HEADER_SIZE + entries.len() * IDX_ENTRY_SIZE;
+
+    let mut out = vec![0u8; bucket_off + n_buckets * 4];
     out[0..4].copy_from_slice(&IDX_MAGIC);
     out[4..6].copy_from_slice(&1u16.to_le_bytes());
     out[6..8].copy_from_slice(&(IDX_ENTRY_SIZE as u16).to_le_bytes());
     out[8..16].copy_from_slice(&(entries.len() as u64).to_le_bytes());
-    out[16..24].copy_from_slice(&0u64.to_le_bytes()); // no bucket table
-    out[24..28].copy_from_slice(&0u32.to_le_bytes());
+    out[16..24].copy_from_slice(&(if bits == 0 { 0 } else { bucket_off as u64 }).to_le_bytes());
+    out[24..28].copy_from_slice(&bits.to_le_bytes());
     out[28] = algo.code();
     out[29] = 32;
     out[30..32].copy_from_slice(&0b11u16.to_le_bytes()); // SORTED | COMPLETE
@@ -755,6 +803,29 @@ fn build_index(l: &Layout, algo: HashAlgo) -> Vec<u8> {
         out[b + 58] = e.codec;
         out[b + 59] = e.oflags;
         out[b + 60..b + 64].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // no aux
+    }
+
+    // bucket[i] is the first entry whose digest prefix is >= i, so the range
+    // for prefix i is [bucket[i], bucket[i+1]) with entry_count as the final
+    // bound. Filling backwards makes empty buckets collapse to zero-width
+    // ranges without a second pass.
+    if bits > 0 {
+        let mut starts = vec![entries.len() as u32; n_buckets];
+        for (i, e) in entries.iter().enumerate().rev() {
+            starts[bucket_of(&e.digest, bits)] = i as u32;
+        }
+        let mut running = entries.len() as u32;
+        for s in starts.iter_mut().rev() {
+            if *s > running {
+                *s = running;
+            } else {
+                running = *s;
+            }
+        }
+        for (i, s) in starts.iter().enumerate() {
+            let o = bucket_off + i * 4;
+            out[o..o + 4].copy_from_slice(&s.to_le_bytes());
+        }
     }
     out
 }
@@ -811,10 +882,7 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
             "index",
             Value::map(vec![
                 ("off", Value::U((l.index_hdr_off + SEG_HEADER_SIZE) as u64)),
-                (
-                    "len",
-                    Value::U((IDX_HEADER_SIZE + l.n_entries * IDX_ENTRY_SIZE) as u64),
-                ),
+                ("len", Value::U(index_bytes(l.n_entries) as u64)),
                 ("entries", Value::U(l.n_entries as u64)),
                 ("fmt", Value::U(1)),
             ]),
@@ -909,6 +977,11 @@ pub struct Container {
     pub header: Header,
     pub superblock: Value,
     pub index: Vec<IndexEntry>,
+    /// Bucket table from the index (§02.6.1), if one is present. Turns a
+    /// ~20-probe binary search over tens of megabytes into one bucket read
+    /// plus a search of a dozen adjacent entries.
+    pub buckets: Vec<u32>,
+    pub bucket_bits: u32,
 }
 
 impl Container {
@@ -960,21 +1033,54 @@ impl Container {
         let ioff = idx.get("off").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let ilen = idx.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let index = parse_index(&bytes, ioff, ilen)?;
+        let (buckets, bucket_bits) = parse_buckets(&bytes, ioff, ilen, index.len())?;
 
         Ok(Container {
             bytes,
             header,
             superblock,
             index,
+            buckets,
+            bucket_bits,
         })
     }
 
-    /// Binary search over the fixed-layout index — the hot path (§02.6.2).
+    /// Locates an object — the hot path (§02.6.2).
+    ///
+    /// With a bucket table this is one bucket read followed by a search of the
+    /// few entries sharing that digest prefix; without one it is a plain
+    /// binary search over the whole index. The difference at a million objects
+    /// is roughly an order of magnitude, because a 20-probe search over 61 MiB
+    /// is 20 cache misses and nothing else.
     pub fn find(&self, d: &Digest) -> Option<&IndexEntry> {
-        self.index
+        let (lo, hi) = if self.bucket_bits > 0 && !self.buckets.is_empty() {
+            let b = bucket_of(d, self.bucket_bits);
+            let lo = self.buckets[b] as usize;
+            let hi = self
+                .buckets
+                .get(b + 1)
+                .map(|x| *x as usize)
+                .unwrap_or(self.index.len());
+            (lo.min(self.index.len()), hi.min(self.index.len()))
+        } else {
+            (0, self.index.len())
+        };
+        if lo >= hi {
+            return None;
+        }
+        // A bucket holds a handful of entries occupying consecutive cache
+        // lines, which the hardware prefetcher handles far better than the
+        // random probe pattern of a binary search. Binary search wins only
+        // once the span is large enough for its logarithmic probe count to
+        // beat sequential bandwidth.
+        const LINEAR_SCAN_LIMIT: usize = 64;
+        if hi - lo <= LINEAR_SCAN_LIMIT {
+            return self.index[lo..hi].iter().find(|e| e.digest == *d);
+        }
+        self.index[lo..hi]
             .binary_search_by(|e| e.digest.as_slice().cmp(d.as_slice()))
             .ok()
-            .map(|i| &self.index[i])
+            .map(|i| &self.index[lo + i])
     }
 
     /// Returns an object's bytes, verifying its digest (verification level L1).
@@ -1184,6 +1290,48 @@ pub fn parse_header(b: &[u8]) -> Res<Header> {
         root_digest: b[64..96].try_into().unwrap(),
         creator,
     })
+}
+
+/// Reads the bucket table, if the index declares one.
+///
+/// The table is an accelerator, never authority: a bucket that points outside
+/// the entry array, or is not monotonic, would let a lookup miss an object that
+/// is present. Rather than trust it, an inconsistent table is dropped and the
+/// reader falls back to a full binary search — slower, always correct.
+fn parse_buckets(b: &[u8], off: usize, len: usize, entries: usize) -> Res<(Vec<u32>, u32)> {
+    if len < IDX_HEADER_SIZE {
+        return Ok((Vec::new(), 0));
+    }
+    let h = &b[off..off + IDX_HEADER_SIZE];
+    let bucket_off = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
+    let bits = u32::from_le_bytes(h[24..28].try_into().unwrap());
+    if bucket_off == 0 || bits == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    if !matches!(bits, 8 | 16 | 20 | 24) {
+        return Err(rule(
+            "R-C11",
+            format!("bucket_bits {bits} is not 0, 8, 16, 20 or 24"),
+        ));
+    }
+    let n = 1usize << bits;
+    let start = off + bucket_off;
+    let end = start + n * 4;
+    if bucket_off < IDX_HEADER_SIZE + entries * IDX_ENTRY_SIZE || end > off + len || end > b.len() {
+        return Err(rule("R-C12", "bucket table extent out of range"));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut prev = 0u32;
+    for i in 0..n {
+        let v = u32::from_le_bytes(b[start + i * 4..start + i * 4 + 4].try_into().unwrap());
+        if v < prev || v as usize > entries {
+            // Not monotonic or out of bounds: unusable as an accelerator.
+            return Ok((Vec::new(), 0));
+        }
+        prev = v;
+        out.push(v);
+    }
+    Ok((out, bits))
 }
 
 fn parse_index(b: &[u8], off: usize, len: usize) -> Res<Vec<IndexEntry>> {
@@ -1765,6 +1913,87 @@ mod tests {
         match Container::open(bytes) {
             Err(e) => assert!(e.to_string().contains("R-C02"), "got: {e}"),
             Ok(_) => panic!("header CRC must be checked"),
+        }
+    }
+
+    /// The bucket table is an accelerator, so the property that matters is
+    /// that it never changes an answer — only how fast it arrives.
+    #[test]
+    fn the_bucket_table_finds_every_object_and_no_others() {
+        let algo = HashAlgo::default();
+        let objects: Vec<Object> = (0..2000u32)
+            .map(|i| {
+                Object::structure(
+                    otype::METADATA,
+                    &Value::map(vec![
+                        ("t", Value::text("omni.test/filler")),
+                        ("v", Value::U(1)),
+                        ("i", Value::U(i as u64)),
+                    ]),
+                )
+            })
+            .collect();
+        let root = objects[0].digest(algo);
+        let bytes = pack(&objects, &root, &opts(algo)).unwrap();
+        let c = Container::open(bytes).unwrap();
+
+        assert_eq!(c.bucket_bits, 16, "2000 entries should get a bucket table");
+        assert_eq!(c.buckets.len(), 1 << 16);
+        for o in &objects {
+            let d = o.digest(algo);
+            assert!(c.find(&d).is_some(), "{} not found", hex(&d));
+        }
+        // Digests that are not present must still miss, including ones landing
+        // in populated buckets.
+        let mut absent = objects[0].digest(algo);
+        absent[31] ^= 0xff;
+        assert!(c.find(&absent).is_none());
+        assert!(c.find(&[0xff; 32]).is_none());
+        assert!(c.find(&[0x00; 32]).is_none());
+    }
+
+    /// A damaged bucket table must cost speed, never correctness: a reader
+    /// that trusted it would report objects as absent that are present.
+    #[test]
+    fn a_corrupt_bucket_table_falls_back_instead_of_losing_objects() {
+        let algo = HashAlgo::default();
+        let objects: Vec<Object> = (0..2000u32)
+            .map(|i| {
+                Object::structure(
+                    otype::METADATA,
+                    &Value::map(vec![
+                        ("t", Value::text("omni.test/filler")),
+                        ("v", Value::U(1)),
+                        ("i", Value::U(i as u64)),
+                    ]),
+                )
+            })
+            .collect();
+        let root = objects[0].digest(algo);
+        let bytes = pack(&objects, &root, &opts(algo)).unwrap();
+        let good = Container::open(bytes.clone()).unwrap();
+
+        // Find the bucket table and make it non-monotonic.
+        let segs = good.segments().unwrap();
+        let (idx_hdr, _, ilen) = *segs.iter().find(|(_, k, _)| *k == seg::INDEX).unwrap();
+        let p = idx_hdr + SEG_HEADER_SIZE;
+        let bucket_off = u64::from_le_bytes(bytes[p + 16..p + 24].try_into().unwrap()) as usize;
+        let mut damaged = bytes.clone();
+        let at = p + bucket_off + 4 * 30_000;
+        damaged[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Keep the CRCs consistent so this tests the fallback, not the CRC.
+        let pc = crc32c(&damaged[p..p + ilen as usize]);
+        damaged[idx_hdr + 24..idx_hdr + 28].copy_from_slice(&pc.to_le_bytes());
+        let hc = crc32c(&damaged[idx_hdr..idx_hdr + 28]);
+        damaged[idx_hdr + 28..idx_hdr + 32].copy_from_slice(&hc.to_le_bytes());
+
+        let c = Container::open(damaged).unwrap();
+        assert_eq!(c.bucket_bits, 0, "an unusable table must be dropped");
+        for o in &objects {
+            assert!(
+                c.find(&o.digest(algo)).is_some(),
+                "fallback must still find it"
+            );
         }
     }
 

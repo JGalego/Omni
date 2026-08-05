@@ -201,7 +201,7 @@ fixed-layout, cacheline-aligned array designed to be used *directly from an
 | 6 | 2 | `entry_size` (`64`) |
 | 8 | 8 | `entry_count` |
 | 16 | 8 | `bucket_table_off` (relative to index start; `0` if absent) |
-| 24 | 4 | `bucket_bits` (0, 8 or 16) |
+| 24 | 4 | `bucket_bits` (0, 8, 16, 20 or 24) |
 | 28 | 1 | `hash_algo` |
 | 29 | 1 | `digest_len` |
 | 30 | 2 | `flags` (bit0 `SORTED`, bit1 `COMPLETE`, bit2 `HAS_AUX`) |
@@ -227,11 +227,23 @@ Exactly 64 bytes: one cache line, one entry, no false sharing during a parallel
 binary search.
 
 **Lookup cost.** With a 16-bit bucket table (65 536 × `u32` = 256 KiB), locating
-an object is: one bucket read (1 cache miss) + a binary search within a bucket of
-`n/65536` entries. For a 1 M-object store that is ~16 entries — under two cache
-lines. Total: **≈3 memory accesses, zero syscalls, zero allocation, zero
-parsing.** The index for that store is 64 MiB; it need not be resident, since only
-touched pages fault in.
+an object is one bucket read followed by a search among the entries sharing that
+digest prefix. For a 1 M-object store that is ~15 entries, which at a 64-byte
+stride is ~15 cache lines — so a *scan* of them, which the hardware prefetcher
+handles, beats a binary search's random probes. Zero syscalls, zero allocation,
+zero parsing. The index for that store is 61 MiB; it need not be resident, since
+only touched pages fault in.
+
+**Measured, not modelled.** `omni bench` reports p50 ≈ 200 ns and p99 ≈ 590 ns
+at 10⁶ objects on a cloud VM. That is above the roadmap's Gate 0 target of
+500 ns p99, and the gap is discussed in
+[`docs/design/performance.md`](../design/performance.md) §11 rather than
+rounded away here.
+
+`bucket_bits` MAY be 0, 8, 16, 20 or 24. Wider is not automatically better: a
+20-bit table gives about one entry per bucket, but its 4 MiB no longer fits in
+L2, so the bucket read becomes a cache miss of its own and the adjacency of a
+16-bit bucket's entries is lost. Measured, 20 bits was *slower* than 16.
 
 ### 2.6.3 Aux table
 

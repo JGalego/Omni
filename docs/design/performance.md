@@ -287,4 +287,58 @@ The roadmap's Phase 3 gate is a published benchmark suite covering:
 Results are to be published as OMNI containers with signed `Evaluation` objects
 (§06.8) — the format should eat its own dog food for its own benchmarks.
 
+## 11 First measured result: index lookup, and Gate 0
+
+Everything above this section is *modelled*. This section is *measured*, and it
+is the first place a model has met the machine.
+
+`omni bench --objects 1000000` builds a real container with 10⁶ objects, opens
+it, and times `find()` over 200 000 probes in an order uncorrelated with the
+index layout. On a cloud VM (shared, so the tail is noisy):
+
+| | Binary search, no bucket table | 16-bit buckets, binary search | 16-bit buckets, scan |
+|---|---:|---:|---:|
+| p50 | 1234 ns | 451 ns | ~200 ns |
+| p90 | 1605 ns | 720 ns | ~310 ns |
+| **p99** | **3846 ns** | **1102 ns** | **~590 ns** |
+| p99.9 | 24193 ns | 5236 ns | ~800 ns |
+
+Index: 61 MiB. Clock overhead: 19 ns, included in the figures.
+
+**Gate 0 asks for p99 < 500 ns at 10⁶ objects. It is not met.** ~590 ns is
+close, and on a quiet machine it might land under, but reporting it as a pass on
+that basis would be exactly the kind of thing this document exists to avoid.
+
+Three things came out of the measurement, and they are worth more than the
+number itself.
+
+*The bucket table was specified and never written.* §02.6.1 has had
+`bucket_table_off` since the first draft and the reference implementation wrote
+zero into it. Plain binary search over 10⁶ entries is ~20 probes over 61 MiB,
+which is ~20 cache misses and nothing else. Writing the table was a 3.5×
+improvement and required no format change, because the field was already there.
+
+*Scanning beat binary search inside a bucket.* A 16-bit bucket holds ~15 entries
+at a 64-byte stride — 15 consecutive cache lines, which the prefetcher handles,
+against a binary search's four random probes into the same span. That is another
+1.9×, and it is the opposite of what the asymptotics suggest.
+
+*Wider buckets made it worse.* A 20-bit table gives ~1 entry per bucket and
+should be two memory accesses. Measured, it was 695 ns p99 against 593 ns for 16
+bits: 4 MiB no longer fits in L2, so the bucket read becomes a miss of its own
+and the adjacency win is lost. The implementation therefore writes 16-bit tables
+and not the theoretically better ones, which is a case of measurement overruling
+a model in the direction that costs performance work rather than saves it.
+
+§02.6 also claimed ~16 entries was "under two cache lines". Sixteen 64-byte
+entries are sixteen cache lines. The arithmetic error is corrected there, and it
+is a fair example of why "≈3 memory accesses" was optimistic: the real figure
+for the current design is closer to five.
+
+**What happens to the gate.** Two honest options: loosen it to a figure the
+design can hit, or change the index. The gate exists to force that decision
+early, and the roadmap says so in as many words — "if the index cannot hit that
+latency, the index format changes now, not later". The decision is not made
+here; the measurement is recorded so that it can be.
+
 **See also:** [Comparison](comparison.md) · [Roadmap](roadmap.md) · [§13 Streaming](../spec/13-streaming.md)
