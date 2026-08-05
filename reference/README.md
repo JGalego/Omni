@@ -47,6 +47,7 @@ implemented:
 - §02.6 fixed-layout object index with binary search
 - §03.2 canonical CBOR (rules D1–D8) with strict rejection of non-canonical input
 - §03.5 digests under both mandatory algorithms, content addressing, deduplication
+- §13.3 Bao outboard trees: pruned encoding, range verification, proof sizing
 - §01 object model, refs, reachability, dangling-ref detection
 - §04.3 dtype descriptors and packed sizing
 - §15.1 validation levels V0–V4
@@ -56,27 +57,30 @@ What is **not** implemented, and is reported as such rather than faked:
 - §04.7 tensor expression evaluation (only bare `literal` values are read)
 - §05 quantization · §07 OMNI-IR · §08 adapters and deltas · §09 training state
 - §10 capability negotiation · §11 WASM plugins · §12.5 signatures
-- §03.7 compression codecs (only `raw`) · §13 HTTP/OCI transport · Bao trees
+- §03.7 compression codecs (only `raw`) · §13 HTTP/OCI transport
 - `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
 
 See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-27 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+40 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
 rejection (each of D1–D8); depth and length-overflow bounds; pack/open/verify
 round-trip; reproducibility including input-order independence; data-object
 page alignment; tamper detection; truncation detection; header CRC checking;
-rejection of an unknown hash algorithm; and the
-dangling-ref-is-incomplete-not-invalid rule. Every container-level test runs
-under both mandatory digest algorithms.
+rejection of an unknown hash algorithm; the
+dangling-ref-is-incomplete-not-invalid rule; and, for Bao, that the outboard
+root equals the object digest at every granularity, that each group verifies
+alone, that corruption stays localised, and that a tampered tree, a
+misdelivered range and an unverifiable request are all refused. Every
+container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 27 passed; 0 failed
+test result: ok. 40 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

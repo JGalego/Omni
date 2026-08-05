@@ -19,11 +19,14 @@
 //! The tensor expression evaluator (§04.7), quantization schemes (§05),
 //! OMNI-IR (§07), adapters (§08), capability negotiation (§10), the WASM
 //! plugin host (§11), signatures (§12.5), compression codecs (§03.7) and every
-//! transport beyond the local filesystem. See `docs/design/roadmap.md`.
+//! transport beyond the local filesystem. Bao trees (§13.3) are implemented,
+//! but nothing yet fetches over a network to use them.
+//! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod bao;
 pub mod blake3;
 pub mod cbor;
 pub mod container;
@@ -31,6 +34,7 @@ pub mod crc32c;
 pub mod model;
 pub mod sha256;
 
+pub use bao::BaoTree;
 pub use blake3::blake3 as blake3_256;
 pub use cbor::Value;
 pub use container::{
