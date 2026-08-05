@@ -594,6 +594,9 @@ struct Layout {
     structs: Vec<Placed>,
     blobs: Vec<Placed>,
     n_entries: usize,
+    /// How many stored copies are not `raw` — decides what the superblock's
+    /// codec list has to name (§02.5).
+    compressed: usize,
 }
 
 fn compute_layout(
@@ -683,6 +686,11 @@ fn compute_layout(
         index_hdr_off = pad_before_index.unwrap().0 + SEG_HEADER_SIZE + pad_before_index.unwrap().1;
     }
     let n_entries = placed_structs.len() + placed_blobs.len();
+    let compressed = placed_structs
+        .iter()
+        .chain(placed_blobs.iter())
+        .filter(|p| p.codec != crate::codec::id::RAW)
+        .count();
     let index_len = index_bytes(n_entries);
     off = index_hdr_off + SEG_HEADER_SIZE + index_len;
 
@@ -710,6 +718,7 @@ fn compute_layout(
         structs: placed_structs,
         blobs: placed_blobs,
         n_entries,
+        compressed,
     }
 }
 
@@ -866,7 +875,16 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
         Value::U(seg::SUPER as u64),
     ]));
 
-    let total_logical: u64 = l.structs.iter().chain(l.blobs.iter()).map(|p| p.len).sum();
+    // §02.5's stats separate the two, and they differ exactly when a codec did
+    // something: `logical` is what the digests cover, `stored` is what the file
+    // costs.
+    let total_logical: u64 = l
+        .structs
+        .iter()
+        .chain(l.blobs.iter())
+        .map(|p| p.logical)
+        .sum();
+    let total_stored: u64 = l.structs.iter().chain(l.blobs.iter()).map(|p| p.len).sum();
 
     Value::map(vec![
         ("t", Value::text("omni.core/superblock")),
@@ -890,8 +908,18 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
         ("segments", Value::Array(segments)),
         ("hash", Value::text("sha2-256")),
         (
+            // §02.5: the codecs a reader may meet in this container. `raw` is
+            // always among them — structure objects are never compressed — and
+            // the requested codec joins it only when something actually used it.
             "codecs",
-            Value::Array(vec![Value::map(vec![("id", Value::text("raw"))])]),
+            Value::Array(if l.compressed > 0 {
+                vec![
+                    Value::map(vec![("id", Value::text("raw"))]),
+                    opts.codec.to_value(),
+                ]
+            } else {
+                vec![Value::map(vec![("id", Value::text("raw"))])]
+            }),
         ),
         ("align", Value::U(align as u64)),
         ("profile", Value::text("core")),
@@ -908,7 +936,7 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
                 ("objects", Value::U(l.n_entries as u64)),
                 ("blobs", Value::U(l.blobs.len() as u64)),
                 ("bytes_logical", Value::U(total_logical)),
-                ("bytes_stored", Value::U(total_logical)),
+                ("bytes_stored", Value::U(total_stored)),
             ]),
         ),
         ("creator", Value::text(opts.creator.clone())),
@@ -1111,7 +1139,7 @@ impl Container {
     pub fn read(&self, d: &Digest) -> Res<Vec<u8>> {
         let e = self.entry(d)?;
         let stored = self.stored_slice(e)?;
-        let codec = crate::codec::Codec::from_id(e.codec);
+        let codec = self.codec_for(e.codec);
         let logical = match codec {
             crate::codec::Codec::Raw => stored.to_vec(),
             other => other.decode(stored, e.logical_len, self.high_ratio())?,
@@ -1120,6 +1148,31 @@ impl Container {
             return Err(rule("R-O01", format!("digest mismatch for {}", hex(d))));
         }
         Ok(logical)
+    }
+
+    /// The codec for an index entry's codec byte, as described by the
+    /// superblock.
+    ///
+    /// The index has room for an id, not for parameters, and some codecs need
+    /// them: `bitshuffle+zstd` transposing by 2 bytes and by 4 produces
+    /// different bytes from the same input. §03.7.1 is why this works — codec
+    /// descriptors are required to be explicit and complete, and the superblock
+    /// carries them. A container whose superblock omits the descriptor falls
+    /// back to the registry default, which is the best a reader can do and is
+    /// caught immediately by the digest check either way.
+    pub fn codec_for(&self, id: u8) -> crate::codec::Codec {
+        if id == crate::codec::id::RAW {
+            return crate::codec::Codec::Raw;
+        }
+        if let Some(Value::Array(list)) = self.superblock.get("codecs") {
+            for c in list {
+                let declared = crate::codec::Codec::from_value(c);
+                if declared.id() == id {
+                    return declared;
+                }
+            }
+        }
+        crate::codec::Codec::from_id(id)
     }
 
     fn entry(&self, d: &Digest) -> Res<&IndexEntry> {
@@ -1666,11 +1719,81 @@ mod tests {
                 &objs,
                 &root,
                 &PackOptions {
-                    codec: Codec::Unsupported("zstd"),
+                    codec: Codec::Unsupported("lz4"),
                     ..Default::default()
                 },
             );
             assert!(matches!(r, Err(Error::Codec(_))));
+        }
+
+        /// The same properties under the codec §03.7.1 actually requires, plus
+        /// the two the superblock is supposed to report about it.
+        #[test]
+        fn a_zstd_container_holds_the_same_objects_and_says_what_it_used() {
+            let (objs, root) = objects();
+            let raw = pack(&objs, &root, &PackOptions::default()).unwrap();
+            for codec in [
+                Codec::Zstd { level: 9 },
+                Codec::BitshuffleZstd {
+                    elem_size: 4,
+                    level: 9,
+                },
+            ] {
+                let id = codec.id();
+                let packed = pack(
+                    &objs,
+                    &root,
+                    &PackOptions {
+                        codec,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(packed.len() < raw.len());
+                let a = Container::open(raw.clone()).unwrap();
+                let b = Container::open(packed).unwrap();
+                assert_eq!(a.header.root_digest, b.header.root_digest);
+                assert_eq!(a.index.len(), b.index.len());
+                for e in &a.index {
+                    assert_eq!(a.read(&e.digest).unwrap(), b.read(&e.digest).unwrap());
+                }
+                let blob = b
+                    .index
+                    .iter()
+                    .find(|e| e.otype == otype::BLOB)
+                    .expect("a data object");
+                assert_eq!(blob.codec, id);
+                assert!(blob.stored_len * 50 < blob.logical_len);
+                // §02.5: the superblock names the codecs a reader may meet, and
+                // separates what the digests cover from what the file costs.
+                let codecs = b.superblock.get("codecs").expect("codecs");
+                let names: Vec<&str> = match codecs {
+                    Value::Array(a) => a
+                        .iter()
+                        .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+                        .collect(),
+                    _ => panic!("codecs is not an array"),
+                };
+                assert!(names.contains(&"raw"));
+                assert!(names.iter().any(|n| n.contains("zstd")), "{names:?}");
+                let stats = b.superblock.get("stats").unwrap();
+                let logical = stats.get("bytes_logical").unwrap().as_u64().unwrap();
+                let stored = stats.get("bytes_stored").unwrap().as_u64().unwrap();
+                assert!(stored < logical, "{stored} vs {logical}");
+                let r = verify(&b).unwrap();
+                assert!(r.dangling.is_empty() && r.padding_ok && r.alignment_ok);
+            }
+            // A raw container still reports exactly one codec, and equal totals.
+            let a = Container::open(raw).unwrap();
+            let stats = a.superblock.get("stats").unwrap();
+            assert_eq!(
+                stats.get("bytes_logical").unwrap().as_u64(),
+                stats.get("bytes_stored").unwrap().as_u64()
+            );
+            match a.superblock.get("codecs").unwrap() {
+                Value::Array(v) => assert_eq!(v.len(), 1),
+                _ => panic!("codecs is not an array"),
+            }
         }
 
         #[test]

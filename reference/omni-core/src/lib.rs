@@ -18,10 +18,11 @@
 //!
 //! ## Not implemented here
 //!
-//! OMNI-IR (§07), capability negotiation (§10), the WASM plugin host (§11), signatures (§12.5),
-//! compression codecs (§03.7) and every transport beyond the local filesystem.
-//! Bao trees (§13.3) are implemented, but nothing yet fetches over a network to
-//! use them.
+//! OMNI-IR (§07), training state (§09), the WASM plugin host (§11) and every
+//! transport beyond the local filesystem. Bao trees (§13.3) are implemented, but
+//! nothing yet fetches over a network to use them. Of §03.7's codecs, `zstd`
+//! (the MUST) and `deflate` are here; the MAY-level ones are reported as
+//! unsupported rather than half-decoded.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -52,6 +53,7 @@ pub mod sparse;
 pub mod store;
 pub mod tensor;
 pub mod tokenizer;
+pub mod zstd;
 
 pub use bao::BaoTree;
 pub use blake3::blake3 as blake3_256;

@@ -29,6 +29,7 @@ fn main() -> ExitCode {
         Some("run") => run(&args),
         Some("list") => list(),
         Some("fuzz") => do_fuzz(&args),
+        Some("codec") => do_codec(&args),
         _ => {
             eprintln!(
                 "omni-conformance — OMNI conformance corpus (suite {SUITE_VERSION})\n\
@@ -37,7 +38,9 @@ fn main() -> ExitCode {
                  \x20   omni-conformance generate <dir>\n\
                  \x20   omni-conformance run <dir> --impl <command>\n\
                  \x20   omni-conformance list\n\
-                 \x20   omni-conformance fuzz <dir> [--iterations N] [--seed S] [--out <dir>]\n"
+                 \x20   omni-conformance fuzz <dir> [--iterations N] [--seed S] [--out <dir>]\n\
+                 \x20   omni-conformance codec <id> encode|decode <in> <out>\n\
+                 \x20       [--level N] [--elem-size N] [--logical-len N]\n"
             );
             2
         }
@@ -58,6 +61,94 @@ fn list() -> u8 {
     }
     println!("\n{} cases", cases.len());
     0
+}
+
+/// `codec <id> encode|decode <in> <out>` — the differential-testing hook.
+///
+/// §03.7's codecs are the one part of OMNI whose correctness is defined by
+/// somebody else's bitstream specification, so the only test that means
+/// anything is one that exchanges bytes with an independent implementation.
+/// This subcommand is that exchange point: CI compresses with libzstd and
+/// decodes here, then compresses here and decodes with libzstd.
+fn do_codec(args: &[String]) -> u8 {
+    let (Some(id), Some(dir), Some(input), Some(output)) =
+        (args.get(1), args.get(2), args.get(3), args.get(4))
+    else {
+        eprintln!("omni-conformance: codec needs <id> encode|decode <in> <out>");
+        return 2;
+    };
+    let mut level = 3u64;
+    let mut elem_size = 2u64;
+    let mut logical_len: Option<u64> = None;
+    let mut i = 5;
+    while i < args.len() {
+        if args[i] == "--level" {
+            level = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(3);
+            i += 2;
+        } else if args[i] == "--elem-size" {
+            elem_size = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(2);
+            i += 2;
+        } else if args[i] == "--logical-len" {
+            logical_len = args.get(i + 1).and_then(|v| v.parse().ok());
+            i += 2;
+        } else {
+            eprintln!("omni-conformance: unknown option `{}`", args[i]);
+            return 2;
+        }
+    }
+    let data = match std::fs::read(input) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("omni-conformance: {input}: {e}");
+            return 2;
+        }
+    };
+    let codec = omni_core::codec::Codec::from_value(&Value::map(vec![
+        ("id", Value::text(id)),
+        ("level", Value::U(level)),
+        ("elem_size", Value::U(elem_size)),
+    ]));
+    const CAP: usize = 1 << 30;
+    let out = match dir.as_str() {
+        "encode" => codec.encode(&data),
+        // §03.7.4's logical length is authoritative wherever an index declares
+        // it, and `--logical-len` is how it gets declared here. Without it there
+        // is nothing to check a ratio against, so the output is bounded and the
+        // codec's own framing decides the rest.
+        "decode" => match logical_len {
+            Some(n) => codec.decode(&data, n, false),
+            None => codec.decode_framed(&data, CAP),
+        },
+        _ => {
+            eprintln!("omni-conformance: codec direction must be encode or decode");
+            return 2;
+        }
+    };
+    match out {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(output, &bytes) {
+                eprintln!("omni-conformance: {output}: {e}");
+                return 2;
+            }
+            println!(
+                "{} {} {} B -> {} B",
+                codec.name(),
+                dir,
+                data.len(),
+                bytes.len()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("omni-conformance: {e}");
+            // An unimplemented codec is indeterminate (3), a broken stream is
+            // invalid (1) — the same distinction the CLI draws everywhere else.
+            match e {
+                omni_core::codec::Error::Unsupported(_) => 3,
+                _ => 1,
+            }
+        }
+    }
 }
 
 fn generate(dir: Option<PathBuf>) -> u8 {

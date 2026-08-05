@@ -5,17 +5,16 @@
 //! changes no identities and two containers using different codecs dedup against
 //! each other. That invariant is what this module exists to preserve.
 //!
-//! Implemented: `raw`, `deflate` (RFC 1951, both directions), `bitshuffle` as a
-//! filter, and `bitshuffle+deflate` — which is the combination §03.7.2 cares
-//! about, because transposing to byte-plane order groups the highly redundant
-//! exponent bytes of a float tensor together.
+//! Implemented: `raw`, `zstd` (RFC 8878, the MUST — see [`crate::zstd`]),
+//! `deflate` (RFC 1951, the archival profile's SHOULD), `bitshuffle` as a
+//! filter, and both `bitshuffle+zstd` and `bitshuffle+deflate` — the first
+//! being the combination §03.7.2 cares about, because transposing to byte-plane
+//! order groups the highly redundant exponent bytes of a float tensor together.
 //!
-//! **Not implemented: `zstd`**, which §03.7.1 marks as MUST. A conforming
-//! implementation needs it; a dependency-free one needs a few thousand lines of
-//! FSE and Huffman decoding to get it, and this crate reports the codec as
-//! unsupported rather than shipping a partial decoder that would silently fail
-//! on frames it does not understand. `deflate` is the SHOULD-level codec and is
-//! required by the archival profile, so the archival path is complete.
+//! Still unimplemented and reported as such: the MAY-level codecs `lz4`,
+//! `brotli`, `xz`, `ans-lut` and the two lossy ones. A registered codec this
+//! build cannot decode makes an object *indeterminate* (§15.1), never invalid —
+//! and never silently half-decoded.
 //!
 //! §03.7's own honest guidance is worth repeating: do not expect compression to
 //! shrink weights. The size wins in OMNI come from deduplication, deltas and
@@ -79,6 +78,16 @@ type Res<T> = Result<T, Error>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Codec {
     Raw,
+    /// Zstandard. `level` selects encoder effort; decoding never depends on it.
+    Zstd {
+        level: u8,
+    },
+    /// Byte-plane transpose with the given element width, then zstd — the
+    /// combination §03.7.2 recommends for float tensors.
+    BitshuffleZstd {
+        elem_size: usize,
+        level: u8,
+    },
     Deflate {
         level: u8,
     },
@@ -99,17 +108,17 @@ impl Codec {
     pub fn id(&self) -> u8 {
         match self {
             Codec::Raw => id::RAW,
+            Codec::Zstd { .. } => id::ZSTD,
+            Codec::BitshuffleZstd { .. } => id::BITSHUFFLE_ZSTD,
             Codec::Deflate { .. } => id::DEFLATE,
             Codec::BitshuffleDeflate { .. } => id::BITSHUFFLE_DEFLATE,
             // A pure filter has no registry id of its own; it is only meaningful
             // paired with an entropy coder, and is exposed here for testing.
             Codec::Bitshuffle { .. } => id::BITSHUFFLE_DEFLATE,
             Codec::Unsupported(name) => match *name {
-                "zstd" => id::ZSTD,
                 "lz4" => id::LZ4,
                 "brotli" => id::BROTLI,
                 "xz" => id::XZ,
-                "bitshuffle+zstd" => id::BITSHUFFLE_ZSTD,
                 "zfp" => id::ZFP,
                 "sz3" => id::SZ3,
                 "ans-lut" => id::ANS_LUT,
@@ -121,6 +130,8 @@ impl Codec {
     pub fn name(&self) -> &'static str {
         match self {
             Codec::Raw => "raw",
+            Codec::Zstd { .. } => "zstd",
+            Codec::BitshuffleZstd { .. } => "bitshuffle+zstd",
             Codec::Deflate { .. } => "deflate",
             Codec::BitshuffleDeflate { .. } => "bitshuffle+deflate",
             Codec::Bitshuffle { .. } => "bitshuffle",
@@ -136,16 +147,19 @@ impl Codec {
     pub fn from_id(id: u8) -> Codec {
         match id {
             id::RAW => Codec::Raw,
+            id::ZSTD => Codec::Zstd { level: 3 },
+            id::BITSHUFFLE_ZSTD => Codec::BitshuffleZstd {
+                elem_size: 2,
+                level: 3,
+            },
             id::DEFLATE => Codec::Deflate { level: 6 },
             id::BITSHUFFLE_DEFLATE => Codec::BitshuffleDeflate {
                 elem_size: 2,
                 level: 6,
             },
-            id::ZSTD => Codec::Unsupported("zstd"),
             id::LZ4 => Codec::Unsupported("lz4"),
             id::BROTLI => Codec::Unsupported("brotli"),
             id::XZ => Codec::Unsupported("xz"),
-            id::BITSHUFFLE_ZSTD => Codec::Unsupported("bitshuffle+zstd"),
             id::ZFP => Codec::Unsupported("zfp"),
             id::SZ3 => Codec::Unsupported("sz3"),
             id::ANS_LUT => Codec::Unsupported("ans-lut"),
@@ -157,6 +171,20 @@ impl Codec {
     pub fn to_value(&self) -> Value {
         let mut p: Vec<(&str, Value)> = vec![("id", Value::text(self.name()))];
         match self {
+            Codec::Zstd { level } => {
+                p.push(("level", Value::U(*level as u64)));
+                // §03.7.1's descriptor: the window this encoder asks readers for
+                // is fixed, and stating it lets a reader size its buffers before
+                // touching the stream.
+                p.push(("window_log", Value::U(crate::zstd::WINDOW_LOG as u64)));
+                p.push(("impl", Value::text("omni-rs")));
+            }
+            Codec::BitshuffleZstd { elem_size, level } => {
+                p.push(("level", Value::U(*level as u64)));
+                p.push(("elem_size", Value::U(*elem_size as u64)));
+                p.push(("window_log", Value::U(crate::zstd::WINDOW_LOG as u64)));
+                p.push(("impl", Value::text("omni-rs")));
+            }
             Codec::Deflate { level } => {
                 p.push(("level", Value::U(*level as u64)));
                 p.push(("impl", Value::text("omni-rs")));
@@ -184,14 +212,14 @@ impl Codec {
             .max(1) as usize;
         match name {
             "raw" => Codec::Raw,
+            "zstd" => Codec::Zstd { level },
+            "bitshuffle+zstd" => Codec::BitshuffleZstd { elem_size, level },
             "deflate" => Codec::Deflate { level },
             "bitshuffle+deflate" => Codec::BitshuffleDeflate { elem_size, level },
             "bitshuffle" => Codec::Bitshuffle { elem_size },
-            "zstd" => Codec::Unsupported("zstd"),
             "lz4" => Codec::Unsupported("lz4"),
             "brotli" => Codec::Unsupported("brotli"),
             "xz" => Codec::Unsupported("xz"),
-            "bitshuffle+zstd" => Codec::Unsupported("bitshuffle+zstd"),
             "zfp" => Codec::Unsupported("zfp"),
             "sz3" => Codec::Unsupported("sz3"),
             "ans-lut" => Codec::Unsupported("ans-lut"),
@@ -203,6 +231,11 @@ impl Codec {
     pub fn encode(&self, logical: &[u8]) -> Res<Vec<u8>> {
         match self {
             Codec::Raw => Ok(logical.to_vec()),
+            Codec::Zstd { level } => Ok(crate::zstd::compress(logical, *level)),
+            Codec::BitshuffleZstd { elem_size, level } => Ok(crate::zstd::compress(
+                &bitshuffle(logical, *elem_size),
+                *level,
+            )),
             Codec::Deflate { level } => Ok(deflate(logical, *level)),
             Codec::Bitshuffle { elem_size } => Ok(bitshuffle(logical, *elem_size)),
             Codec::BitshuffleDeflate { elem_size, level } => {
@@ -232,6 +265,10 @@ impl Codec {
         let n = logical_len as usize;
         let out = match self {
             Codec::Raw => stored.to_vec(),
+            Codec::Zstd { .. } => crate::zstd::decompress(stored, n)?,
+            Codec::BitshuffleZstd { elem_size, .. } => {
+                unbitshuffle(&crate::zstd::decompress(stored, n)?, *elem_size)
+            }
             Codec::Deflate { .. } => inflate(stored, n)?,
             Codec::Bitshuffle { elem_size } => unbitshuffle(stored, *elem_size),
             Codec::BitshuffleDeflate { elem_size, .. } => {
@@ -246,6 +283,31 @@ impl Codec {
             )));
         }
         Ok(out)
+    }
+
+    /// Decompresses a stored copy whose logical length nothing declared,
+    /// bounded only by `cap`.
+    ///
+    /// Inside a container there is always an index entry, and [`Codec::decode`]
+    /// is the right entry point: `logical_len` is authoritative and R-C13 has a
+    /// declared ratio to judge. A tool handed a bare compressed file has
+    /// neither, and refusing to decode it at all would be a worse answer than
+    /// bounding the output — which this still does.
+    pub fn decode_framed(&self, stored: &[u8], cap: usize) -> Res<Vec<u8>> {
+        match self {
+            Codec::Raw => Ok(stored.to_vec()),
+            Codec::Zstd { .. } => crate::zstd::decompress(stored, cap),
+            Codec::BitshuffleZstd { elem_size, .. } => Ok(unbitshuffle(
+                &crate::zstd::decompress(stored, cap)?,
+                *elem_size,
+            )),
+            Codec::Deflate { .. } => inflate(stored, cap),
+            Codec::Bitshuffle { elem_size } => Ok(unbitshuffle(stored, *elem_size)),
+            Codec::BitshuffleDeflate { elem_size, .. } => {
+                Ok(unbitshuffle(&inflate(stored, cap)?, *elem_size))
+            }
+            Codec::Unsupported(name) => Err(Error::Unsupported(name)),
+        }
     }
 }
 
@@ -929,15 +991,7 @@ mod tests {
 
     #[test]
     fn unimplemented_codecs_say_so_rather_than_guessing() {
-        for name in [
-            "zstd",
-            "lz4",
-            "brotli",
-            "xz",
-            "bitshuffle+zstd",
-            "zfp",
-            "sz3",
-        ] {
+        for name in ["lz4", "brotli", "xz", "ans-lut", "zfp", "sz3"] {
             let c = Codec::from_value(&Value::map(vec![("id", Value::text(name))]));
             assert_eq!(c.name(), name);
             assert!(matches!(c.encode(b"x"), Err(Error::Unsupported(_))));
@@ -964,7 +1018,12 @@ mod tests {
                 level: 6,
             },
             Codec::Bitshuffle { elem_size: 2 },
-            Codec::Unsupported("zstd"),
+            Codec::Zstd { level: 3 },
+            Codec::BitshuffleZstd {
+                elem_size: 2,
+                level: 9,
+            },
+            Codec::Unsupported("lz4"),
         ] {
             let v = c.to_value();
             assert_eq!(Codec::from_value(&v), c, "{}", c.name());
@@ -973,7 +1032,7 @@ mod tests {
         }
         assert_eq!(Codec::Raw.id(), id::RAW);
         assert_eq!(Codec::Deflate { level: 6 }.id(), id::DEFLATE);
-        assert_eq!(Codec::from_id(id::ZSTD), Codec::Unsupported("zstd"));
+        assert_eq!(Codec::from_id(id::ZSTD), Codec::Zstd { level: 3 });
         assert_eq!(Codec::from_id(id::RAW), Codec::Raw);
         assert_eq!(Codec::from_id(0xfe).name(), "unknown");
     }

@@ -368,6 +368,108 @@ jobs:
             { echo "::error::the two containers should not be identical"; exit 1; }
           echo "blake3-256 and sha2-256 containers both valid, both $a bytes"
 
+      # §03.7.1 marks zstd MUST. A codec is defined by somebody else's
+      # bitstream, so the only test that means anything is an exchange with the
+      # reference implementation — in both directions.
+      - name: zstd agrees with libzstd, both ways
+        run: |
+          pip install --quiet zstandard
+          CONF=reference/target/release/omni-conformance
+          python3 - "$CONF" <<'PY'
+          import subprocess, sys, random
+          import zstandard as zstd
+
+          CONF = sys.argv[1]
+          random.seed(20260805)
+
+          def noise(n):
+              return bytes(random.randrange(256) for _ in range(n))
+
+          cases = {
+              "empty": b"",
+              "one byte": b"z",
+              "text": b"a model exists once, everything else is derived. " * 900,
+              "small alphabet": bytes(random.choice(b"acgt") for _ in range(60000)),
+              "incompressible": noise(70000),
+              "one value": bytes(200000),
+              "float plane": bytes([0x3f if i % 3 else 0x40 for i in range(60000)]),
+              "duplicated": noise(90000) * 3,
+              # Two blocks and change, so matches must reach across a block
+              # boundary and the frame must carry more than one block.
+              "multi-block": (b"the tensor is an expression. " * 12000),
+          }
+
+          bad = 0
+          for name, data in cases.items():
+              open('/tmp/c-in.bin', 'wb').write(data)
+              # 1. We write it; libzstd must read it.
+              for level in (1, 3, 9, 19):
+                  r = subprocess.run([CONF, 'codec', 'zstd', 'encode', '/tmp/c-in.bin',
+                                      '/tmp/c-ours.zst', '--level', str(level)],
+                                     capture_output=True, text=True)
+                  if r.returncode != 0:
+                      print(f"::error::encode failed for {name} at level {level}: {r.stderr}")
+                      bad += 1
+                      continue
+                  frame = open('/tmp/c-ours.zst', 'rb').read()
+                  try:
+                      back = zstd.ZstdDecompressor().decompress(
+                          frame, max_output_size=len(data) + 1)
+                  except Exception as e:
+                      print(f"::error::libzstd rejected our frame for {name} at {level}: {e}")
+                      bad += 1
+                      continue
+                  if back != data:
+                      print(f"::error::libzstd decoded our frame for {name} differently")
+                      bad += 1
+              # 2. libzstd writes it; we must read it — at every level, with and
+              #    without a checksum and a declared content size.
+              for level in (1, 2, 5, 9, 12, 17, 19, 22):
+                  ref = zstd.ZstdCompressor(level=level,
+                                            write_checksum=(level % 2 == 0),
+                                            write_content_size=(level % 3 != 0)
+                                            ).compress(data)
+                  open('/tmp/c-ref.zst', 'wb').write(ref)
+                  r = subprocess.run([CONF, 'codec', 'zstd', 'decode', '/tmp/c-ref.zst',
+                                      '/tmp/c-back.bin'], capture_output=True, text=True)
+                  if r.returncode != 0:
+                      print(f"::error::we rejected libzstd's frame for {name} at {level}: {r.stderr}")
+                      bad += 1
+                      continue
+                  if open('/tmp/c-back.bin', 'rb').read() != data:
+                      print(f"::error::we decoded libzstd's frame for {name} at {level} differently")
+                      bad += 1
+              print(f"{name}: {len(data)} B, both directions agree")
+          sys.exit(1 if bad else 0)
+          PY
+          echo "zstd interoperates with libzstd in both directions"
+
+      # §03.7: compression is a property of a stored copy, so changing it must
+      # change no identity at all.
+      - name: Compressed containers keep every digest
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --quantized /tmp/comp.omni >/dev/null
+          "$OMNI" unpack /tmp/comp.omni -o /tmp/comp.omnid >/dev/null
+          # The baseline: the same objects packed raw, from the same directory
+          # store, so a raw repack has something byte-exact to be compared with.
+          "$OMNI" pack /tmp/comp.omnid -o /tmp/base.omni >/dev/null
+          for codec in zstd:9 bitshuffle+zstd:9:2 deflate:9; do
+            "$OMNI" pack /tmp/comp.omnid -o /tmp/packed.omni --codec "$codec" >/dev/null
+            "$OMNI" verify /tmp/packed.omni --level 6 >/dev/null
+            "$OMNI" repack /tmp/packed.omni -o /tmp/re.omni --codec raw | tee /tmp/repack.txt
+            grep -q 'every digest unchanged' /tmp/repack.txt
+            # A raw repack of a compressed container must reproduce the original
+            # container exactly: same objects, same order, same layout.
+            cmp /tmp/re.omni /tmp/base.omni
+            echo "$codec: identities survive the round trip"
+          done
+          # A codec this build does not implement is refused up front, not
+          # half-applied.
+          if "$OMNI" pack /tmp/comp.omnid -o /tmp/nope.omni --codec lz4 2>/dev/null; then
+            echo "::error::pack accepted an unimplemented codec"; exit 1
+          fi
+
       # The digests must be checkable by implementations that have nothing to do
       # with this repository, or "content-addressed" is just a claim.
       - name: Digests verify against independent implementations

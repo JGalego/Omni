@@ -73,10 +73,13 @@ VERBS:
     render  <file> [--message role:content]… [--var name=value]… [--inputs]
                               Render the OMNI-CT chat template (§06.9);
                               --inputs lists the variables it reads
-    pack    <dir.omnid> -o <file.omni> [--align N]
+    pack    <dir.omnid> -o <file.omni> [--align N] [--codec ID[:level]]
                               Build a container from a directory store
     unpack  <file.omni> -o <dir.omnid>
                               Explode a container into a directory store
+    repack  <file.omni> -o <out.omni> [--codec ID[:level]] [--align N]
+                              Re-store the same objects under different
+                              compression — every digest unchanged (§03.7)
     fsck    <file> [--rebuild -o <out.omni>]
                               Diagnose damage; rebuild by segment scan (§02.8)
     caps    [--out caps.cbor]  Emit this build's CapabilitySet (§10.2)
@@ -130,6 +133,7 @@ fn main() -> ExitCode {
         "render" => run(&args, cmd_render),
         "pack" => cmd_pack(&args),
         "unpack" => cmd_unpack(&args),
+        "repack" => cmd_repack(&args),
         // fsck must work on files that do not open, so it does not go through
         // `run`, which opens the container first.
         "fsck" => cmd_fsck(&args),
@@ -1557,6 +1561,124 @@ fn cmd_unpack(args: &[String]) -> R {
     Ok(0)
 }
 
+/// Parses `--codec ID[:level]` into a §03.7.1 codec descriptor.
+///
+/// `bitshuffle+zstd` needs an element width to transpose by; `:N` after the
+/// level supplies it, defaulting to 2 bytes because bf16 is what tensors
+/// mostly are.
+fn codec_flag(args: &[String]) -> Result<Option<omni_core::codec::Codec>, String> {
+    let Some(spec) = flag(args, "--codec") else {
+        return Ok(None);
+    };
+    let mut parts = spec.split(':');
+    let id = parts.next().unwrap_or("");
+    let level: u64 = match parts.next() {
+        None => 3,
+        Some(l) => l
+            .parse()
+            .map_err(|_| format!("--codec: `{l}` is not a level"))?,
+    };
+    let elem: u64 = match parts.next() {
+        None => 2,
+        Some(e) => e
+            .parse()
+            .map_err(|_| format!("--codec: `{e}` is not an element width"))?,
+    };
+    let c = omni_core::codec::Codec::from_value(&Value::map(vec![
+        ("id", Value::text(id)),
+        ("level", Value::U(level)),
+        ("elem_size", Value::U(elem)),
+    ]));
+    if let omni_core::codec::Codec::Unsupported(name) = c {
+        return Err(if name == "unknown" {
+            format!("--codec: `{id}` is not a codec in the §03.7.1 registry")
+        } else {
+            format!("--codec: `{name}` is registered but not implemented in this build")
+        });
+    }
+    Ok(Some(c))
+}
+
+/// `omni repack <file.omni> -o <out.omni>` — change the storage codec without
+/// changing what the container *is*.
+///
+/// §03.7 makes compression a property of a stored copy, so this must produce a
+/// container with the same root and the same object digests, byte for byte in
+/// the logical domain. The check is not a comment: the new container is opened
+/// and every digest compared before the file is written.
+fn cmd_repack(args: &[String]) -> R {
+    let (Some(input), Some(out)) = (args.get(1), flag(args, "-o").or(flag(args, "--out"))) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let src = Container::open(std::fs::read(input)?)?;
+    let root = src.header.root_digest;
+    let objects = container_objects(&src)?;
+    let mut opts = PackOptions {
+        hash: src.header.hash,
+        log2_align: src.header.log2_align,
+        ..Default::default()
+    };
+    match codec_flag(args) {
+        Ok(Some(c)) => opts.codec = c,
+        Ok(None) => {}
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(2);
+        }
+    }
+    if let Some(a) = flag(args, "--align") {
+        match a.parse::<u32>() {
+            Ok(n) if n.is_power_of_two() && (64..=1 << 30).contains(&n) => {
+                opts.log2_align = n.trailing_zeros() as u8
+            }
+            _ => {
+                prr!("omni: --align must be a power of two between 64 and 1Gi\n");
+                return Ok(2);
+            }
+        }
+    }
+    let codec_name = opts.codec.name();
+    let bytes = pack(&objects, &root, &opts)?;
+
+    // The claim in the CLI spec is that repacking changes no identity. Verify it
+    // here rather than asserting it in prose.
+    let fresh = Container::open(bytes.clone())?;
+    if fresh.header.root_digest != root {
+        return Err("repack changed the root; refusing to write it".into());
+    }
+    if fresh.index.len() != src.index.len() {
+        return Err("repack changed the object count; refusing to write it".into());
+    }
+    for e in &src.index {
+        let Some(_) = fresh.find(&e.digest) else {
+            return Err(format!(
+                "repack lost object {}; refusing to write it",
+                short(src.header.hash, &e.digest)
+            )
+            .into());
+        };
+        if fresh.read(&e.digest)? != src.read(&e.digest)? {
+            return Err("repack changed an object's bytes; refusing to write it".into());
+        }
+    }
+    std::fs::write(out, &bytes)?;
+    let before = std::fs::metadata(input)?.len();
+    pr!("repacked {input} -> {out}");
+    pr!("  codec          {codec_name}");
+    pr!(
+        "  objects        {} (every digest unchanged)",
+        src.index.len()
+    );
+    pr!(
+        "  size           {} -> {} ({:.1} %)",
+        human(before),
+        human(bytes.len() as u64),
+        100.0 * bytes.len() as f64 / before as f64
+    );
+    Ok(0)
+}
+
 /// `omni pack <dir.omnid> -o <file.omni>` — the inverse. Object types are
 /// recovered by walking from the root, since a directory store has no index to
 /// record them in.
@@ -1610,6 +1732,14 @@ fn cmd_pack(args: &[String]) -> R {
                 prr!("omni: --align must be a power of two between 64 and 1Gi\n");
                 return Ok(2);
             }
+        }
+    }
+    match codec_flag(args) {
+        Ok(Some(c)) => opts.codec = c,
+        Ok(None) => {}
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(2);
         }
     }
     let bytes = pack(&objects, &root, &opts)?;

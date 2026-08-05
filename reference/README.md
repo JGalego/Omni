@@ -22,6 +22,8 @@ $ ./target/release/omni adapter check base.omni lora.omni
 $ ./target/release/omni example --tokenizer tok.omni
 $ ./target/release/omni verify tok.omni --tokenizer     # runs its §06.7.1 vectors
 $ ./target/release/omni tokenize tok.omni --text "hello"
+$ ./target/release/omni pack model.omnid -o packed.omni --codec zstd:9
+$ ./target/release/omni repack packed.omni -o smaller.omni --codec bitshuffle+zstd:9:2
 $ ./target/release/omni example --chat-template ct.omni
 $ ./target/release/omni verify ct.omni --template         # runs its §06.9 vectors
 $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_prompt=true
@@ -31,8 +33,8 @@ $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, model builder | §01–§06, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · pack · unpack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, model builder | §01–§06, §13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -41,7 +43,8 @@ $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_
 - **Zero dependencies.** `docs/design/sdk.md` §5 claims a conforming C0 reader
   needs nothing beyond a hash function and fits in ~3 000 lines. This crate is
   the evidence rather than the assertion — BLAKE3, SHA-256, SHA-512, CRC-32C,
-  Ed25519, ChaCha20 and a strict canonical CBOR codec are all implemented here.
+  Ed25519, ChaCha20, deflate, Zstandard, XXH64 and a strict canonical CBOR codec
+  are all implemented here.
 - **`#![forbid(unsafe_code)]`.** This code parses untrusted binary input; §12.4
   requires memory safety, bounds checks on every length and offset, bounded
   nesting depth, and no allocation driven by an unvalidated declared size.
@@ -90,9 +93,14 @@ implemented:
   R-A01–R-A03, the eight arithmetic methods built from core nodes, graph-level
   methods carried as rewrites, composition, the six delta representations with
   measured error, and parent chains with R-O06
-- §03.7 compression: `raw`, `deflate` (RFC 1951, both directions), `bitshuffle`
-  and `bitshuffle+deflate`, with the §03.7.4 decompression bounds; a compressed
-  container holds the same object identities as an uncompressed one
+- §03.7 compression: `raw`, `zstd` (RFC 8878, both directions — FSE, Huffman,
+  sequences, repeat offsets, the window, multi-frame streams and the XXH64
+  content checksum), `deflate` (RFC 1951, both directions), `bitshuffle`, and
+  both `bitshuffle+zstd` and `bitshuffle+deflate`, with the §03.7.4
+  decompression bounds; a compressed container holds the same object identities
+  as an uncompressed one, the superblock names the codecs a reader will meet and
+  reports stored bytes apart from logical ones, and `omni repack` changes the
+  storage codec while proving every digest survived
 - §10 capability negotiation: capability sets with the three-valued support of
   §10.2, candidate enumeration, the deterministic resolver of §10.5 under all
   five objectives, budget retry, and the informative failures of §10.5.2
@@ -125,15 +133,16 @@ What is **not** implemented, and is reported as such rather than faked:
 
 - §07 OMNI-IR · §09 training state
 - §11 WASM plugins
-- §03.7's `zstd` (a MUST) and the other optional codecs: reported as
-  unsupported rather than half-decoded · §13 HTTP/OCI transport
+- §03.7's MAY-level codecs `lz4`, `brotli`, `xz`, `ans-lut` and the two lossy
+  ones: reported as unsupported rather than half-decoded · §13 HTTP/OCI
+  transport
 - `mmap` (the reader takes a `Vec<u8>`; the parsing code is identical either way)
 
 See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-271 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+284 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -184,7 +193,14 @@ tampered signature are all refused; and, for §12.5, that attaching a signature
 to the manifest it signs does not invalidate it, that the canonical digest
 ignores caches but not assets, that a signature over another model does not
 transfer, and that an unknown key or an unimplemented algorithm is indeterminate
-rather than invalid; and, for compression, that deflate round-trips at every
+rather than invalid; and, for compression, that zstd decodes six frames
+produced by libzstd — covering Raw, RLE and compressed blocks, direct and
+FSE-compressed Huffman weights, one- and four-stream literals, Treeless blocks
+that reuse a previous table, and multi-block frames whose matches reach across a
+block boundary — that our own frames round-trip at every level over every
+corpus, that XXH64 matches its published vectors, that a dictionary frame is
+refused as unsupported rather than guessed at, that a corrupted frame never
+decodes to the original, that deflate round-trips at every
 level and is reproducible, that bitshuffle is exactly invertible at any length
 and helps on float weights, that a compressed container holds the same objects
 and digests as an uncompressed one, and that a lying ratio, a back-reference
@@ -221,7 +237,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 271 passed; 0 failed
+test result: ok. 284 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
