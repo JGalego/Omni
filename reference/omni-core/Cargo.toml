@@ -1,0 +1,11 @@
+[package]
+name = "omni-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OMNI (Open Model Neutral Interchange) reference core: container, objects, canonical CBOR, digests"
+
+# Deliberately zero dependencies. The C0 reader budget (docs/design/sdk.md §5)
+# claims a conforming reader needs nothing beyond a hash function; this crate
+# demonstrates that by implementing everything from scratch.
+[dependencies]

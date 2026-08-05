@@ -115,3 +115,18 @@ See [§14.7](docs/spec/14-versioning.md) for the reasoning behind keeping `.omni
 The specification is offered under CC BY 4.0; the reference implementation under
 Apache-2.0 WITH LLVM-exception OR MIT. Standards need patent-safe, permissive
 licensing to be adopted, and dual licensing removes the last excuse.
+
+---
+
+## Try it
+
+```console
+$ cd reference && cargo build --release && cargo test
+$ cd ../examples && ../reference/target/release/omni example toy.omni
+$ ../reference/target/release/omni inspect toy.omni
+$ ../reference/target/release/omni verify  toy.omni
+```
+
+`examples/toy.omni` is a real, complete, byte-reproducible OMNI container. See
+[`examples/README.md`](examples/README.md) for annotated hexdumps, CBOR
+diagnostic listings of every object, and an independent digest verification.
