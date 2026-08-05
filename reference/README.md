@@ -18,7 +18,7 @@ $ ./target/release/omni verify  model.omni
 | Crate | Contents | Spec |
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, model builder | §01–§04, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · example` | design/cli.md |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · pack · unpack · fsck · example` | design/cli.md |
 
 ## Deliberate constraints
 
@@ -49,6 +49,7 @@ implemented:
 - §03.5 digests under both mandatory algorithms, content addressing, deduplication
 - §13.3 Bao outboard trees: pruned encoding, range verification, proof sizing
 - §01.8 stores: memory, `.omnid/` directory, container, layered resolution
+- §02.8 recovery by segment scan (`omni fsck --rebuild`)
 - §01 object model, refs, reachability, dangling-ref detection
 - §04.3 dtype descriptors and packed sizing
 - §15.1 validation levels V0–V4
@@ -65,7 +66,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-49 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+53 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -79,12 +80,14 @@ alone, that corruption stays localised, and that a tampered tree, a
 misdelivered range and an unverifiable request are all refused; and, for
 stores, a container→directory→container round trip that is byte-exact,
 type recovery from refs alone, detection of a file whose name lies about its
-contents, and refusal to mix digest algorithms. Every container-level test runs
+contents, and refusal to mix digest algorithms; and, for recovery, that a
+container stripped of its index, superblock and trailer rebuilds byte-identically
+and that a corrupted data object is reported missing rather than accepted. Every container-level test runs
 under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 49 passed; 0 failed
+test result: ok. 53 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

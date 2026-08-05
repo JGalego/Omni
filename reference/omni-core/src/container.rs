@@ -864,7 +864,52 @@ impl Container {
     }
 }
 
-fn parse_header(b: &[u8]) -> Res<Header> {
+/// Parses and CRC-checks the 128-byte file header.
+///
+/// Public because recovery (§02.8) needs it: the header is the only part of a
+/// damaged container that must still be trusted, and it is the only part that
+/// carries the digest algorithm, the alignment and the root digest.
+/// Locates every segment by scanning for `OSEG` on 8-byte boundaries,
+/// validating both CRCs (§02.8).
+///
+/// Deliberately does not consult the superblock, the trailer or the index:
+/// this is the path a damaged container takes, and it must not depend on the
+/// structures most likely to be damaged. A segment whose header CRC fails is
+/// skipped rather than fatal — the goal is to salvage what is intact.
+pub fn scan_segments(bytes: &[u8]) -> Res<Vec<(usize, u16, u64)>> {
+    let header = parse_header(bytes)?;
+    let mut out = Vec::new();
+    let mut off = header.header_size as usize;
+    // The trailer may itself be destroyed, so scan to the end of the file and
+    // let the per-segment CRCs decide what is real.
+    let end = bytes.len();
+    while off + SEG_HEADER_SIZE <= end {
+        if bytes[off..off + 4] != SEG_MAGIC {
+            off += 8;
+            continue;
+        }
+        let hc = u32::from_le_bytes(bytes[off + 28..off + 32].try_into().unwrap());
+        if crc32c(&bytes[off..off + 28]) != hc {
+            off += 8;
+            continue;
+        }
+        let kind = u16::from_le_bytes(bytes[off + 4..off + 6].try_into().unwrap());
+        let plen = u64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
+        let p = off + SEG_HEADER_SIZE;
+        if plen > (end - p) as u64 {
+            off += 8;
+            continue;
+        }
+        out.push((off, kind, plen));
+        off = round_up(p + plen as usize, 8);
+    }
+    Ok(out)
+}
+
+pub fn parse_header(b: &[u8]) -> Res<Header> {
+    if b.len() < HEADER_SIZE {
+        return Err(rule("R-C01", "file too small to hold a header"));
+    }
     if b[0..8] != MAGIC {
         return Err(rule("R-C01", "bad magic"));
     }

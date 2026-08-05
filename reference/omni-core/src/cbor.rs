@@ -436,12 +436,25 @@ fn f16_to_f64(h: u16) -> f64 {
 /// Strict canonical decode. Rejects any non-canonical input and any trailing
 /// bytes (D8).
 pub fn decode(bytes: &[u8]) -> Result<Value, Error> {
-    let mut d = Dec { b: bytes, p: 0 };
-    let v = d.value(0)?;
-    if d.p != bytes.len() {
-        return Err(Error::Trailing(bytes.len() - d.p));
+    let (v, used) = decode_prefix(bytes)?;
+    if used != bytes.len() {
+        return Err(Error::Trailing(bytes.len() - used));
     }
     Ok(v)
+}
+
+/// Decodes one canonical value from the front of `bytes` and reports how many
+/// bytes it consumed, leaving the rest alone.
+///
+/// This is what makes a run of concatenated objects readable without an index:
+/// CBOR is self-delimiting, so the end of one value is the start of the next.
+/// Recovery (§02.8) depends on it. It is *not* a relaxation of D8 — trailing
+/// bytes are still rejected by [`decode`]; this simply reports the boundary
+/// instead of assuming there is nothing after it.
+pub fn decode_prefix(bytes: &[u8]) -> Result<(Value, usize), Error> {
+    let mut d = Dec { b: bytes, p: 0 };
+    let v = d.value(0)?;
+    Ok((v, d.p))
 }
 
 // ------------------------------------------------------------- ergonomics --

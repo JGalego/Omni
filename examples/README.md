@@ -302,7 +302,88 @@ algorithms — only the chunk's *name* changed. Its file offset moved, from
 still page-aligned, so this tensor can be handed to a consumer directly from an
 `mmap` with no copy (R-C08).
 
-## 9 What these examples do *not* show
+## 9 A container and a directory are the same graph
+
+`.omni` is one serialization of the object graph, not the graph itself
+(§01 axiom A5). Exploding it into a directory store and packing it back has to
+be a no-op, and it is:
+
+```console
+$ omni unpack toy.omni -o /tmp/toy.omnid
+unpacked toy.omni -> /tmp/toy.omnid
+  hash           blake3-256
+  root           b3:ef5e49b8b0c2faa7…
+  objects        49 written, 0 already present
+
+$ omni pack /tmp/toy.omnid -o /tmp/repacked.omni
+$ cmp /tmp/repacked.omni toy.omni && echo identical
+identical
+```
+
+The directory has no index and no type column — just files named by digest:
+
+```console
+$ ls /tmp/toy.omnid
+config  objects  root
+$ ls /tmp/toy.omnid/objects/ef
+5e49b8b0c2faa7545bd60ada413730fcc1474fa73be4a5b93f5e588056c8d3
+```
+
+Object types are not stored anywhere in it. They are recovered by walking the
+`[otype, digest]` refs from a root whose type is known, which is why a plain
+directory of files can round trip through a container that has a typed index.
+
+## 10 Recovering a wrecked container
+
+§02.8 says a container whose trailer, superblock and index are destroyed can be
+rebuilt by scanning. Destroying the last 8 KiB of `toy.omni` removes all three:
+
+```console
+$ python3 -c "
+d = bytearray(open('toy.omni','rb').read())
+d[-8192:] = b'\x00' * 8192
+open('wrecked.omni','wb').write(bytes(d))"
+
+$ omni verify wrecked.omni
+error: R-C09: trailer magic mismatch
+
+$ omni fsck wrecked.omni --rebuild -o repaired.omni
+normal open   ✗ R-C09: trailer magic mismatch
+header        ✓ OMNI/1.0  hash=blake3-256  align=4096
+root          b3:ef5e49b8b0c2faa7…
+segment scan  5 segments with valid CRCs
+     0x00000080  SUPER         337 B
+     0x00001080  OBJ          6294 B
+     0x00002938  PAD          1672 B
+     0x00002fe0  BLOB        90112 B
+     0x00019000  PAD          4032 B
+structures    27 decoded from OBJ segments
+data objects  22 located by alignment, confirmed by hashing
+graph         49 objects reachable from the root
+
+recoverable   ✓ complete
+
+rebuilt       repaired.omni  111.19 KiB
+              verifies: 49 objects, 49 reachable
+
+$ cmp repaired.omni toy.omni && echo "byte-identical to the undamaged original"
+byte-identical to the undamaged original
+```
+
+Two format decisions are doing the work. Structure objects are canonical CBOR,
+which is self-delimiting, so decoding one finds the next without an index. Data
+objects have no framing at all — but every one starts on a 4 KiB boundary
+(R-C08) and the `ChunkList` objects record their lengths, so the search space is
+small and every candidate is confirmed by hashing.
+
+That confirmation is the part that matters. Recovery of most formats means
+guessing, and a plausible guess is worse than a failure. Here a mis-assembled
+object cannot pass: it fails its digest and is reported missing, so a damaged
+file recovers to something *incomplete* rather than something *wrong*. Flipping
+a byte inside one chunk produces exactly that — 21 objects recovered, one
+reported missing, and the rebuilt container honestly carrying a dangling ref.
+
+## 11 What these examples do *not* show
 
 Honesty about scope. The reference implementation is at Phase 0/1 of the
 [roadmap](../docs/design/roadmap.md); these examples exercise §01–§04's `literal`

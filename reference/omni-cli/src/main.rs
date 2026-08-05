@@ -7,8 +7,11 @@
 
 use omni_core::cbor::Value;
 use omni_core::container::{otype, seg, IndexEntry};
+use omni_core::recover::recover;
+use omni_core::store::{copy_reachable, walk, DirStore, EnumerableStore, Store};
 use omni_core::{
-    hex, pack, verify, Container, DType, HashAlgo, ModelBuilder, PackOptions, TensorSpec,
+    hex, pack, verify, Container, ContainerStore, DType, HashAlgo, ModelBuilder, PackOptions,
+    TensorSpec,
 };
 use std::process::ExitCode;
 
@@ -54,6 +57,12 @@ VERBS:
     dump    <file> --header   Annotated hexdump of the 128-byte file header
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
     cat     <file> --tensor <name> --hex [--limit N]
+    pack    <dir.omnid> -o <file.omni> [--align N]
+                              Build a container from a directory store
+    unpack  <file.omni> -o <dir.omnid>
+                              Explode a container into a directory store
+    fsck    <file> [--rebuild -o <out.omni>]
+                              Diagnose damage; rebuild by segment scan (§02.8)
     example <out.omni> [--hash blake3|sha256]
                               Build a small but complete example container
 
@@ -73,6 +82,11 @@ fn main() -> ExitCode {
         "ls" => run(&args, cmd_ls),
         "dump" => run(&args, cmd_dump),
         "cat" => run(&args, cmd_cat),
+        "pack" => cmd_pack(&args),
+        "unpack" => cmd_unpack(&args),
+        // fsck must work on files that do not open, so it does not go through
+        // `run`, which opens the container first.
+        "fsck" => cmd_fsck(&args),
         "example" => cmd_example(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
@@ -680,6 +694,223 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
         }
     }
     Ok(0)
+}
+
+/// `omni unpack <file.omni> -o <dir.omnid>` — a container into a directory
+/// store. No conversion happens: the objects are the same objects (§01 A5).
+fn cmd_unpack(args: &[String]) -> R {
+    let (Some(input), Some(out)) = (args.get(1), flag(args, "-o").or(flag(args, "--out"))) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let src = ContainerStore::new(Container::open(std::fs::read(input)?)?);
+    let (root_type, root) = src.root();
+    let mut dst = DirStore::create(out, src.hash())?;
+    let (copied, present) = copy_reachable(&src, &mut dst, root_type, &root)?;
+    dst.set_root(root_type, &root)?;
+
+    pr!("unpacked {input} -> {out}");
+    pr!("  hash           {}", src.hash().name());
+    pr!("  root           {}", short(src.hash(), &root));
+    pr!("  objects        {copied} written, {present} already present");
+    let unreachable = src.container().index.len() - (copied + present);
+    if unreachable > 0 {
+        pr!("  unreferenced   {unreachable} objects in the index, not reachable from the root");
+    }
+    Ok(0)
+}
+
+/// `omni pack <dir.omnid> -o <file.omni>` — the inverse. Object types are
+/// recovered by walking from the root, since a directory store has no index to
+/// record them in.
+fn cmd_pack(args: &[String]) -> R {
+    let (Some(input), Some(out)) = (args.get(1), flag(args, "-o").or(flag(args, "--out"))) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let src = DirStore::open(input)?;
+    let Some((root_type, root)) = src.root()? else {
+        prr!("omni: {input} has no recorded root; nothing to pack\n");
+        return Ok(2);
+    };
+
+    let w = walk(&src, root_type, &root)?;
+    if !w.dangling.is_empty() {
+        prr!(
+            "omni: {} referenced objects are missing from the store\n",
+            w.dangling.len()
+        );
+        for d in w.dangling.iter().take(5) {
+            prr!("  {}\n", short(src.hash(), d));
+        }
+        return Ok(5);
+    }
+
+    let objects: Result<Vec<_>, _> = w
+        .objects
+        .iter()
+        .map(|(d, t)| {
+            src.resolve(d).map(|b| omni_core::Object {
+                otype: *t,
+                payload: b.expect("walk found it a moment ago"),
+                oflags: 0b0100_0001, // CRITICAL | SAFE_TO_COPY
+            })
+        })
+        .collect();
+    let objects = objects?;
+
+    let mut opts = PackOptions {
+        hash: src.hash(),
+        ..Default::default()
+    };
+    if let Some(a) = flag(args, "--align") {
+        match a.parse::<u32>() {
+            Ok(n) if n.is_power_of_two() && (64..=1 << 30).contains(&n) => {
+                opts.log2_align = n.trailing_zeros() as u8
+            }
+            _ => {
+                prr!("omni: --align must be a power of two between 64 and 1Gi\n");
+                return Ok(2);
+            }
+        }
+    }
+    let bytes = pack(&objects, &root, &opts)?;
+    std::fs::write(out, &bytes)?;
+
+    let c = Container::open(bytes.clone())?;
+    let r = verify(&c)?;
+    pr!("packed {input} -> {out}");
+    pr!("  size           {}", human(bytes.len() as u64));
+    pr!("  hash           {}", src.hash().name());
+    pr!("  root           {}", short(src.hash(), &root));
+    pr!("  objects        {}", objects.len());
+    pr!(
+        "  verified       {} objects, {}",
+        r.objects_verified,
+        human(r.bytes_verified)
+    );
+    let stored: usize = src.iter()?.len();
+    if stored > objects.len() {
+        pr!(
+            "  left behind    {} objects in the store, unreachable from the root",
+            stored - objects.len()
+        );
+    }
+    Ok(0)
+}
+
+/// `omni fsck <file> [--rebuild -o <out>]` — §02.8.
+///
+/// Unlike `verify`, this trusts nothing but the file header, and reaches its
+/// conclusions by scanning rather than by reading the index. That is the whole
+/// point: it is the tool for files where the index is the damaged part.
+fn cmd_fsck(args: &[String]) -> R {
+    let Some(input) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let bytes = std::fs::read(input)?;
+
+    // What a normal reader would say.
+    let opens = Container::open(bytes.clone());
+    match &opens {
+        Ok(c) => match verify(c) {
+            Ok(r) => pr!(
+                "normal open   ✓ valid, {} objects, {} reachable",
+                c.index.len(),
+                r.reachable
+            ),
+            Err(e) => pr!("normal open   ✗ opens but fails validation: {e}"),
+        },
+        Err(e) => pr!("normal open   ✗ {e}"),
+    }
+
+    let r = recover(&bytes)?;
+    pr!(
+        "header        ✓ OMNI/{}.{}  hash={}  align={}",
+        r.header.container_major,
+        r.header.container_minor,
+        r.header.hash.name(),
+        1u64 << r.header.log2_align
+    );
+    pr!("root          {}", short(r.header.hash, &r.root));
+
+    pr!(
+        "segment scan  {} segments with valid CRCs",
+        r.segments.len()
+    );
+    for (off, kind, plen) in &r.segments {
+        pr!("     {off:#010x}  {:<6} {:>10} B", seg::name(*kind), plen);
+    }
+    pr!("structures    {} decoded from OBJ segments", r.structures);
+    pr!(
+        "data objects  {} located by alignment, confirmed by hashing",
+        r.blobs
+    );
+    if r.unaccounted_blob_bytes > 0 {
+        pr!(
+            "unaccounted   {} of BLOB payload matched nothing",
+            human(r.unaccounted_blob_bytes)
+        );
+    }
+    pr!(
+        "graph         {} objects reachable from the root",
+        r.objects.len()
+    );
+
+    if !r.missing.is_empty() {
+        pr!(
+            "missing       {} referenced objects could not be recovered",
+            r.missing.len()
+        );
+        for d in r.missing.iter().take(5) {
+            pr!("     {}", short(r.header.hash, d));
+        }
+    }
+
+    let code = if r.complete() {
+        pr!();
+        pr!("recoverable   ✓ complete");
+        0
+    } else {
+        pr!();
+        pr!("recoverable   partial — the graph is incomplete (§01.4), not wrong");
+        5
+    };
+
+    if args.iter().any(|a| a == "--rebuild") {
+        let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+            prr!("omni: --rebuild needs -o <out.omni>\n");
+            return Ok(2);
+        };
+        let opts = PackOptions {
+            hash: r.header.hash,
+            log2_align: r.header.log2_align,
+            ..Default::default()
+        };
+        let rebuilt = pack(&r.objects, &r.root, &opts)?;
+        std::fs::write(out, &rebuilt)?;
+        pr!();
+        pr!("rebuilt       {out}  {}", human(rebuilt.len() as u64));
+        if rebuilt == bytes {
+            pr!("              byte-identical to the input");
+        } else if r.complete() {
+            pr!("              differs from the input, which is expected when the input was damaged");
+        }
+        let c = Container::open(rebuilt)?;
+        match verify(&c) {
+            Ok(v) => pr!(
+                "              verifies: {} objects, {} reachable",
+                v.objects_verified,
+                v.reachable
+            ),
+            Err(e) => {
+                prr!("omni: the rebuilt container does not verify: {e}\n");
+                return Ok(1);
+            }
+        }
+    }
+    Ok(code)
 }
 
 /// Value of a `--name <value>` option, if present.

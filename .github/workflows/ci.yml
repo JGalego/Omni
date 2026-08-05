@@ -104,6 +104,33 @@ jobs:
           fi
           echo "committed example is reproducible from source"
 
+      # §01 axiom A5: a container and a directory are two backings for one
+      # graph, so the round trip must not perturb a single byte.
+      - name: Container round-trips through a directory store
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" unpack examples/toy.omni -o /tmp/toy.omnid
+          "$OMNI" pack   /tmp/toy.omnid    -o /tmp/repacked.omni
+          cmp /tmp/repacked.omni examples/toy.omni
+          echo "container -> .omnid -> container is byte-identical"
+
+      # §02.8: a container whose index, superblock and trailer are destroyed is
+      # rebuilt by scanning. Content addressing is what makes the result
+      # trustworthy rather than merely plausible.
+      - name: A wrecked container is recovered exactly
+        run: |
+          OMNI=reference/target/release/omni
+          python3 -c "
+          d = bytearray(open('examples/toy.omni','rb').read())
+          d[-8192:] = b'\x00' * 8192   # index + back superblock + trailer
+          open('/tmp/wrecked.omni','wb').write(bytes(d))"
+          if "$OMNI" verify /tmp/wrecked.omni >/dev/null 2>&1; then
+            echo "::error::the wrecked file should not verify"; exit 1
+          fi
+          "$OMNI" fsck /tmp/wrecked.omni --rebuild -o /tmp/repaired.omni
+          cmp /tmp/repaired.omni examples/toy.omni
+          echo "recovered byte-identically from the undamaged original"
+
       - name: Corruption is detected
         run: |
           OMNI=reference/target/release/omni

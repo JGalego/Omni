@@ -32,6 +32,7 @@ pub mod cbor;
 pub mod container;
 pub mod crc32c;
 pub mod model;
+pub mod recover;
 pub mod sha256;
 pub mod store;
 
