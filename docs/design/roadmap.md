@@ -227,12 +227,12 @@ At least one production deployment outside the authoring organizations.
 |---|---|---|
 | **Nobody adopts it** | high | Parasitic adoption: lossless import, faithful export, FUSE view, OCI transport. OMNI must be useful to someone who never publishes an `.omni`. |
 | **The expression algebra is too complex for runtimes** | medium | C0/C1 profile split; `literal` realizations; the evaluator is ~1 500 lines and is provided in every binding |
-| **Spec ambiguity causes divergent implementations** | medium | Differential testing from Phase 1; conformance suite is normative; WASM reference semantics for anything subtle |
+| **Spec ambiguity causes divergent implementations** | medium | Differential testing from Phase 1; conformance suite is normative; WASM reference semantics for anything subtle. A second reader in a second language (`bindings/python/omni.py`, pure Python, no dependencies) is checked against the Rust one on every push — two implementations agreeing on a byte is worth more than one asserting it |
 | **A dominant vendor forks it** | medium | Permissive licensing + royalty-free IPR make forking legal but pointless; the conformance mark and mirrored registry are the coordination points |
 | **Registry capture / politicization** | medium | `x.*` namespace, first-come-first-served for third parties, frozen core, mirrorable signed registry (§11.7) |
 | **Hash algorithm break** | low, high impact | Agility designed in (§12.11); migration costs one hashing pass, zero re-uploads |
 | **Container format needs a breaking change** | low, very high impact | `header_size` growth, skippable segments, index `fmt_version`, feature flags — the specific mechanisms that prevent it |
-| **Scope creep** | high | The C0 budget (§SDK.5) is a hard gate on every proposal |
+| **Scope creep** | high | The C0 budget (§SDK.5) is a hard gate on every proposal, and it is now *measured* rather than modelled: the pure-Python C0 reader is 878 lines against a ~3 000 line budget |
 
 ## Success criteria at 5 years
 

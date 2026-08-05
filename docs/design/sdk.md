@@ -179,6 +179,14 @@ with omni.writer("out.omni", reproducible=True) as wr:
   code migrates by changing one import.
 - Type stubs shipped; `mypy`-clean.
 
+**What exists today is not this.** PyO3 needs a dependency and `unsafe`, and the
+reference implementation forbids both on purpose, so the binding above is a design
+and not a build. What is built is [`bindings/python/omni.py`](../../bindings/python/omni.py):
+a **C0 reader in pure Python, no dependencies**, which reads a container, verifies
+every digest, and hands back a literal tensor's bytes. No DLPack, no zero copy,
+no writer — those need the C ABI of §3 first. Its purpose is different anyway, and
+§5.1 is where that purpose is.
+
 ### 4.2 C++ (`omni.hpp`)
 
 Header-only RAII over the C ABI; C++17.
@@ -295,6 +303,39 @@ This budget is why the container is boring, why the index is a fixed array, why
 CBOR is used instead of a bespoke encoding, and why the expression evaluator is
 C1 rather than C0. **If a proposed feature would push C0 over budget, it belongs
 in a higher profile.** That rule has been applied throughout this specification.
+
+### 5.1 Measured, in a second language
+
+The table above is a breakdown of the Rust implementation, which is also the
+program that *wrote* the containers it reads. On its own that cannot distinguish
+"the format is simple" from "these two programs share an author's assumptions".
+
+So there is a second reader: [`bindings/python/omni.py`](../../bindings/python/omni.py),
+**878 lines of pure Python with no dependencies**, written from the specification
+rather than from the Rust. It implements BLAKE3 from scratch — the one primitive
+C0 needs that Python does not ship — plus CRC-32C, the two-read open, the index
+with its bucket table, canonical OMNI-CBOR with D1–D8 enforced, the object graph,
+and literal tensors.
+
+CI runs it against every container the Rust implementation writes and checks that
+the two agree: every object's digest, the root digest in full, and every literal
+tensor's bytes compared against what the Rust *exporter* produces. It also checks
+what C0 does not cover — a compressed object, a `dequantize` expression, a packed
+layout — is refused **by name** rather than answered wrongly, because a floor is
+only honest if what sits above it is named.
+
+Two things the exercise found, which is the argument for doing it at all:
+
+- The budget is comfortable. 878 lines against ~3 000, in a language with none of
+  Rust's advantages for this kind of work, with room left over for the strictness
+  checks a reader could technically skip.
+- The strictness is load-bearing and easy to get subtly wrong. D5 is not "doubles
+  only" — it is the *shortest float encoding that round-trips exactly*, so `1.0`
+  must be a half and `0.1` must be a double, and a reader that accepts either
+  form for either value has admitted two digests for one object. D7 is not
+  "no tags" but "registered tags only", and refusing all of them would refuse a
+  valid container, because §04.3's exact rationals are a tag. Both were written
+  the wrong way first and caught by reading real bytes.
 
 ## 6 Error model
 

@@ -1,3 +1,7 @@
 target/
 **/target/
 Cargo.lock
+
+# Python bytecode from bindings/python.
+__pycache__/
+*.pyc

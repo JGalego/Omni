@@ -835,6 +835,48 @@ jobs:
           # the vocabulary and logits at position 0 that no later token can move.
           echo "the synthesized graph runs, is bounded, and says when its weights are not a model"
 
+      # `docs/design/sdk.md` §5 claims a conforming C0 reader needs only a header
+      # parse, an index lookup, canonical CBOR, BLAKE3 and literal tensors. The
+      # Rust implementation is evidence for that, but it also *wrote* these
+      # containers, so on its own it cannot tell "the format is simple" from
+      # "these two programs share an author's assumptions". A second reader, in a
+      # different language, with nothing but its standard library, can.
+      - name: A second implementation reads the same container
+        run: |
+          OMNI=reference/target/release/omni
+          export OMNI_BIN="$PWD/$OMNI"
+
+          # BLAKE3 against the official vectors, CRC-32C against its check value,
+          # canonical CBOR against encodings that must be refused, and then the
+          # part that matters: the same container read by both implementations.
+          python3 bindings/python/test_omni.py 2>&1 | tee /tmp/pyt.txt
+          grep -q '^OK' /tmp/pyt.txt
+          grep -q 'the C0 reader:' /tmp/pyt.txt
+
+          # And end to end from the command line, on the committed example.
+          python3 bindings/python/omni.py examples/toy.omni --check | tee /tmp/pyread.txt
+          grep -q 'objects         49' /tmp/pyread.txt
+          grep -q 'tensors         12' /tmp/pyread.txt
+          grep -q 'literal      12' /tmp/pyread.txt
+          grep -q '49 object(s)' /tmp/pyread.txt
+          # The two readers agree on the root digest in full, which is the whole
+          # file's identity — so they agree about every object under it.
+          root_py=$(python3 bindings/python/omni.py examples/toy.omni \
+                      | grep -oE '[0-9a-f]{64}' | head -1)
+          test -n "$root_py"
+          "$OMNI" ls examples/toy.omni --full | grep Manifest | grep -q "$root_py"
+
+          # C0 is a floor, and a floor is only honest if what is above it is
+          # named. A quantized model's weights are `dequantize` expressions, and
+          # the pure-Python reader refuses them by name rather than returning the
+          # packed integers as if they were the weights.
+          "$OMNI" example --quantized /tmp/pyq.omni > /dev/null
+          python3 bindings/python/omni.py /tmp/pyq.omni --verbose > /tmp/pyq.txt
+          grep -q 'above C0' /tmp/pyq.txt
+          grep -q 'dequantize' /tmp/pyq.txt
+
+          echo "the C0 budget claim holds in a second language, standard library only"
+
       # §05's central claim is that quantization is a transformation and not a
       # file type: a GPTQ or AWQ weight is `dequantize(packed_words, scheme)` and
       # needs no new mechanism. The test of that claim is not that the importer

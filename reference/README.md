@@ -228,6 +228,25 @@ implemented:
   when the base actually names its axes: a base imported from safetensors names
   none, because safetensors says nothing about them, and asserting a requirement
   the base cannot meet made every attach *invalid* instead of merely unchecked
+- **A second reader, in pure Python** —
+  [`bindings/python/omni.py`](../bindings/python/omni.py), 878 lines, standard
+  library only, BLAKE3 included because Python does not ship it. It exists to test
+  a claim this crate cannot test on its own: `docs/design/sdk.md` §5 says a
+  conforming C0 reader fits in ~3 000 lines with no dependencies beyond a hash
+  function, and the Rust implementation is also the program that *wrote* every
+  container it reads, so on its own it cannot tell "the format is simple" from
+  "these two programs share an author's assumptions". CI checks the two agree on
+  every object digest, on the root digest in full, and on every literal tensor's
+  bytes against what the Rust exporter writes — and that what is above C0
+  (a compressed object, a `dequantize` expression, a packed layout) is refused by
+  name rather than answered wrongly.
+
+  Writing it found two places where the strictness is easy to get subtly wrong,
+  both caught by reading real bytes rather than by reasoning: D5 is not "doubles
+  only" but the *shortest float encoding that round-trips exactly*, so `1.0` must
+  be a half and `0.1` a double; and D7 is "registered tags only" rather than "no
+  tags", so refusing every tag refuses a valid container, because §04.3's exact
+  rationals are one
 - **A reference interpreter for OMNI-IR** (`omni graph run`), which is where §07's
   claim gets tested rather than asserted: a model that describes its own
   computation can be executed by something that was never told its architecture.
