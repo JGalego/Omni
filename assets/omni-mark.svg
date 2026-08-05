@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Omni">
+  <title>Omni</title>
+  <defs>
+    <linearGradient id="omniGrad" x1="6" y1="8" x2="58" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+
+  <!-- container: a hexagonal boundary -->
+  <path d="M45 9.48 L58 32 L45 54.52 L19 54.52 L6 32 L19 9.48 Z"
+        fill="none" stroke="url(#omniGrad)" stroke-width="3.5"
+        stroke-linejoin="round"/>
+
+  <!-- references: edges from the canonical object to its derived views -->
+  <path d="M32 24 L21.5 37.5 M32 24 L42.5 37.5"
+        fill="none" stroke="url(#omniGrad)" stroke-width="2.4"
+        stroke-linecap="round" opacity="0.75"/>
+
+  <!-- derived views: hollow objects -->
+  <rect x="17.5" y="37.5" width="8" height="8" rx="2"
+        fill="none" stroke="url(#omniGrad)" stroke-width="2.4"/>
+  <rect x="38.5" y="37.5" width="8" height="8" rx="2"
+        fill="none" stroke="url(#omniGrad)" stroke-width="2.4"/>
+
+  <!-- the model itself: it exists once -->
+  <rect x="28" y="16" width="8" height="8" rx="2" fill="url(#omniGrad)"/>
+</svg>
