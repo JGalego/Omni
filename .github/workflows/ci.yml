@@ -192,8 +192,20 @@ jobs:
           # A container with no tokenizer is indeterminate and incomplete, never
           # "valid, no tokenizer problems" (§15.1).
           "$OMNI" example /tmp/plain.omni
-          "$OMNI" verify /tmp/plain.omni --tokenizer; test $? = 3
-          "$OMNI" tokenize /tmp/plain.omni --text hi; test $? = 5
+          # GitHub runs `run:` blocks under `bash -e`, so a bare
+          # `cmd; test $? = N` dies on cmd's non-zero exit before the assertion
+          # is ever reached. Semantic exit codes have to be captured, not tested
+          # after the fact.
+          expect() {
+            local want=$1; shift
+            local got=0
+            "$@" >/dev/null 2>&1 || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          expect 3 "$OMNI" verify /tmp/plain.omni --tokenizer
+          expect 5 "$OMNI" tokenize /tmp/plain.omni --text hi
           echo "the tokenizer reproduces its own vectors, and refuses when it cannot"
 
       # §06.9: a chat template is the last place arbitrary code still runs in a
@@ -217,9 +229,21 @@ jobs:
             || { echo "rendered: $out"; exit 1; }
           # A missing input is refused with the list of what was wanted, not
           # rendered as the empty string.
-          "$OMNI" render /tmp/ct.omni --message user:hi; test $? = 2
-          "$OMNI" render /tmp/plain.omni --message user:hi; test $? = 5
-          "$OMNI" verify /tmp/plain.omni --template; test $? = 3
+          # GitHub runs `run:` blocks under `bash -e`, so a bare
+          # `cmd; test $? = N` dies on cmd's non-zero exit before the assertion
+          # is ever reached. Semantic exit codes have to be captured, not tested
+          # after the fact.
+          expect() {
+            local want=$1; shift
+            local got=0
+            "$@" >/dev/null 2>&1 || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          expect 2 "$OMNI" render /tmp/ct.omni --message user:hi
+          expect 5 "$OMNI" render /tmp/plain.omni --message user:hi
+          expect 3 "$OMNI" verify /tmp/plain.omni --template
           "$OMNI" inspect /tmp/ct.omni | grep -q 'chat template omni-ct/1'
           echo "the template renders identically, or says why not"
 
