@@ -7,7 +7,7 @@
 use crate::cbor::{self, Value};
 use crate::crc32c::crc32c;
 use crate::sha256::{hex, sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAGIC: [u8; 8] = [0x89, b'O', b'M', b'N', b'I', 0x0d, 0x0a, 0x1a];
 pub const MAGIC_END: [u8; 8] = [0x1a, 0x0a, 0x0d, b'I', b'N', b'M', b'O', 0x89];
@@ -444,6 +444,28 @@ struct Placed {
 /// (R-C10), which requires a fixed-point layout pass because the superblock
 /// records the offsets of the segments that contain it.
 pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8>> {
+    pack_partial(objects, &[], root, opts)
+}
+
+/// [`pack`], plus objects that are *described but not present*.
+///
+/// An entry in `external` contributes an index entry with `EXTERNAL` set and no
+/// extent: the digest, type and logical length are recorded, the bytes are not
+/// in the file. That is §13.8's index-only container — a catalogue of a 700 GB
+/// model in a few megabytes — and it is also what a partial mirror looks like
+/// mid-transfer. The header gains `PARTIAL` so a reader knows before it plans
+/// anything that this container is incomplete by construction rather than
+/// truncated by accident.
+///
+/// An `external` entry whose digest is also among `objects` is dropped: a
+/// present object beats an absent description of one, and an index cannot hold
+/// both (R-C11 requires strictly increasing digests).
+pub fn pack_partial(
+    objects: &[Object],
+    external: &[IndexEntry],
+    root: &Digest,
+    opts: &PackOptions,
+) -> Res<Vec<u8>> {
     if !(6..=30).contains(&opts.log2_align) {
         return Err(rule("R-C04", "log2_align out of range"));
     }
@@ -472,10 +494,19 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     let (blobs, structs): (Vec<&Object>, Vec<&Object>) =
         ordered.iter().partition(|o| o.otype == otype::BLOB);
 
+    let present: BTreeSet<Digest> = uniq.keys().map(|(_, d)| *d).collect();
+    let mut absent: Vec<IndexEntry> = external
+        .iter()
+        .filter(|e| !present.contains(&e.digest))
+        .cloned()
+        .collect();
+    absent.sort_by_key(|e| e.digest);
+    absent.dedup_by_key(|e| e.digest);
+
     // Fixed-point layout: the superblock's size affects the offsets it records.
     let mut sb_reserve = 4096usize;
     let (layout, sb_bytes) = loop {
-        let l = compute_layout(&structs, &blobs, align, sb_reserve, opts.hash);
+        let l = compute_layout(&structs, &blobs, &absent, align, sb_reserve, opts.hash);
         let sb = superblock_value(&l, root, align, opts).encode();
         let need = round_up(SEG_HEADER_SIZE + sb.len(), 64);
         if need <= sb_reserve {
@@ -498,6 +529,9 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     let mut flags = hflags::SEALED | hflags::FRONT_SB;
     if structs.iter().any(|o| o.otype == otype::SIGNATURE) {
         flags |= hflags::SIGNED;
+    }
+    if !layout.external.is_empty() {
+        flags |= hflags::PARTIAL;
     }
     out[0..8].copy_from_slice(&MAGIC);
     out[8..10].copy_from_slice(&1u16.to_le_bytes());
@@ -595,6 +629,8 @@ struct Layout {
     file_size: usize,
     structs: Vec<Placed>,
     blobs: Vec<Placed>,
+    /// Index entries for objects this container describes but does not hold.
+    external: Vec<Placed>,
     n_entries: usize,
     /// How many stored copies are not `raw` — decides what the superblock's
     /// codec list has to name (§02.5).
@@ -604,6 +640,7 @@ struct Layout {
 fn compute_layout(
     structs: &[&Object],
     blobs: &[&Object],
+    external: &[IndexEntry],
     align: usize,
     sb_reserve: usize,
     algo: HashAlgo,
@@ -687,7 +724,21 @@ fn compute_layout(
         }
         index_hdr_off = pad_before_index.unwrap().0 + SEG_HEADER_SIZE + pad_before_index.unwrap().1;
     }
-    let n_entries = placed_structs.len() + placed_blobs.len();
+    // Described-but-absent objects: an index entry, no extent, EXTERNAL set.
+    let placed_external: Vec<Placed> = external
+        .iter()
+        .map(|e| Placed {
+            digest: e.digest,
+            otype: e.otype,
+            oflags: e.oflags | oflags::EXTERNAL,
+            offset: 0,
+            len: 0,
+            logical: e.logical_len,
+            // There are no stored bytes, so there is no stored form to name.
+            codec: crate::codec::id::RAW,
+        })
+        .collect();
+    let n_entries = placed_structs.len() + placed_blobs.len() + placed_external.len();
     let compressed = placed_structs
         .iter()
         .chain(placed_blobs.iter())
@@ -719,6 +770,7 @@ fn compute_layout(
         file_size,
         structs: placed_structs,
         blobs: placed_blobs,
+        external: placed_external,
         n_entries,
         compressed,
     }
@@ -782,7 +834,12 @@ fn bucket_of(d: &Digest, bits: u32) -> usize {
 }
 
 fn build_index(l: &Layout, algo: HashAlgo) -> Vec<u8> {
-    let mut entries: Vec<&Placed> = l.structs.iter().chain(l.blobs.iter()).collect();
+    let mut entries: Vec<&Placed> = l
+        .structs
+        .iter()
+        .chain(l.blobs.iter())
+        .chain(l.external.iter())
+        .collect();
     entries.sort_by_key(|a| a.digest);
 
     let bits = bucket_bits_for(entries.len());
@@ -880,10 +937,14 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
     // §02.5's stats separate the two, and they differ exactly when a codec did
     // something: `logical` is what the digests cover, `stored` is what the file
     // costs.
+    // Absent objects count towards `bytes_logical` and not towards
+    // `bytes_stored`: an index-only container describes 700 GB and costs a few
+    // megabytes, and the two numbers are what say so.
     let total_logical: u64 = l
         .structs
         .iter()
         .chain(l.blobs.iter())
+        .chain(l.external.iter())
         .map(|p| p.logical)
         .sum();
     let total_stored: u64 = l.structs.iter().chain(l.blobs.iter()).map(|p| p.len).sum();
@@ -935,15 +996,20 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
                 ("optional", Value::Array(vec![])),
             ]),
         ),
-        (
-            "stats",
-            Value::map(vec![
+        ("stats", {
+            let mut stats = vec![
                 ("objects", Value::U(l.n_entries as u64)),
                 ("blobs", Value::U(l.blobs.len() as u64)),
                 ("bytes_logical", Value::U(total_logical)),
                 ("bytes_stored", Value::U(total_stored)),
-            ]),
-        ),
+            ];
+            // Only when there are any: a complete container's superblock must
+            // not change bytes because this field exists.
+            if !l.external.is_empty() {
+                stats.push(("external", Value::U(l.external.len() as u64)));
+            }
+            Value::map(stats)
+        }),
         ("creator", Value::text(opts.creator.clone())),
     ])
 }

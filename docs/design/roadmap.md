@@ -117,12 +117,19 @@ demonstrably better than the incumbent. A third-party security review of the
 parser and the signature stack. *This gate is where the storage-savings claims
 in this proposal are confirmed or retracted.*
 
-**Gate 3 status.** Not started. Bao verified streaming (§13.3) is implemented and
-tested, and `store::FileStore` reads a container by range with the reads counted,
-which is the local half of §13.4. There is no HTTP store, no OCI mapping, no
-`mount` and no `serve`, so nothing about distribution is demonstrated. The
-signature stack of §12.5 is implemented (Ed25519, COSE_Sign1, trust policies)
-and has had no third-party review.
+**Gate 3 status.** Not met. The *mechanisms* of §13.4 now exist and are tested
+against a real socket: an HTTP/1.1 range store with coalescing, retry and
+per-object digest verification; the `.omni.idx` sidecar, which turns a
+three-request open into none; the index-only container of §13.8; Bao verified
+streaming (§13.3); and `store::FileStore` for the local half. CI fetches a
+container over HTTP by range and checks that the reassembled object graph is
+byte-identical to the original. What the gate actually asks for is untouched:
+there is no mirror of 10 000 models, no measured dedup or delta-size or
+load-time figures, no TTFT comparison over a throttled link. `https://` is
+refused rather than downgraded — TLS needs a dependency this crate does not
+have — and there is no OCI mapping, no `mount` and no `serve`, so the
+*distribution* claims remain claims. The signature stack of §12.5 is implemented
+(Ed25519, COSE_Sign1, trust policies) and has had no third-party review.
 
 ## Phase 4 — Ecosystem (months 18–30)
 

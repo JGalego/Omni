@@ -101,6 +101,19 @@ VERBS:
     strip   <file.omni> --training [--caches] -o <out.omni>
                               Drop training state by reachability; every tensor
                               digest unchanged (§09.1)
+    strip   <file.omni> --weights -o <out.omni>
+                              The index-only container of §13.8: every object
+                              described, the weights left behind
+    index   <file.omni> [-o <file.omni.idx>]        (also `idx`)
+                              Write the detached index sidecar of §13.4.1, so a
+                              remote reader opens the container in one request
+    index   <file.omni.idx> --show
+                              Read a sidecar and report the framing it promises
+    fetch   <http://host/model.omni> [--sidecar <f.idx>] [--all [--gap N]]
+                              [-o <out.omni>]
+                              Read a container over HTTP by range (§13.4.2),
+                              coalescing requests and verifying every object;
+                              https is refused rather than downgraded
     log     <file.omni> [--with <prev.omni>]…
                               The checkpoint chain: step, loss, and what each
                               one costs over its parent (§09.6)
@@ -183,6 +196,10 @@ fn main() -> ExitCode {
         "adapter" => cmd_adapter(&args),
         "bench" => cmd_bench(&args),
         "open" => cmd_open(&args),
+        // `index` is the name `docs/design/cli.md` §7 uses; `idx` matches the
+        // extension it writes.
+        "index" | "idx" => cmd_idx(&args),
+        "fetch" => cmd_fetch(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
         other => {
@@ -832,14 +849,41 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
         c.index.iter().filter(|e| e.otype != otype::BLOB).count(),
         c.index.iter().filter(|e| e.otype == otype::BLOB).count()
     );
+    // §13.8: a container that describes more than it holds says so here, before
+    // anything tries to read a weight that is not in the file.
+    let comp = omni_core::transport::Completeness::of(c);
     if let Some(s) = stats {
         if let Some(b) = s.get("bytes_logical").and_then(|v| v.as_u64()) {
+            // The overhead is against what the file actually holds. For an
+            // index-only container the logical figure describes objects that are
+            // elsewhere, and subtracting it from the file size would report a
+            // negative overhead as zero.
+            let held = if comp.is_complete() {
+                b
+            } else {
+                comp.local_bytes
+            };
             pr!(
-                "storage       {} logical in objects · {} container overhead",
-                human(b),
-                human(c.header.file_size.saturating_sub(b))
+                "storage       {} {} · {} container overhead",
+                human(held),
+                if comp.is_complete() {
+                    "logical in objects"
+                } else {
+                    "held in this file"
+                },
+                human(c.header.file_size.saturating_sub(held))
             );
         }
+    }
+    if !comp.is_complete() {
+        pr!(
+            "complete      no ({:.1} %, {} of {} objects, {} of {})",
+            comp.percent(),
+            commas(comp.local as u64),
+            commas(comp.described as u64),
+            human(comp.local_bytes),
+            human(comp.described_bytes)
+        );
     }
 
     // The point of §06.12: everything above came from a bounded read.
@@ -931,6 +975,19 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         r.objects_verified,
         human(r.bytes_verified)
     );
+    // §13.8: an object the index describes and the file does not hold cannot be
+    // hashed, so V3 says nothing about it. Saying how many is the difference
+    // between "verified" and "verified what was here".
+    let comp = omni_core::transport::Completeness::of(c);
+    if !comp.is_complete() {
+        pr!(
+            "V3 external    ⚠ {} object(s) described but not held ({} of {}); \
+             their bytes are elsewhere",
+            comp.described - comp.local,
+            human(comp.local_bytes),
+            human(comp.described_bytes)
+        );
+    }
     // R-O05 is about dangling refs that are *required*. A parent declared
     // `required: false` — the previous checkpoint in a chain (§09.6), a base a
     // reader may or may not want — is an expected absence, and reporting it as
@@ -1397,6 +1454,17 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
     if indeterminate > 0 {
         pr!("\nindeterminate: {indeterminate} finding(s) this build cannot decide");
         return Ok(3);
+    }
+    // Everything checkable checked out, and some of it was not here to check.
+    // §01.4 makes that incomplete rather than invalid, and the CLI has an exit
+    // code for exactly that distinction.
+    if !comp.is_complete() {
+        pr!(
+            "\nincomplete: valid container, {} object(s) described but not held ({:.1} %)",
+            comp.described - comp.local,
+            comp.percent()
+        );
+        return Ok(5);
     }
     pr!("\nvalid");
     Ok(0)
@@ -2210,12 +2278,51 @@ fn cmd_strip(args: &[String]) -> R {
     };
     let want_training = args.iter().any(|a| a == "--training");
     let want_caches = args.iter().any(|a| a == "--caches");
-    if !want_training && !want_caches {
-        prr!("omni: strip needs --training and/or --caches\n");
+    let want_weights = args.iter().any(|a| a == "--weights");
+    if !want_training && !want_caches && !want_weights {
+        prr!("omni: strip needs --training, --caches and/or --weights\n");
         return Ok(2);
     }
     let c = Container::open(std::fs::read(input)?)?;
     let hash = c.header.hash;
+
+    // `--weights` is a different operation from the other two: it does not drop
+    // objects from the graph, it stops holding their bytes. §13.8's index-only
+    // container — everything described, the weights elsewhere.
+    if want_weights {
+        if want_training || want_caches {
+            prr!(
+                "omni: --weights cannot be combined; an index-only container \
+                  already describes everything it does not hold\n"
+            );
+            return Ok(2);
+        }
+        let bytes = omni_core::transport::index_only(&c)?;
+        let thin = Container::open(bytes.clone())?;
+        std::fs::write(out, &bytes)?;
+        let comp = omni_core::transport::Completeness::of(&thin);
+        let old_size = std::fs::metadata(input)?.len();
+        pr!("stripped {input} -> {out}");
+        pr!(
+            "  described    {} objects, {} of model",
+            commas(comp.described as u64),
+            human(comp.described_bytes)
+        );
+        pr!(
+            "  present      {} objects, {} ({:.2} % complete)",
+            commas(comp.local as u64),
+            human(comp.local_bytes),
+            comp.percent()
+        );
+        pr!(
+            "  size         {} -> {} ({:.2} %)",
+            human(old_size),
+            human(bytes.len() as u64),
+            100.0 * bytes.len() as f64 / old_size as f64
+        );
+        pr!("  flags        PARTIAL (§13.8: incomplete by construction)");
+        return Ok(0);
+    }
 
     // The tensor digests before, so the claim can be checked rather than
     // asserted.
@@ -3402,6 +3509,178 @@ fn cmd_open(args: &[String]) -> R {
             human(after.1),
             100.0 * after.1 as f64 / total as f64
         );
+    }
+    Ok(0)
+}
+
+/// `omni index` — the `.omni.idx` sidecar of §13.4.1.
+///
+/// Written next to the container by default, because that is where a reader
+/// looks for it: the data URL with `.idx` appended.
+fn cmd_idx(args: &[String]) -> R {
+    use omni_core::transport::{sidecar, Sidecar};
+    let Some(input) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+
+    // `--show` reads a sidecar rather than writing one: the same framing a
+    // remote reader would plan against, with no container in reach.
+    if args.iter().any(|a| a == "--show") {
+        let s = Sidecar::parse(&std::fs::read(input)?)?;
+        let size = std::fs::metadata(input)?.len();
+        pr!("{input}  {}", human(size));
+        pr!("  describes    a container of {}", human(s.file_size));
+        pr!("  hash         {}", s.hash.name());
+        pr!("  root         {}", short(s.hash, &s.root));
+        pr!("  index        {} objects", commas(s.index.len() as u64));
+        pr!(
+            "  logical      {} of objects described",
+            human(s.logical_bytes())
+        );
+        pr!(
+            "  cost         {:.4} % of the container it opens",
+            100.0 * size as f64 / s.file_size.max(1) as f64
+        );
+        return Ok(0);
+    }
+
+    let c = Container::open(std::fs::read(input)?)?;
+    let out = flag(args, "-o")
+        .or(flag(args, "--out"))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{input}.idx"));
+    let bytes = sidecar(&c);
+    // It has to parse before it is written: a sidecar nobody can read is worse
+    // than no sidecar, because a reader will try.
+    let parsed = Sidecar::parse(&bytes)?;
+    if parsed.root != c.header.root_digest || parsed.index.len() != c.index.len() {
+        return Err("the sidecar does not describe the container it came from".into());
+    }
+    std::fs::write(&out, &bytes)?;
+    pr!("wrote {out}");
+    pr!("  index        {} objects", commas(c.index.len() as u64));
+    pr!(
+        "  size         {} against {} of container ({:.4} %)",
+        human(bytes.len() as u64),
+        human(c.bytes.len() as u64),
+        100.0 * bytes.len() as f64 / c.bytes.len() as f64
+    );
+    pr!("  opens in     1 request instead of 3 (§13.4.1)");
+    Ok(0)
+}
+
+/// `omni fetch` — a container read over HTTP by range (§13.4.2).
+///
+/// The point of the verb is the counters: how many round trips an operation
+/// costs, and how many bytes moved for them. A transport claim that nothing
+/// counts is not a claim.
+fn cmd_fetch(args: &[String]) -> R {
+    use omni_core::transport::{HttpStore, Sidecar};
+    let Some(url) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+
+    let store = match flag(args, "--sidecar") {
+        Some(p) => {
+            let bytes = std::fs::read(p)?;
+            // Say what the sidecar promised before anything is fetched, so a
+            // mismatch is visible rather than inferred from a later failure.
+            let s = Sidecar::parse(&bytes)?;
+            pr!(
+                "{p}  {} objects, a container of {}",
+                commas(s.index.len() as u64),
+                human(s.file_size)
+            );
+            let store = HttpStore::open_with_sidecar(url, &bytes)?;
+            // R-X02: one request to establish that the file being served is the
+            // one this sidecar describes. Skipping it would mean planning every
+            // later range against a size nothing checked.
+            store.confirm_target()?;
+            store
+        }
+        None => HttpStore::open(url)?,
+    };
+    let (requests, bytes, retries) = store.io();
+    pr!("{url}");
+    pr!(
+        "  open         {requests} request(s), {}{}",
+        human(bytes),
+        if retries > 0 {
+            format!(", {retries} retried")
+        } else {
+            String::new()
+        }
+    );
+    pr!(
+        "  index        {} objects",
+        commas(store.index().len() as u64)
+    );
+    pr!("  hash         {}", store.hash().name());
+    pr!("  root         {}", short(store.hash(), &store.root));
+
+    // Everything reachable from the root, in as few requests as coalescing
+    // allows. `--gap` is the slack that decides when two ranges are one
+    // request; the right value is a deployment question (§13.6), so it is a
+    // flag and not a constant.
+    let gap: u64 = flag(args, "--gap")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1 << 20);
+    let out = flag(args, "-o").or(flag(args, "--out"));
+    if args.iter().any(|a| a == "--all") || out.is_some() {
+        let want: Vec<Digest> = store.index().iter().map(|e| e.digest).collect();
+        let before = store.io();
+        let got = store.fetch_many(&want, gap, 64 << 20)?;
+        let after = store.io();
+        let present = got.iter().filter(|g| g.is_some()).count();
+        let payload: u64 = got.iter().flatten().map(|g| g.len() as u64).sum();
+        pr!(
+            "  fetch        {} request(s) for {} object(s), {} moved",
+            after.0 - before.0,
+            commas(present as u64),
+            human(after.1 - before.1)
+        );
+        pr!(
+            "  verified     {} of payload, every object against its digest (R-O01)",
+            human(payload)
+        );
+
+        if let Some(out) = out {
+            // A local copy assembled from those ranges: the object graph,
+            // re-packed. Not a byte copy of the remote file — the objects are
+            // what transfer (§13.1) — and because packing is reproducible
+            // (§01.10), the result is byte-identical to the original when
+            // everything arrived. That equality is the end-to-end check.
+            let mut objects = Vec::new();
+            let mut absent = Vec::new();
+            for (e, got) in store.index().iter().zip(got.iter()) {
+                match got {
+                    Some(payload) => objects.push(omni_core::Object {
+                        otype: e.otype,
+                        payload: payload.clone(),
+                        oflags: e.oflags,
+                        stored: None,
+                    }),
+                    None => absent.push(e.clone()),
+                }
+            }
+            let opts = PackOptions {
+                hash: store.hash(),
+                ..Default::default()
+            };
+            let bytes = omni_core::container::pack_partial(&objects, &absent, &store.root, &opts)?;
+            std::fs::write(out, &bytes)?;
+            pr!("wrote {out}  {}", human(bytes.len() as u64));
+        }
+
+        if present < want.len() {
+            pr!(
+                "  absent       {} object(s) the index describes but the file does not hold",
+                want.len() - present
+            );
+            return Ok(5);
+        }
     }
     Ok(0)
 }

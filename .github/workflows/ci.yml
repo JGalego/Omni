@@ -409,6 +409,160 @@ jobs:
           PY
           echo "the plugin host runs what the model shipped, and only that"
 
+      # §13: the unit of transfer is the object. A container read over HTTP by
+      # range, with the round trips counted — a transport claim nothing counts
+      # is not a claim.
+      - name: A container is read over HTTP by range, and every byte is checked
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          "$OMNI" example --tune 1 /tmp/net.omni >/dev/null
+
+          # §13.4.1: the detached index. A few kilobytes that open a container in
+          # one request instead of three.
+          "$OMNI" index /tmp/net.omni | tee /tmp/idx.txt
+          grep -q 'opens in     1 request instead of 3' /tmp/idx.txt
+          "$OMNI" index /tmp/net.omni.idx --show | grep -q 'describes    a container of'
+
+          # A range-capable static server: the smallest thing that is honestly
+          # HTTP. No fixture in the repository can stand in for this — a range
+          # store that is never asked for a range is untested code.
+          cat > /tmp/rangeserver.py <<'PY_SRV'
+          import http.server, os, re, socketserver, sys
+          ROOT = sys.argv[1]
+          class H(http.server.BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+              def log_message(self, *a): pass
+              def do_GET(self):
+                  path = os.path.join(ROOT, os.path.basename(self.path))
+                  if not os.path.isfile(path):
+                      self.send_response(404); self.send_header("Content-Length", "0")
+                      self.end_headers(); return
+                  data = open(path, "rb").read()
+                  rng = self.headers.get("Range")
+                  m = re.fullmatch(r"bytes=(\d+)-(\d+)", rng.strip()) if rng else None
+                  if m:
+                      a, b = int(m.group(1)), int(m.group(2))
+                      if a >= len(data):
+                          self.send_response(416); self.send_header("Content-Length", "0")
+                          self.end_headers(); return
+                      body = data[a:b + 1]
+                      self.send_response(206)
+                      self.send_header("Content-Range",
+                                       f"bytes {a}-{a + len(body) - 1}/{len(data)}")
+                  else:
+                      body = data; self.send_response(200)
+                  self.send_header("Accept-Ranges", "bytes")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers(); self.wfile.write(body)
+          class S(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+          with S(("127.0.0.1", 18713), H) as srv:
+              srv.serve_forever()
+          PY_SRV
+          python3 /tmp/rangeserver.py /tmp &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          for _ in $(seq 50); do
+            python3 -c "
+          import socket, sys
+          s = socket.socket()
+          sys.exit(0 if s.connect_ex(('127.0.0.1', 18713)) == 0 else 1)" && break
+            sleep 0.1
+          done
+
+          # §02.7 over a stateless transport: header, front superblock, index.
+          "$OMNI" fetch http://127.0.0.1:18713/net.omni | tee /tmp/f1.txt
+          grep -q 'open         3 request(s)' /tmp/f1.txt
+          # With the sidecar in hand, opening costs one request instead of three —
+          # and that one is R-X02: confirming the file being served is the file
+          # the sidecar describes, before any offset from it is trusted.
+          "$OMNI" fetch http://127.0.0.1:18713/net.omni --sidecar /tmp/net.omni.idx \
+            | tee /tmp/f2.txt
+          grep -q 'open         1 request(s)' /tmp/f2.txt
+
+          # R-X02: a sidecar describes one specific container. Handed one for a
+          # different file, the store must refuse rather than range-read the right
+          # URL at the wrong offsets — a failure that otherwise looks like
+          # corruption.
+          "$OMNI" example /tmp/other.omni >/dev/null
+          "$OMNI" index /tmp/other.omni -o /tmp/other.idx >/dev/null
+          set +e
+          "$OMNI" fetch http://127.0.0.1:18713/net.omni --sidecar /tmp/other.idx \
+            > /tmp/f6.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'R-X02' /tmp/f6.txt
+          echo "a sidecar for another container is refused before a range is planned"
+
+          # §13.4.2: every object, coalesced into one request, each verified
+          # against its digest — and the reassembled container is byte-identical
+          # to the original, because packing is reproducible (§01.10). That
+          # equality is the end-to-end proof that nothing was lost or altered in
+          # transit.
+          "$OMNI" fetch http://127.0.0.1:18713/net.omni --sidecar /tmp/net.omni.idx \
+            -o /tmp/net-copy.omni | tee /tmp/f3.txt
+          grep -q 'fetch        1 request(s)' /tmp/f3.txt
+          grep -q 'every object against its digest (R-O01)' /tmp/f3.txt
+          cmp /tmp/net.omni /tmp/net-copy.omni
+          echo "a container fetched over HTTP by range reassembles to the same bytes"
+
+          # A tampered byte is caught, not served. The store checks what the
+          # network hands it (§13.7), so flipping one byte of one object must be
+          # a failure rather than a silently wrong tensor.
+          python3 - <<'PY_TAMPER'
+          import subprocess
+          # The container's own index says where its objects are, so the byte to
+          # flip is chosen rather than guessed: the largest data object, which is
+          # certainly payload and not padding.
+          ls = subprocess.run(['reference/target/release/omni', 'ls', '/tmp/net.omni'],
+                              capture_output=True, text=True, check=True).stdout
+          rows = [r.split() for r in ls.splitlines()[1:] if r.strip()]
+          blobs = [(int(r[3]), int(r[2])) for r in rows if r[1] == 'Blob']
+          assert blobs, ls
+          size, off = max(blobs)
+          raw = bytearray(open('/tmp/net.omni', 'rb').read())
+          raw[off + size // 2] ^= 0xFF
+          open('/tmp/net-bad.omni', 'wb').write(bytes(raw))
+          print(f'flipped one byte inside a {size}-byte data object at {off}')
+          PY_TAMPER
+          set +e
+          "$OMNI" fetch http://127.0.0.1:18713/net-bad.omni --all > /tmp/f4.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -qi 'R-O01\|do not hash' /tmp/f4.txt
+          echo "a flipped byte over the wire is refused, not decoded"
+
+          # §13.8: the index-only container. Everything described, no weights —
+          # and it is incomplete rather than invalid (§01.4), which the exit code
+          # has to say.
+          "$OMNI" strip /tmp/net.omni --weights -o /tmp/thin.omni | tee /tmp/thin.txt
+          grep -q 'flags        PARTIAL' /tmp/thin.txt
+          python3 -c "
+          import os
+          thin, full = os.path.getsize('/tmp/thin.omni'), os.path.getsize('/tmp/net.omni')
+          assert thin < full / 2, f'{thin} is not much smaller than {full}'
+          print(f'the catalogue is {thin} bytes for a {full}-byte model')"
+          "$OMNI" inspect /tmp/thin.omni | grep -q 'complete      no ('
+          set +e
+          "$OMNI" verify /tmp/thin.omni --level 6 > /tmp/thinv.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 5
+          grep -q 'incomplete: valid container' /tmp/thinv.txt
+          echo "an index-only container is incomplete, not invalid, and says which"
+
+          # https is refused with its reason rather than downgraded to http.
+          set +e
+          "$OMNI" fetch https://example.invalid/x.omni > /tmp/f5.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'TLS' /tmp/f5.txt
+          echo "https is refused with the reason, not silently downgraded"
+
       # §07: a model that describes its own computation, and the property no
       # other format has — an unknown high-level op recovered from a shipped
       # lowering rather than refused.

@@ -219,6 +219,21 @@ $ omni index model.omni -o model.omni.idx
 $ omni mirror ./store.omnid s3://bucket/models/ --packs 1Gi
 ```
 
+Of this section the reference implementation has `index` and `fetch` over plain
+HTTP — ranged, coalesced, resumable, with every object checked against its digest
+and the round trips counted:
+
+```console
+$ omni index model.omni                              # → model.omni.idx
+$ omni fetch http://host/model.omni                  # opens in 3 requests
+$ omni fetch http://host/model.omni --sidecar model.omni.idx --all -o local.omni
+$ omni strip model.omni --weights -o catalogue.omni  # §13.8, index-only
+```
+
+`https://` is refused with its reason rather than downgraded, because TLS needs a
+dependency the reference deliberately does not have. `push`, `pull`, `mirror` and
+the `omni://` scheme need a registry client and do not exist yet.
+
 ## 8 Schema, registry, plugins
 
 ```

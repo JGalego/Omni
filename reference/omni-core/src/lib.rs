@@ -18,12 +18,14 @@
 //!
 //! ## Not implemented here
 //!
-//! Every transport beyond the local filesystem: Bao trees (§13.3) are here, but
-//! nothing yet fetches over a network to use them, and the OCI mapping of §13.5
-//! is unimplemented. Of §03.7's codecs, `zstd` (the MUST) and `deflate` are
-//! here; the MAY-level ones are reported as unsupported rather than
-//! half-decoded. The WebAssembly host of §11.6 runs the core instruction set but
-//! not SIMD.
+//! `https://`: [`transport`] speaks HTTP/1.1 over a socket with ranges,
+//! coalescing and per-object verification, but TLS needs a cryptographic
+//! transport stack and there are no dependencies to provide one, so an
+//! `https://` URL is refused with that reason rather than downgraded. The OCI
+//! mapping of §13.5, `omni mount` (§13.9) and `omni serve` are unimplemented.
+//! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
+//! ones are reported as unsupported rather than half-decoded. The WebAssembly
+//! host of §11.6 runs the core instruction set but not SIMD.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -57,6 +59,7 @@ pub mod store;
 pub mod tensor;
 pub mod tokenizer;
 pub mod train;
+pub mod transport;
 pub mod wasm;
 pub mod zstd;
 

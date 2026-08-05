@@ -133,6 +133,16 @@ conformance violation.
   shape and dtype.
 - R-I11 A module carrying `lowered_from` is below the `semantic` level.
 
+### Transport (V3)
+
+- R-X01 A `.omni.idx` sidecar's header CRC and superblock digest verify, and its
+  `hash_algo` agrees with the container header it carries (§13.4.1).
+- R-X02 A sidecar's `file_size` equals the `file_size` of the container header it
+  carries; and before an offset from it is used, the served container matches both
+  that `file_size` and the sidecar's root digest.
+- R-X03 Bytes received over a transport are verified against the object digest —
+  or the Bao tree for a partial object — before use (§13.3, §13.7).
+
 ### Security (V7)
 
 - R-S01 Signature covers the manifest with `attestations` removed.

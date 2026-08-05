@@ -102,6 +102,47 @@ GET /models/llm-8b.omni.idx             → header + superblock + index, one obj
 
 which collapses the first three requests into one.
 
+The sidecar is a 128-byte header followed by three parts, in this order: the
+container's file header verbatim, its superblock, and its object index with the
+index segment header in front. They are the *same bytes* a reader would have
+range-fetched from the container, so a reader shares its parsing code rather than
+growing a second parser.
+
+| Off | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic `89 4F 4D 4E 49 58 0D 0A` (`\x89OMNIX\r\n`) |
+| 8 | 2 | `fmt_version` (`1`) |
+| 10 | 1 | `hash_algo`, the same code as the container header's |
+| 11 | 5 | reserved, MUST be zero |
+| 16 | 8 | `file_size` of the container this sidecar describes |
+| 24 | 16 | (offset, length) of the container's file header |
+| 40 | 16 | (offset, length) of the superblock |
+| 56 | 16 | (offset, length) of the index, segment header included |
+| 72 | 32 | digest of the superblock bytes |
+| 104 | 20 | reserved, MUST be zero |
+| 124 | 4 | CRC-32C of bytes 0..124 |
+
+The magic differs from the container's in one byte, so neither reader
+half-parses the other's file. The superblock digest is under the header CRC and
+the superblock is under that digest, which is what makes a sidecar an assertion
+about a specific container rather than a hint: a reader that plans against an
+edited sidecar would fetch the wrong ranges of the right file.
+
+Rules:
+
+- R-X01 A reader MUST verify the sidecar's header CRC and the superblock digest
+  before using either, and MUST reject a sidecar whose `hash_algo` disagrees with
+  the container header it carries.
+- R-X02 A sidecar's `file_size` MUST equal the `file_size` in the container header
+  it carries. Before trusting an offset from a sidecar, a reader MUST confirm that
+  the container it is reading has that `file_size` *and* the sidecar's root digest;
+  on either mismatch it MUST refuse the sidecar rather than range-read against
+  stale offsets. Size alone is insufficient: two builds of one model that differ
+  only in weight values have identical lengths.
+- R-X03 Bytes received for an object MUST be verified against that object's
+  digest — or, for a partial object, against its Bao tree (§13.3) — before the
+  object is used. A range read that cannot be verified is not a successful read.
+
 ### 13.4.2 Fetching tensors
 
 - Coalesce adjacent chunk ranges into one request; the index makes this a sort

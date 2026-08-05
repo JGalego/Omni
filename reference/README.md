@@ -39,14 +39,17 @@ $ ./target/release/omni repack packed.omni -o smaller.omni --codec bitshuffle+zs
 $ ./target/release/omni example --chat-template ct.omni
 $ ./target/release/omni verify ct.omni --template         # runs its §06.9 vectors
 $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_prompt=true
+$ ./target/release/omni index model.omni                # the §13.4.1 index sidecar
+$ ./target/release/omni fetch http://host/model.omni --sidecar model.omni.idx --all
+$ ./target/release/omni strip model.omni --weights -o catalogue.omni   # §13.8
 ```
 
 ## What is here
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, model builder | §01–§13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store with the `.omni.idx` sidecar, model builder | §01–§13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -178,14 +181,29 @@ implemented:
 - §01.5 R-O02 in `verify`: an object whose own `t` contradicts the index's
   `otype` is invalid. Refs carry the type, so a reader decides what to do with
   an object before fetching it; one that lies defeats all of those decisions
+- §13.4 streaming and transport: the `.omni.idx` sidecar of §13.4.1, with framing
+  of its own so a truncated or edited one is refused rather than half-believed;
+  an HTTP/1.1 range store over a socket, with keep-alive, range coalescing,
+  retry on a dropped connection, and every object checked against its digest
+  before it is returned, because bytes from a CDN edge are bytes from a stranger;
+  §02.7's open over a stateless transport, in three requests from the container
+  and none at all from a sidecar; and §13.8's index-only container, which
+  describes every object, holds no weights, and is *incomplete* rather than
+  invalid — `omni fetch`, `omni index` and `omni strip --weights`, with the round
+  trips counted so the claim is checkable
 - §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
   reached through `omni sign --verify`
 
 What is **not** implemented, and is reported as such rather than faked:
 
 - §03.7's MAY-level codecs `lz4`, `brotli`, `xz`, `ans-lut` and the two lossy
-  ones: reported as unsupported rather than half-decoded · §13 HTTP/OCI
-  transport
+  ones: reported as unsupported rather than half-decoded
+- `https://`. §13.4's HTTP range store is here and speaks HTTP/1.1 over a
+  socket, but TLS needs a cryptographic transport stack and this crate has no
+  dependencies to provide one. An `https://` URL is refused with that reason
+  rather than silently downgraded
+- The OCI mapping of §13.5, `omni mount` (§13.9) and `omni serve`. Each needs
+  something outside this crate's reach — a registry client, FUSE, a server
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
@@ -197,7 +215,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-334 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+351 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -312,6 +330,24 @@ mesh that cannot divide the tensor is refused with the numbers; that
 reproducibility is *reported* rather than claimed, naming the stateful generator
 and the vague dataloader position that limit it; and that stripping a checkpoint
 removes the training state by reachability while every weight digest survives.
+And, for §13: that a sidecar carries the same framing as the container it
+describes and that a truncated one — at every length — and a single flipped bit
+anywhere in its header are refused rather than half-parsed, as is a sidecar whose
+superblock was rewritten; that a container and a sidecar each refuse to be
+mis-read as the other; that an index-only container describes every object,
+holds no weights, still validates, and reports the model's real size while being
+a fraction of it; that range coalescing merges what is adjacent and within its
+slack while honouring its cap; that `https://` is refused with its reason; and —
+against a real HTTP server on a real socket — that a container opens in three
+requests and a sidecar makes that zero, that many objects fetch in fewer
+requests than there are objects, that a range of an object moves only its range,
+that a dropped connection is retried rather than lost, that a chunked response
+is dechunked, that a server which ignores `Range` is told apart from one that
+fails, that an absent object is absent rather than an error, that a compressed
+container decodes with the parameters its superblock declares, that a single
+tampered byte from the wire is refused by the digest that covers it, and that a
+sidecar for a *different* container is caught by R-X02 in one request rather than
+used to plan ranges into the wrong offsets of the right file.
 And, for the WebAssembly host: that
 arithmetic, locals, a real loop, memory loads and stores, `call`,
 `call_indirect`, `br_table`, `if`/`else` and the bulk-memory operations all do
@@ -335,7 +371,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 334 passed; 0 failed
+test result: ok. 351 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
