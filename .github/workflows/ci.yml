@@ -81,6 +81,7 @@ jobs:
           "$OMNI" example /tmp/ci.omni
           "$OMNI" inspect /tmp/ci.omni
           "$OMNI" verify  /tmp/ci.omni
+          "$OMNI" verify  /tmp/ci.omni --level 6
 
       - name: Packing is byte-reproducible (writer rule W1)
         run: |
@@ -147,6 +148,25 @@ jobs:
             echo "::error::verify accepted a truncated container"; exit 1
           fi
           echo "truncation detected"
+
+      # The value layer of §04-§05 is only a claim until something reads a
+      # container whose tensors are expressions rather than byte ranges.
+      - name: The value layer round-trips through a container
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --quantized /tmp/q.omni
+          "$OMNI" verify /tmp/q.omni --level 6
+          # Four tensors over one set of stored bytes (§04.8): the int4 weight,
+          # its bf16 dequantization, the LoRA-merged bf16, and the fp8 cast.
+          "$OMNI" cat /tmp/q.omni --tensor model.layers.0.attn.q_proj.weight.bf16 --limit 4
+          "$OMNI" cat /tmp/q.omni --tensor model.layers.0.attn.q_proj.weight.lora --limit 4
+          "$OMNI" cat /tmp/q.omni --tensor model.layers.0.attn.q_proj.weight.fp8  --limit 4
+          # The derived realizations cost no storage.
+          "$OMNI" inspect /tmp/q.omni | grep -q 'affine-sub-u4 g32'
+          # §04.7.4: reading 64 of 2048 elements fetches 32 bytes, exactly.
+          "$OMNI" deps /tmp/q.omni --tensor model.layers.0.attn.q_proj.weight.bf16 \
+            --range 0:64 | grep -q 'bytes 0..32 (32 B)'
+          echo "expressions evaluate, and a partial read reads only its part"
 
       - name: Both mandatory hash algorithms produce valid containers
         run: |

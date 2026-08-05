@@ -3137,21 +3137,26 @@ impl Expr {
             } => {
                 let (num, den) = dtype.bits_rational();
                 let shape = concrete(shape).unwrap_or_default();
-                let dense = matches!(
-                    layout,
-                    Layout::Strided {
-                        strides: None,
-                        offset: 0,
-                        ..
-                    }
-                );
+                let dense = layout.is_monotone();
                 let total = layout.stored_bytes(&shape, dtype).unwrap_or(u64::MAX);
                 let (mut lo, mut hi, mut exact, mut reason) = (0u64, total, exact, reason);
                 if dense {
                     // Bit positions are monotone in the element index, so the
-                    // byte range is exact.
-                    lo = (elems.0 * num as u64) / (8 * den as u64);
-                    hi = ((elems.1 * num as u64).div_ceil(8 * den as u64)).min(total);
+                    // byte range is exact: ask the layout where the endpoints
+                    // are rather than assuming dense packing, since a `packed`
+                    // layout may leave slack in each word.
+                    let first = bit_of_linear(layout, &shape, dtype, elems.0);
+                    let last = bit_of_linear(layout, &shape, dtype, elems.1.saturating_sub(1));
+                    match (first, last) {
+                        (Some(a), Some(b)) => {
+                            lo = (a / 8) as u64;
+                            hi = (((b + num as u128).div_ceil(8)) as u64).min(total);
+                        }
+                        _ => {
+                            lo = (elems.0 * num as u64) / (8 * den as u64);
+                            hi = ((elems.1 * num as u64).div_ceil(8 * den as u64)).min(total);
+                        }
+                    }
                 } else if let (Some(a), Some(b)) = (
                     bit_of_linear(layout, &shape, dtype, elems.0),
                     bit_of_linear(layout, &shape, dtype, elems.1.saturating_sub(1)),

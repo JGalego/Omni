@@ -10,7 +10,10 @@ $ cargo test
 $ ./target/release/omni example model.omni      # BLAKE3-256, the default
 $ ./target/release/omni example --hash sha256 model-sha.omni
 $ ./target/release/omni inspect model.omni
-$ ./target/release/omni verify  model.omni
+$ ./target/release/omni verify  model.omni --level 6
+$ ./target/release/omni example --quantized quant.omni   # int4 + LoRA, as expressions
+$ ./target/release/omni cat  quant.omni --tensor model.layers.0.attn.q_proj.weight.lora
+$ ./target/release/omni deps quant.omni --tensor model.layers.0.attn.q_proj.weight.bf16 --range 0:64
 ```
 
 ## What is here
@@ -18,7 +21,7 @@ $ ./target/release/omni verify  model.omni
 | Crate | Contents | Spec |
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, model builder | §01–§05, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · pack · unpack · fsck · example` | design/cli.md |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · pack · unpack · fsck · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -82,8 +85,8 @@ implemented:
 - §12.5 signatures: COSE_Sign1 over the §12.5.2 payload, Ed25519, the
   `canonical_digest` of §12.5.3, trust policies (any-of, all-of, k-of-n,
   role-based), validity windows, rollback counters and revocation statements
-- §15.1 validation levels V0–V4 (the V5 and V7 rules are implemented; the CLI
-  ladder still stops at V4)
+- §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
+  reached through `omni sign --verify`
 
 What is **not** implemented, and is reported as such rather than faked:
 

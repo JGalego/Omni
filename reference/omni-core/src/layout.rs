@@ -433,6 +433,31 @@ impl Layout {
         }
     }
 
+    /// Whether an element's bit position increases with its row-major index.
+    ///
+    /// Range pushdown (§04.7.4) is *exact* exactly when this holds: a
+    /// contiguous run of elements is then a contiguous run of bytes, and a
+    /// reader can fetch precisely what it needs. When it does not hold, the
+    /// dependency is still computed, but as a bound.
+    pub fn is_monotone(&self) -> bool {
+        match self {
+            Layout::Strided {
+                order: Order::RowMajor,
+                strides: None,
+                offset: _,
+            } => true,
+            Layout::Packed {
+                bit_order: BitOrder::LsbFirst,
+                order: Order::RowMajor,
+                ..
+            } => true,
+            // Element positions in a blocked-scaled layout are monotone, but
+            // the scales are interleaved among them, so a byte range covering
+            // the elements is not the range a reader actually needs.
+            _ => false,
+        }
+    }
+
     /// R-T03: is this descriptor sufficient to place every element?
     pub fn sufficiency(&self, shape: &[u64], dtype: &DType) -> Sufficiency {
         match self {

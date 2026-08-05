@@ -9,6 +9,9 @@
 use crate::cbor::Value;
 use crate::container::{otype, Digest, HashAlgo, Object};
 use crate::dtype::DType;
+use crate::expr::{Expr, Ref};
+use crate::layout::Layout;
+use crate::tensor::TensorDesc;
 
 // ------------------------------------------------------------------ builder --
 
@@ -29,6 +32,13 @@ pub struct ModelBuilder {
     pub tensors: Vec<TensorSpec>,
     pub chunk_size: usize,
     pub extra: Vec<(String, Value)>,
+    /// Tensors whose value is an arbitrary expression rather than a bare
+    /// literal: a dequantized weight, a LoRA-merged one, a cast realization.
+    /// These cost no storage of their own (§04.1).
+    pub derived: Vec<(String, TensorDesc)>,
+    /// Objects the caller stored directly — the chunks and chunk lists behind
+    /// the literals inside `derived` expressions.
+    pub extra_objects: Vec<Object>,
     /// The digest algorithm the resulting container will use. Object
     /// identities depend on it, so it has to be fixed before the graph is
     /// built rather than at pack time.
@@ -45,6 +55,8 @@ impl ModelBuilder {
             tensors: Vec::new(),
             chunk_size: 4 << 20,
             extra: Vec::new(),
+            derived: Vec::new(),
+            extra_objects: Vec::new(),
             hash: HashAlgo::default(),
         }
     }
@@ -75,6 +87,66 @@ impl ModelBuilder {
 
     pub fn tensor(mut self, t: TensorSpec) -> Self {
         self.tensors.push(t);
+        self
+    }
+
+    /// Stores `data` as chunks plus a `ChunkList` and returns the `literal`
+    /// expression that reads it back.
+    ///
+    /// This is the writer half of §04.5: the caller gets a value it can build
+    /// expressions over, and the bytes exist exactly once no matter how many
+    /// expressions mention them.
+    pub fn literal(&mut self, data: &[u8], dtype: DType, shape: &[u64], layout: Layout) -> Expr {
+        let cl = self.chunk_list(data);
+        Expr::Literal {
+            chunks: cl,
+            dtype,
+            shape: crate::expr::dims(shape),
+            layout,
+        }
+    }
+
+    /// Stores bytes as a `ChunkList` and returns the ref.
+    pub fn chunk_list(&mut self, data: &[u8]) -> Ref {
+        let mut chunk_refs = Vec::new();
+        for chunk in data.chunks(self.chunk_size) {
+            let blob = Object::blob(chunk.to_vec());
+            let d = blob.digest(self.hash);
+            self.extra_objects.push(blob);
+            chunk_refs.push(Value::map(vec![
+                (
+                    "r",
+                    Value::Array(vec![Value::U(0), Value::Bytes(d.to_vec())]),
+                ),
+                ("n", Value::U(chunk.len() as u64)),
+            ]));
+        }
+        let chunklist = Object::structure(
+            otype::CHUNK_LIST,
+            &Value::map(vec![
+                ("t", Value::text("omni.tensor/chunklist")),
+                ("v", Value::U(1)),
+                ("total", Value::U(data.len() as u64)),
+                (
+                    "chunker",
+                    Value::map(vec![
+                        ("k", Value::text("fixed")),
+                        ("size", Value::U(self.chunk_size as u64)),
+                    ]),
+                ),
+                ("chunks", Value::Array(chunk_refs)),
+            ]),
+        );
+        let d = chunklist.digest(self.hash);
+        self.extra_objects.push(chunklist);
+        (otype::CHUNK_LIST, d)
+    }
+
+    /// Adds a tensor whose value is an expression. The descriptor is stored as
+    /// given, so the caller decides what the tensor claims — and
+    /// [`TensorDesc::check`] is what verifies the claim.
+    pub fn derived(mut self, name: impl Into<String>, desc: TensorDesc) -> Self {
+        self.derived.push((name.into(), desc));
         self
     }
 
@@ -183,6 +255,36 @@ impl ModelBuilder {
             ));
             order.push(Value::text(t.name.clone()));
         }
+
+        // Derived tensors: descriptors only, no new payload. A tensor whose
+        // value is a bare literal does carry parameters and is counted; one
+        // whose value is an expression is a *view* of parameters that already
+        // exist, and counting it would report the same weights twice (R-M01).
+        // Quantization scales and zero points are not parameters either, and are
+        // recognised the same way a reader recognises them: by use.
+        let mut machinery = std::collections::BTreeSet::new();
+        for (_, desc) in &self.derived {
+            crate::tensor::scheme_leaves(&desc.value, &mut machinery);
+        }
+        for (name, desc) in &self.derived {
+            if let Expr::Literal { chunks, .. } = &desc.value {
+                if desc.is_weight() && !machinery.contains(chunks) {
+                    params_total += desc.numel().unwrap_or(0);
+                }
+            }
+            let obj = Object::structure(otype::TENSOR_DESC, &desc.to_value());
+            let d = obj.digest(self.hash);
+            objects.push(obj);
+            table_entries.push((
+                Value::text(name.clone()),
+                Value::Array(vec![
+                    Value::U(otype::TENSOR_DESC as u64),
+                    Value::Bytes(d.to_vec()),
+                ]),
+            ));
+            order.push(Value::text(name.clone()));
+        }
+        objects.extend(self.extra_objects.iter().cloned());
 
         let table = Object::structure(
             otype::TENSOR_TABLE,

@@ -181,10 +181,14 @@ impl TensorDesc {
             Some(l) => Layout::from_value(l).map_err(Error::Type)?,
             None => Layout::default(),
         };
-        let value = Expr::from_value(
-            v.get("value")
-                .ok_or_else(|| Error::Type("TensorDesc has no `value`".into()))?,
-        )?;
+        // §04.7.2 gives `literal` its own dtype, shape and layout, and a writer
+        // SHOULD emit them. A writer that does not has still said it once, on
+        // the descriptor — and R-T01 requires the two to agree, so inheriting
+        // them is unambiguous rather than a guess.
+        let raw = v
+            .get("value")
+            .ok_or_else(|| Error::Type("TensorDesc has no `value`".into()))?;
+        let value = Expr::from_value(&inherit(raw, &shape, &dtype, &layout))?;
         let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
         Ok(TensorDesc {
             shape,
@@ -265,12 +269,24 @@ impl TensorDesc {
         self.sizes().map(|s| numel(&s))
     }
 
-    /// True when this tensor holds parameters, for the `params_total` check of
-    /// R-M01.
+    /// True when this tensor's elements are model *parameters*, for R-M01.
+    ///
+    /// Everything trainable counts, including the gains a normalization layer
+    /// declares as `scale`. What does not count is machinery: indices, buffers,
+    /// masks, codebooks and constants. Quantization scales and zero points are
+    /// also machinery, but they share the `scale` and `zero` semantics with real
+    /// parameters, so they are excluded by *use* rather than by name — see
+    /// [`scheme_parameters`].
     pub fn is_weight(&self) -> bool {
-        matches!(
+        !matches!(
             self.semantic.as_deref(),
-            Some("weight") | Some("bias") | Some("embedding") | None
+            Some("index")
+                | Some("state")
+                | Some("buffer")
+                | Some("codebook")
+                | Some("mask")
+                | Some("constant")
+                | Some("opaque")
         )
     }
 }
@@ -667,6 +683,31 @@ impl TensorDesc {
     }
 }
 
+/// Fills a bare `literal` node's missing `dtype`, `shape` and `layout` from the
+/// descriptor that owns it. Only the top-level node is touched: a literal nested
+/// inside an expression describes bytes the descriptor says nothing about, and
+/// inheriting there really would be a guess.
+fn inherit(value: &Value, shape: &Shape, dtype: &DType, layout: &Layout) -> Value {
+    if value.get("op").and_then(|x| x.as_str()) != Some("literal") {
+        return value.clone();
+    }
+    let Value::Map(m) = value else {
+        return value.clone();
+    };
+    let mut m = m.clone();
+    let has = |m: &[(Value, Value)], k: &str| m.iter().any(|(key, _)| key.as_str() == Some(k));
+    if !has(&m, "dtype") {
+        m.push((Value::text("dtype"), dtype.to_value()));
+    }
+    if !has(&m, "shape") {
+        m.push((Value::text("shape"), crate::expr::shape_to_value(shape)));
+    }
+    if !has(&m, "layout") {
+        m.push((Value::text("layout"), layout.to_value()));
+    }
+    Value::Map(m)
+}
+
 /// Reads a `ChunkList`'s declared total and the sum of its chunks' lengths.
 /// `None` when the list itself is absent from the store.
 fn chunk_total(ctx: &Ctx<'_>, r: &Ref) -> Res<Option<(u64, u64)>> {
@@ -737,6 +778,7 @@ pub fn validate_table(ctx: &Ctx<'_>, table: &TensorTable) -> Vec<Finding> {
 /// R-M01: `params_total`, when present, equals the sum over weight-semantic
 /// tensors.
 pub fn check_params_total(ctx: &Ctx<'_>, table: &TensorTable, declared: u64) -> Vec<Finding> {
+    let machinery = scheme_parameters(ctx, table);
     let mut sum = 0u64;
     let mut unknown_shapes = 0usize;
     for r in table.tensors.values() {
@@ -744,7 +786,14 @@ pub fn check_params_total(ctx: &Ctx<'_>, table: &TensorTable, declared: u64) -> 
             unknown_shapes += 1;
             continue;
         };
-        if !d.is_weight() {
+        // A tensor whose value is an expression is a *realization* of
+        // parameters that already exist (§04.8): counting the int4 weight, the
+        // bf16 dequantization of it and the fp8 cast of that would report the
+        // same weights three times.
+        let Expr::Literal { chunks, .. } = &d.value else {
+            continue;
+        };
+        if !d.is_weight() || machinery.contains(chunks) {
             continue;
         }
         match d.numel() {
@@ -763,10 +812,47 @@ pub fn check_params_total(ctx: &Ctx<'_>, table: &TensorTable, declared: u64) -> 
         return vec![bad(
             "R-M01",
             "metadata",
-            format!("params_total is {declared} but the weight tensors hold {sum}"),
+            format!("params_total is {declared} but the stored parameter tensors hold {sum}"),
         )];
     }
     Vec::new()
+}
+
+/// The chunk refs that some tensor's expression consumes as *scheme* data: the
+/// scales, zero points, permutations and codebooks of §05.1.
+///
+/// These are stored numeric tensors with `scale` or `zero` semantics, exactly
+/// like a normalization gain, and the only thing that distinguishes them is what
+/// they are used for. So the distinction is drawn from use.
+pub fn scheme_parameters(ctx: &Ctx<'_>, table: &TensorTable) -> std::collections::BTreeSet<Ref> {
+    let mut out = std::collections::BTreeSet::new();
+    for r in table.tensors.values() {
+        let Ok(d) = TensorDesc::load(ctx, r) else {
+            continue;
+        };
+        scheme_leaves(&d.value, &mut out);
+    }
+    out
+}
+
+/// Collects the chunk refs an expression consumes as scheme data.
+pub fn scheme_leaves(e: &Expr, out: &mut std::collections::BTreeSet<Ref>) {
+    if let Expr::Dequantize { scheme, .. } | Expr::Quantize { scheme, .. } = e {
+        for key in ["scale", "zero", "scale_zero", "scale_scale", "order"] {
+            if let Some(v) = scheme.get(key) {
+                if let Ok(sub) = Expr::from_value(v) {
+                    for leaf in sub.leaves() {
+                        if let Expr::Literal { chunks, .. } = leaf {
+                            out.insert(*chunks);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for c in e.children() {
+        scheme_leaves(c, out);
+    }
 }
 
 #[cfg(test)]
