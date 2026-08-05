@@ -21,6 +21,9 @@ jobs:
   rust:
     name: rust (${{ matrix.toolchain }} on ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Beta is an early-warning signal for upcoming toolchain changes; it must
+    # not gate the branch.
+    continue-on-error: ${{ matrix.toolchain == 'beta' }}
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +52,10 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # Clippy on stable only. A new lint landing in beta is a signal, not a
+      # reason to block every branch in the repository.
       - name: Lint
+        if: matrix.toolchain == 'stable'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test

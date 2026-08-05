@@ -471,7 +471,7 @@ fn write_segment(out: &mut [u8], hdr_off: usize, kind: u16, seq: u64, payload: &
 
 fn build_index(l: &Layout) -> Vec<u8> {
     let mut entries: Vec<&Placed> = l.structs.iter().chain(l.blobs.iter()).collect();
-    entries.sort_by(|a, b| a.digest.cmp(&b.digest));
+    entries.sort_by_key(|a| a.digest);
 
     let mut out = vec![0u8; IDX_HEADER_SIZE + entries.len() * IDX_ENTRY_SIZE];
     out[0..4].copy_from_slice(&IDX_MAGIC);

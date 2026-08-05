@@ -71,6 +71,12 @@ dangling-ref-is-incomplete-not-invalid rule.
 ```console
 $ cargo test
 test result: ok. 19 passed; 0 failed
-$ cargo clippy
+$ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
+
+CI lints with whatever clippy ships in the current stable toolchain, which may
+be newer than yours and may therefore know lints you do not have locally. If CI
+flags something `cargo clippy` accepted on your machine, `rustup update` first.
+Clippy runs on stable only; beta is an early-warning job and does not gate the
+branch.
