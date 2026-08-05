@@ -97,10 +97,13 @@ $ omni verify toy.omni --level 6
 ```
 
 The same binary can quantize (`example --quantized`), evaluate tensor
-expressions (`cat`), plan against a runtime's capabilities (`plan`), sign and
-verify (`sign`), diff two models (`delta`), attach adapters (`adapter`),
-tokenize (`tokenize`) and render chat templates (`render`) — the full tour is
-in [`reference/README.md`](reference/README.md).
+expressions (`cat`), show what a read costs in real I/O (`open`), plan against a
+runtime's capabilities (`plan`), sign and verify (`sign`), diff two models
+(`delta`), attach adapters (`adapter`), tokenize (`tokenize`), render chat
+templates (`render`), print, verify and lower an execution graph (`graph`), run
+an embedded WebAssembly plugin (`plugin`), and separate a training checkpoint
+from the weights it shares (`strip`, `log`, `reshard`) — the full tour is in
+[`reference/README.md`](reference/README.md).
 
 The committed [`examples/toy.omni`](examples/toy.omni) is the exact container
 `omni example` writes — CI proves it byte-for-byte on every push.
@@ -158,10 +161,18 @@ framing ([§02](docs/spec/02-container.md)) and object model
 first attempt; everything above them is designed to evolve through the registry
 and feature-flag mechanisms in [§14](docs/spec/14-versioning.md).
 
-The reference implementation covers the container, object model, canonical
-encoding and the `literal` tensor case. The evaluator, quantization, IR,
-adapters, signatures and transports are specified but not yet implemented — see
-[the roadmap](docs/design/roadmap.md) for what is real and what is planned.
+The reference implementation covers the container and object model, canonical
+encoding and both mandatory hashes, the tensor expression algebra with its
+typing and range pushdown, quantization and sparsity, compression (including
+`zstd`, the one codec §03 marks MUST), tokenizers and chat templates, adapters
+and deltas, OMNI-IR with its dialects and rewrites, capability negotiation,
+signatures, training state, and a WebAssembly host for plugins. What is *not*
+implemented is stated in the same place it is claimed:
+[`reference/README.md`](reference/README.md) lists it — network transports
+(§13.4–§13.5), SIMD in the plugin host, and the MAY-level codecs — and every one
+of them is reported as unsupported at run time rather than guessed at. See
+[the roadmap](docs/design/roadmap.md) for what the gates have and have not
+proven.
 
 ## File extension and media types
 

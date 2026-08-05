@@ -55,6 +55,15 @@ base/fine-tune pairs. Differential test against `llama.cpp`'s dequantization for
 every GGUF K-quant type: zero mismatches. *If the structural GGUF mapping cannot
 be made bit-exact, §05.2.4 is wrong and gets revised.*
 
+**Gate 1 status.** The *format* side is done and tested: the dtype algebra, the
+layouts, the expression algebra with range pushdown, the sparsity and
+quantization catalogues, `omni delta` and `omni adapter`, and — as of the codec
+work — `zstd` in both directions, checked against libzstd on every push. The
+*importers and exporters do not exist*, so nothing in this gate is met: there is
+no round-trip claim to make on 100 real models, no delta-size study, and no
+differential test against `llama.cpp`. The catalogue being implemented is
+necessary for that work and is not a substitute for it.
+
 ## Phase 2 — Prove the semantic layer (months 7–12)
 
 **Goal:** the model is self-describing.
@@ -74,6 +83,18 @@ declared tolerance. Tokenizer vectors pass for ≥ 200 real tokenizers.
 Jinja2 → OMNI-CT translation succeeds for ≥ 95 % of chat templates on a public
 hub snapshot, with the failures analyzed and published. *If OMNI-CT cannot cover
 95 %, the language grows or the fallback story changes.*
+
+**Gate 2 status.** OMNI-IR parses, verifies, prints and rewrites; `omni.core` is
+frozen and `omni.tensor`/`omni.nn`/`omni.quant`/`omni.io` are defined with per-op
+versions; `graph synthesize` builds a decoder graph from `arch.params` and
+`graph lower` applies the shipped lowerings. The tokenizer IR and OMNI-CT run
+their own conformance vectors. The WASM host of §11.6 exists and runs plugin
+expression ops under the restricted profile. **Not met, and not close:** one
+architecture family is synthesizable rather than ten, there is no reference
+*interpreter* for the IR (verification and rewriting are not execution), the
+tokenizer vectors are this repository's rather than 200 real ones, and no
+Jinja2 → OMNI-CT translator exists, so the 95 % figure is untested. The
+coverage numbers in this gate are the point of it; none of them has a value yet.
 
 ## Phase 3 — Prove the distribution layer (months 12–18)
 
@@ -95,6 +116,13 @@ and load times published as signed OMNI containers. TTFT over a throttled link
 demonstrably better than the incumbent. A third-party security review of the
 parser and the signature stack. *This gate is where the storage-savings claims
 in this proposal are confirmed or retracted.*
+
+**Gate 3 status.** Not started. Bao verified streaming (§13.3) is implemented and
+tested, and `store::FileStore` reads a container by range with the reads counted,
+which is the local half of §13.4. There is no HTTP store, no OCI mapping, no
+`mount` and no `serve`, so nothing about distribution is demonstrated. The
+signature stack of §12.5 is implemented (Ed25519, COSE_Sign1, trust policies)
+and has had no third-party review.
 
 ## Phase 4 — Ecosystem (months 18–30)
 
