@@ -26,8 +26,8 @@ $ ./target/release/omni verify  model.omni
 
 - **Zero dependencies.** `docs/design/sdk.md` §5 claims a conforming C0 reader
   needs nothing beyond a hash function and fits in ~3 000 lines. This crate is
-  the evidence rather than the assertion — BLAKE3, SHA-256, CRC-32C and a strict
-  canonical CBOR codec are all implemented here.
+  the evidence rather than the assertion — BLAKE3, SHA-256, SHA-512, CRC-32C,
+  Ed25519, ChaCha20 and a strict canonical CBOR codec are all implemented here.
 - **`#![forbid(unsafe_code)]`.** This code parses untrusted binary input; §12.4
   requires memory safety, bounds checks on every length and offset, bounded
   nesting depth, and no allocation driven by an unvalidated declared size.
@@ -90,7 +90,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-179 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+189 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -134,12 +134,15 @@ from their recipes; and, for deltas, that an unchanged tensor costs nothing,
 that a genuinely low-rank change is extracted exactly and reproducibly, that a
 representation which would exceed `--max-err` is not chosen, that a dense small
 change becomes a quantized residual wrapped in `approx`, and that a parent chain
-is bounded and reports a missing required parent as incomplete. Every
+is bounded and reports a missing required parent as incomplete; and, for
+Ed25519, the RFC 8032 §7.1 vectors plus the checks that make a verdict mean one
+thing — a non-canonical `s`, a non-canonical `y`, a small-order key and a
+tampered signature are all refused. Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 179 passed; 0 failed
+test result: ok. 189 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
