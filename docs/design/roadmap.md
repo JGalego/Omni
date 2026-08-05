@@ -113,7 +113,7 @@ Deliverables:
   signatures.
 - Verified streaming (Bao) end to end; progressive load.
 - `omni mount` (FUSE) with synthesized safetensors and tokenizer views.
-- `omni serve`: an object server.
+- `omni serve`: an object server. ✅
 - Signatures (Ed25519, ES256, ML-DSA), Sigstore keyless, in-toto/SLSA
   provenance, revocation.
 - Published benchmark suite (§performance.10).
@@ -132,10 +132,11 @@ streaming (§13.3); and `store::FileStore` for the local half. CI fetches a
 container over HTTP by range and checks that the reassembled object graph is
 byte-identical to the original. What the gate actually asks for is untouched:
 there is no mirror of 10 000 models, no measured dedup or delta-size or
-load-time figures, no TTFT comparison over a throttled link. `https://` is
-refused rather than downgraded — TLS needs a dependency this crate does not
-have — and there is no OCI mapping, no `mount` and no `serve`, so the
-*distribution* claims remain claims. The signature stack of §12.5 is implemented
+load-time figures, no TTFT comparison over a throttled link. `omni serve` implements §13.4.3's
+per-object URLs alongside the pack, so CI exercises the client against a real
+server rather than a mock. `https://` is refused rather than downgraded — TLS
+needs a dependency this crate does not have — and there is no OCI mapping and no
+`mount`, so the *distribution* claims remain claims. The signature stack of §12.5 is implemented
 (Ed25519, COSE_Sign1, trust policies) and has had no third-party review.
 
 ## Phase 4 — Ecosystem (months 18–30)

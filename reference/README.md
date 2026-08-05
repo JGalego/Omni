@@ -44,14 +44,15 @@ $ ./target/release/omni fetch http://host/model.omni --sidecar model.omni.idx --
 $ ./target/release/omni strip model.omni --weights -o catalogue.omni   # §13.8
 $ ./target/release/omni import safetensors w.safetensors -o w.omni  # with a report
 $ ./target/release/omni export safetensors w.omni --plan            # what it would cost
+$ ./target/release/omni serve model.omni --port 8080    # §13.4.3 object server
 ```
 
 ## What is here
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store with the `.omni.idx` sidecar, a JSON codec, safetensors import and export, model builder | §01–§13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store and object server with the `.omni.idx` sidecar, a JSON codec, safetensors import and export, model builder | §01–§13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -193,6 +194,14 @@ implemented:
   describes every object, holds no weights, and is *incomplete* rather than
   invalid — `omni fetch`, `omni index` and `omni strip --weights`, with the round
   trips counted so the claim is checkable
+- §13.4.3 `omni serve`: the other half of the transport, read-only. The pack with
+  range support, the sidecar generated from it, and every object at
+  `/objects/<digest>` with the `immutable` cache header §13.4.2 says is always
+  correct there. Writing is not a route and nothing is joined to a filesystem
+  path, so there is nothing to traverse into. Having both halves means each is
+  tested against a real implementation of the other rather than against a mock:
+  CI runs `omni fetch` against `omni serve` and checks, with `hashlib` rather
+  than with this crate, that every object served at a digest hashes to it
 - **safetensors, both directions**, with the importer and exporter contracts of
   `docs/design/import-export.md` §1 implemented rather than paraphrased: every
   tensor verified byte-for-byte against the source before the import claims to
@@ -222,8 +231,8 @@ What is **not** implemented, and is reported as such rather than faked:
   socket, but TLS needs a cryptographic transport stack and this crate has no
   dependencies to provide one. An `https://` URL is refused with that reason
   rather than silently downgraded
-- The OCI mapping of §13.5, `omni mount` (§13.9) and `omni serve`. Each needs
-  something outside this crate's reach — a registry client, FUSE, a server
+- The OCI mapping of §13.5 and `omni mount` (§13.9). One needs a registry client,
+  the other FUSE
 - Every importer and exporter except safetensors. The capability matrix in
   `docs/design/import-export.md` §3 has 25 rows and this build implements one of
   them; GGUF, PyTorch, ONNX, PEFT, GPTQ and AWQ do not exist, and a request for
@@ -239,7 +248,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-370 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+380 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -371,7 +380,18 @@ fails, that an absent object is absent rather than an error, that a compressed
 container decodes with the parameters its superblock declares, that a single
 tampered byte from the wire is refused by the digest that covers it, and that a
 sidecar for a *different* container is caught by R-X02 in one request rather than
-used to plan ranges into the wrong offsets of the right file.
+used to plan ranges into the wrong offsets of the right file. And, for the object
+server: that a request line names one of the four routes or nothing, with
+traversal attempts, an unknown pack name and a non-digest path all reaching
+`NotFound` and every write method refused; that a digest path is parsed strictly;
+that every object is served at its own digest and hashes to it; that an unknown
+digest is a counted 404; that the pack is range-readable by this crate's own
+client in three requests; that the sidecar it generates opens the pack it
+describes and passes R-X02; that an unsatisfiable range is refused rather than
+answered short; that `HEAD` gives the length with no body and leaves the
+connection usable; that an index-only container serves its structure and 404s its
+weights; and that six kinds of malformed request end their own connection and
+nothing else.
 And, for the WebAssembly host: that
 arithmetic, locals, a real loop, memory loads and stores, `call`,
 `call_indirect`, `br_table`, `if`/`else` and the bulk-memory operations all do
@@ -415,7 +435,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 370 passed; 0 failed
+test result: ok. 380 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -409,6 +409,85 @@ jobs:
           PY
           echo "the plugin host runs what the model shipped, and only that"
 
+      # §13.4.3: the other half of the transport. A hub SHOULD serve both a
+      # pack and per-object URLs, and having both here means each is tested
+      # against a real implementation of the other rather than against a mock.
+      - name: The object server and the range client speak to each other
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          # SHA-256 rather than the default BLAKE3, for one reason: Python's
+          # standard library can compute it, so the check below that a served
+          # object hashes to the URL it came from is made by something other
+          # than this implementation.
+          "$OMNI" example --hash sha256 --tune 2 /tmp/served.omni >/dev/null
+
+          "$OMNI" serve /tmp/served.omni --port 18781 --requests 200 \
+            > /tmp/serve.log 2>&1 &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          for _ in $(seq 50); do
+            python3 -c "
+          import socket, sys
+          sys.exit(0 if socket.socket().connect_ex(('127.0.0.1', 18781)) == 0 else 1)" \
+              && break
+            sleep 0.1
+          done
+
+          # The pack, range-read by this repository's own client: three requests
+          # to open, one coalesced request for every object, each digest checked.
+          "$OMNI" fetch http://127.0.0.1:18781/served.omni --all | tee /tmp/sf.txt
+          grep -q 'open         3 request(s)' /tmp/sf.txt
+          grep -q 'every object against its digest (R-O01)' /tmp/sf.txt
+
+          # The sidecar it generates opens the pack it describes, R-X02 included.
+          curl -sf http://127.0.0.1:18781/served.omni.idx -o /tmp/served.idx
+          "$OMNI" index /tmp/served.idx --show | grep -q 'describes    a container of'
+          "$OMNI" fetch http://127.0.0.1:18781/served.omni --sidecar /tmp/served.idx \
+            | grep -q 'open         1 request(s)'
+
+          # §13.4.3: every object at its own digest, and the bytes served hash to
+          # the URL they were served from. That is the whole property.
+          "$OMNI" ls /tmp/served.omni --full > /tmp/objs.txt
+          python3 - <<'PY_OBJ'
+          import hashlib, urllib.request
+          rows = [r.split() for r in open('/tmp/objs.txt').read().splitlines()[1:] if r.strip()]
+          assert rows, "no objects listed"
+          checked = 0
+          for digest, otype, *_ in rows:
+              for path in (f"/objects/sha2-{digest}", f"/objects/{digest}"):
+                  with urllib.request.urlopen(f"http://127.0.0.1:18781{path}") as r:
+                      body, h = r.read(), r.headers
+                  # The property, checked by hashlib rather than by the thing
+                  # under test: the bytes served at a digest hash to it. Serving
+                  # the stored (possibly compressed) form would fail here, which
+                  # is why the server serves the logical form.
+                  got = hashlib.sha256(body).hexdigest()
+                  assert got == digest, f"{path} served bytes hashing to {got}"
+                  want = ("application/vnd.omni.chunk.v1" if otype == "Blob"
+                          else "application/vnd.omni.object.v1+cbor")
+                  assert h["Content-Type"] == want, f"{digest}: {h['Content-Type']}"
+                  # Every URL here is derived from a digest, so §13.4.2's cache
+                  # advice is unconditionally correct and must be given.
+                  assert h["Cache-Control"] == "public, max-age=31536000, immutable", \
+                      h["Cache-Control"]
+                  checked += 1
+          print(f"{checked} object fetches, every one hashing to the URL it came from")
+          PY_OBJ
+
+          # Read-only, and no paths: writing is not a route, and there is nothing
+          # to traverse into.
+          code() { curl -s -o /dev/null -w '%{http_code}' --path-as-is "$@"; }
+          test "$(code -X PUT http://127.0.0.1:18781/served.omni)" = 405
+          test "$(code -X DELETE http://127.0.0.1:18781/)" = 405
+          test "$(code http://127.0.0.1:18781/../../etc/passwd)" = 404
+          test "$(code http://127.0.0.1:18781/objects/../../etc/passwd)" = 404
+          test "$(code http://127.0.0.1:18781/objects/notadigest)" = 404
+          test "$(code "http://127.0.0.1:18781/objects/$(printf 'f%.0s' $(seq 64))")" = 404
+          # A range gets a range, not the whole file.
+          test "$(curl -s -r 100-199 -o /dev/null -w '%{size_download}' \
+                    http://127.0.0.1:18781/served.omni)" = 100
+          echo "the object server serves both layouts of §13.4 and refuses the rest"
+
       # Phase 1's premise: OMNI is worth nothing if it cannot absorb the
       # existing world without losing anything. safetensors is the format with
       # the least excuse, and the capability matrix calls its round-trip

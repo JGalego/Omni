@@ -230,6 +230,16 @@ $ omni fetch http://host/model.omni --sidecar model.omni.idx --all -o local.omni
 $ omni strip model.omni --weights -o catalogue.omni  # §13.8, index-only
 ```
 
+It also has `omni serve`, which is the server side of the same section — the pack
+with range support, the sidecar, and §13.4.3's per-object URLs:
+
+```console
+$ omni serve model.omni --port 8080
+  pack         /model.omni       (49 objects, range-readable)
+  index        /model.omni.idx   (§13.4.1: opens the pack in one request)
+  objects      /objects/<digest> (§13.4.3: immutable, cacheable forever)
+```
+
 `https://` is refused with its reason rather than downgraded, because TLS needs a
 dependency the reference deliberately does not have. `push`, `pull`, `mirror` and
 the `omni://` scheme need a registry client and do not exist yet.

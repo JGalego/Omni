@@ -59,7 +59,8 @@ VERBS:
                               Validate (V0-V6); exit 1 invalid, 3 indeterminate;
                               --tokenizer and --template also run their
                               conformance vectors
-    ls      <file>            List objects in the index
+    ls      <file> [--full]   List objects in the index; --full prints whole
+                              digests, which is what a URL or a --object needs
     dump    <file> --header   Annotated hexdump of the 128-byte file header
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
     cat     <file> --tensor <name> [--hex] [--limit N] [--raw] [--with <file>]
@@ -165,6 +166,10 @@ VERBS:
     open    <file.omni> [--tensor <name>] [--range A:B]
                               Open the file the way §02.7 says a seek-capable
                               reader should, and report the I/O it cost
+    serve   <file.omni> [--port N] [--addr A] [--requests N]
+                              Serve the pack, its index sidecar and every object
+                              at its own digest (§13.4.3), read-only, with the
+                              requests counted
     bench   [--objects N] [--lookups N]
                               Measure index lookup latency against Gate 0
 
@@ -213,6 +218,7 @@ fn main() -> ExitCode {
         "fetch" => cmd_fetch(&args),
         "import" => cmd_import(&args),
         "export" => cmd_export(&args),
+        "serve" => cmd_serve(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
         other => {
@@ -1677,9 +1683,14 @@ fn cmd_tokenize(c: &Container, args: &[String]) -> R {
     Ok(0)
 }
 
-fn cmd_ls(c: &Container, _args: &[String]) -> R {
+fn cmd_ls(c: &Container, args: &[String]) -> R {
+    // A truncated digest is readable and useless: it cannot be pasted into a
+    // `/objects/<digest>` URL, handed to `--object`, or compared with another
+    // tool's output. `--full` prints the identity rather than a preview of it.
+    let full = args.iter().any(|a| a == "--full" || a == "--long");
+    let width = if full { 64 } else { 18 };
     pr!(
-        "{:<20} {:<16} {:>12} {:>12}  {}",
+        "{:<width$} {:<16} {:>12} {:>12}  {}",
         "DIGEST",
         "TYPE",
         "OFFSET",
@@ -1690,8 +1701,8 @@ fn cmd_ls(c: &Container, _args: &[String]) -> R {
     entries.sort_by_key(|e| e.offset);
     for e in entries {
         pr!(
-            "{:<20} {:<16} {:>12} {:>12}  {}",
-            &hex(&e.digest)[..18],
+            "{:<width$} {:<16} {:>12} {:>12}  {}",
+            &hex(&e.digest)[..width],
             otype::name(e.otype),
             e.offset,
             e.stored_len,
@@ -3882,6 +3893,67 @@ fn stem(path: &str) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string())
+}
+
+/// `omni serve` — the other half of §13.4, so both halves can be tested against
+/// each other rather than against a mock.
+fn cmd_serve(args: &[String]) -> R {
+    use omni_core::serve::Server;
+    let Some(path) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let port: u16 = match flag(args, "--port").map(str::parse) {
+        Some(Ok(p)) => p,
+        Some(Err(_)) => {
+            prr!("omni: --port takes a number\n");
+            return Ok(2);
+        }
+        // Port 0 asks the OS for a free one, which is printed below. Useful for
+        // a test, and harmless for a human.
+        None => 8080,
+    };
+    let addr = flag(args, "--addr").unwrap_or("127.0.0.1");
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "model.omni".to_string());
+
+    let c = Container::open(std::fs::read(path)?)?;
+    let objects = c.index.len();
+    let size = c.bytes.len() as u64;
+    let root = short(c.header.hash, &c.header.root_digest);
+    let server = std::sync::Arc::new(Server::bind(&format!("{addr}:{port}"), c, &name)?);
+
+    pr!("serving {path}  {}", human(size));
+    pr!("  listening    http://{addr}:{}", server.port());
+    pr!(
+        "  pack         /{name}   ({} objects, range-readable)",
+        commas(objects as u64)
+    );
+    pr!("  index        /{name}.idx   (§13.4.1: opens the pack in one request)");
+    pr!("  objects      /objects/<digest>   (§13.4.3: immutable, cacheable forever)");
+    pr!("  root         {root}");
+
+    // `--requests N` stops after N, so a script can use this without a way to
+    // send a signal. Without it, this runs until interrupted.
+    let limit: Option<u64> = flag(args, "--requests").and_then(|s| s.parse().ok());
+    let stop = {
+        let s = server.clone();
+        move || match limit {
+            Some(n) => s.stats.read().0 >= n,
+            None => false,
+        }
+    };
+    server.serve_while(&stop)?;
+    let (requests, bytes, misses) = server.stats.read();
+    pr!(
+        "served {} request(s), {} ({} not found)",
+        commas(requests),
+        human(bytes),
+        misses
+    );
+    Ok(0)
 }
 
 fn cmd_bench(args: &[String]) -> R {
