@@ -2151,7 +2151,7 @@ impl State<'_> {
                 for (j, sc) in scores.iter_mut().enumerate() {
                     let j = j as u64;
                     let hidden_causal = causal && j > i + past;
-                    let hidden_window = window.is_some_and(|w| i + past >= j + w + 1);
+                    let hidden_window = window.is_some_and(|w| i + past > j + w);
                     if hidden_causal || hidden_window {
                         *sc = f64::NEG_INFINITY;
                         continue;
