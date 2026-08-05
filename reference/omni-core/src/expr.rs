@@ -2859,11 +2859,19 @@ impl Expr {
                 let t = x.eval_child(ctx)?;
                 crate::quant::quantize(ctx, &t, scheme, dtype, *round)?
             }
-            // As above for the sparsity schemes of §04.6.
-            Expr::Sparse { scheme, .. } => {
-                return Err(Error::Unsupported(format!(
-                    "sparse scheme `{scheme}` (§04.6) is not implemented"
-                )))
+            // The sparsity schemes of §04.6 are data consumed by this node.
+            Expr::Sparse {
+                scheme,
+                parts,
+                attrs,
+                fill,
+                ..
+            } => {
+                let mut mat = Vec::with_capacity(parts.len());
+                for (k, e) in parts {
+                    mat.push((k.as_str(), e.eval_child(ctx)?));
+                }
+                crate::sparse::densify(scheme, &mat, attrs, shape, dtype, fill.as_f64())?
             }
             // `approx` is a marker, not a transform: it makes the loss visible
             // without changing the value.
