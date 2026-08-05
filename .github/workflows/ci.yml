@@ -467,6 +467,110 @@ jobs:
                 f"{len(g)/1024/1024:.2f} MiB")
           PY_GIF
 
+      # §08 + import: a PEFT LoRA is safetensors plus a config, and the thing OMNI
+      # adds is that the base is pinned by digest rather than named by a string.
+      - name: A PEFT LoRA imports as an adapter pinned to its base
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+
+          # A base and a LoRA over it, both written from the formats' own
+          # definitions in Python — PEFT's tensor naming included.
+          python3 - <<'PY_LORA'
+          import json, os, struct
+          def write(path, tensors):
+              header, data = {}, b""
+              for name, shape in tensors:
+                  n = 1
+                  for d in shape:
+                      n *= d
+                  payload = b"".join(struct.pack("<H", (i * 37) % 0x3F80) for i in range(n))
+                  header[name] = {"dtype": "BF16", "shape": shape,
+                                  "data_offsets": [len(data), len(data) + len(payload)]}
+                  data += payload
+              h = json.dumps(header).encode()
+              open(path, "wb").write(struct.pack("<Q", len(h)) + h + data)
+
+          write("/tmp/lora-base.safetensors", [
+              (f"model.layers.{l}.self_attn.{p}.weight", [16, 16])
+              for l in range(2) for p in ("q_proj", "k_proj", "v_proj", "o_proj")])
+
+          os.makedirs("/tmp/lora", exist_ok=True)
+          write("/tmp/lora/adapter_model.safetensors",
+                [(f"base_model.model.model.layers.{l}.self_attn.{p}.lora_{ab}.weight",
+                  [8, 16] if ab == "A" else [16, 8])
+                 for l in range(2) for p in ("q_proj", "v_proj") for ab in ("A", "B")])
+          json.dump({"peft_type": "LORA", "r": 8, "lora_alpha": 16, "lora_dropout": 0.05,
+                     "base_model_name_or_path": "acme/toy-base", "task_type": "CAUSAL_LM",
+                     "target_modules": ["q_proj", "v_proj"], "bias": "none"},
+                    open("/tmp/lora/adapter_config.json", "w"))
+          print("wrote a base and a PEFT LoRA over it")
+          PY_LORA
+
+          "$OMNI" import safetensors /tmp/lora-base.safetensors -o /tmp/lora-base.omni \
+            --name acme/toy-base >/dev/null
+          "$OMNI" import peft /tmp/lora --base /tmp/lora-base.omni -o /tmp/lora.omni \
+            | tee /tmp/peft.txt
+
+          # Two layers × two targets, each a factor pair, each verified (I4).
+          grep -q '4 tensor pair(s)' /tmp/peft.txt
+          grep -q '8 verified byte-for-byte against the source' /tmp/peft.txt
+          # I1: the base is pinned by digest; PEFT's name for it is not an identity.
+          grep -q 'pinned by digest, not by the name PEFT gave' /tmp/peft.txt
+          # The base declares no axes — safetensors says nothing about them — so no
+          # rank-axis requirement is written rather than one that cannot be met.
+          grep -q 'no rank-axis requirement written' /tmp/peft.txt
+
+          # It is a valid container on its own: an adapter is a publishable artifact
+          # (§08.1), and its base being absent is expected rather than incomplete.
+          "$OMNI" verify /tmp/lora.omni --level 6 | tee /tmp/peftv.txt
+          grep -q '^valid' /tmp/peftv.txt
+          grep -q 'V5 adapter     ✓ lora over 8 factor tensor(s), 2 attach rule(s), rank 8' \
+            /tmp/peftv.txt
+          grep -q 'declared optional and not present' /tmp/peftv.txt
+
+          # §08.3: it attaches to the base it was built over, binding each layer's
+          # own factors, and touches nothing it did not train.
+          "$OMNI" adapter check /tmp/lora-base.omni /tmp/lora.omni | tee /tmp/pefta.txt
+          grep -q 'attached      4 tensor(s)' /tmp/pefta.txt
+          grep -q '^attachable' /tmp/pefta.txt
+          grep -q 'layers.0.self_attn.q_proj.weight' /tmp/pefta.txt
+          if grep -q 'k_proj' /tmp/pefta.txt; then
+            echo "::error::the adapter touched k_proj, which was not a target"; exit 1
+          fi
+
+          # And it refuses, by name, every config field that would change what the
+          # update is.
+          python3 - <<'PY_REFUSE'
+          import json, subprocess
+          base = json.load(open("/tmp/lora/adapter_config.json"))
+          for field, value in [("use_dora", True), ("fan_in_fan_out", True),
+                               ("use_rslora", True), ("rank_pattern", {"q_proj": 4}),
+                               ("alpha_pattern", {"q_proj": 8}),
+                               ("modules_to_save", ["score"]), ("peft_type", "IA3")]:
+              cfg = dict(base)
+              cfg[field] = value
+              json.dump(cfg, open("/tmp/lora/adapter_config.json", "w"))
+              r = subprocess.run(["reference/target/release/omni", "import", "peft",
+                                  "/tmp/lora", "--base", "/tmp/lora-base.omni",
+                                  "-o", "/tmp/nope.omni"],
+                                 capture_output=True, text=True)
+              out = r.stdout + r.stderr
+              assert r.returncode != 0, f"{field} was accepted"
+              assert field in out or "LORA" in out, f"{field}: {out[:200]}"
+          json.dump(base, open("/tmp/lora/adapter_config.json", "w"))
+          print("every field that changes the update is refused by name")
+          PY_REFUSE
+
+          # A LoRA over the wrong base does not attach, and says which rule.
+          "$OMNI" example /tmp/other-base.omni >/dev/null
+          set +e
+          "$OMNI" adapter check /tmp/other-base.omni /tmp/lora.omni > /tmp/wrong.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -qi 'R-A01\|not present\|unmatched\|matched no' /tmp/wrong.txt
+          echo "a PEFT LoRA imports, attaches to its own base, and refuses another"
+
       # §13.5: the OCI mapping. The argument for it is parasitic adoption —
       # registries, mirrors, CDNs and signing already exist — so the layout has
       # to be one the existing tools actually read.

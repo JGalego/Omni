@@ -190,10 +190,10 @@ typing and range pushdown, quantization and sparsity, compression (including
 and deltas, OMNI-IR with its dialects and rewrites, capability negotiation,
 signatures, training state, a WebAssembly host for plugins, HTTP range transport
 with the detached index sidecar, an object server and the OCI mapping, and
-lossless safetensors import and export. What is *not* implemented is stated in
+lossless safetensors import and export, and PEFT LoRA import. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
-it — every importer and exporter except safetensors, `https://` (TLS needs a
-dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
+it — every importer and exporter except safetensors and PEFT, `https://` (TLS
+needs a dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
 plugin host, and the MAY-level codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See
 [the roadmap](docs/design/roadmap.md) for what the gates have and have not

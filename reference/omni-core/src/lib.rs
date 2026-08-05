@@ -29,8 +29,8 @@
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
-//! in `docs/design/import-export.md` §3, [`safetensors`] is the one that is
-//! implemented; a request to import another is refused by name.
+//! in `docs/design/import-export.md` §3, [`safetensors`] and [`peft`] are the
+//! two that are implemented; a request to import another is refused by name.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -54,6 +54,7 @@ pub mod layout;
 pub mod model;
 pub mod oci;
 pub mod pattern;
+pub mod peft;
 pub mod plan;
 pub mod plugin;
 pub mod quant;

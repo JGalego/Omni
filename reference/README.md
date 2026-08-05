@@ -44,6 +44,7 @@ $ ./target/release/omni fetch http://host/model.omni --sidecar model.omni.idx --
 $ ./target/release/omni strip model.omni --weights -o catalogue.omni   # §13.8
 $ ./target/release/omni import safetensors w.safetensors -o w.omni  # with a report
 $ ./target/release/omni export safetensors w.omni --plan            # what it would cost
+$ ./target/release/omni import peft ./lora --base w.omni -o lora.omni  # a LoRA, pinned
 $ ./target/release/omni serve model.omni --port 8080    # §13.4.3 object server
 $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with oras
 ```
@@ -52,7 +53,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors import and export, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors and PEFT import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
@@ -214,6 +215,16 @@ implemented:
   stated precisely rather than optimistically — see the module docs for why it
   comes from delta containers rather than from two independently packed files
   happening to slice the same way
+- **PEFT LoRA import**, as the §08 `Adapter` the capability matrix says it is.
+  The thing OMNI adds is in the one required argument: PEFT names its base with a
+  *string* and §08.1 pins it with a *digest*, so `--base` is not optional and the
+  name PEFT gave is kept as a name. Every field that would change what the update
+  *is* — `use_dora`, `fan_in_fan_out`, `use_rslora`, `rank_pattern`,
+  `alpha_pattern`, `modules_to_save`, any `peft_type` but `LORA` — is refused by
+  name rather than quietly ignored. And the rank-axis requirement is written only
+  when the base actually names its axes: a base imported from safetensors names
+  none, because safetensors says nothing about them, and asserting a requirement
+  the base cannot meet made every attach *invalid* instead of merely unchecked
 - **safetensors, both directions**, with the importer and exporter contracts of
   `docs/design/import-export.md` §1 implemented rather than paraphrased: every
   tensor verified byte-for-byte against the source before the import claims to
@@ -247,10 +258,10 @@ What is **not** implemented, and is reported as such rather than faked:
   layout, but the push itself needs bearer-token auth and chunked blob uploads
   against a live registry, which is a client rather than a format concern
 - `omni mount` (§13.9), which needs FUSE
-- Every importer and exporter except safetensors. The capability matrix in
-  `docs/design/import-export.md` §3 has 25 rows and this build implements one of
-  them; GGUF, PyTorch, ONNX, PEFT, GPTQ and AWQ do not exist, and a request for
-  one is refused by name rather than half-attempted
+- Every importer and exporter except safetensors and PEFT. The capability matrix
+  in `docs/design/import-export.md` §3 has 25 rows and this build implements two
+  of them; GGUF, PyTorch, ONNX, GPTQ and AWQ do not exist, and a request for one
+  is refused by name rather than half-attempted
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
@@ -262,7 +273,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-386 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+392 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -415,7 +426,15 @@ missing marker, an unknown layout version, a missing index and reordered layers
 are each refused; and — asserted so nobody writes it down wrong — that
 re-exporting a model with one tensor changed does *not* share most of its blobs,
 while a delta container's layout is a fraction of the base's, which is where the
-dedup actually comes from.
+dedup actually comes from. And, for PEFT: that a config's every
+update-changing field is refused by name; that a regex `target_modules` and a
+non-LoRA `peft_type` are refused; that factors are checked against the base they
+claim to update, so a rank that disagrees, a target the base lacks and half a
+factor pair are each errors; that the naming convention is *read* rather than
+assumed; that a tensor nobody asked for makes the import lossy and says which;
+that the imported adapter pins its base by digest, declares it as a non-required
+parent that `delta::parents` can actually read back, and attaches to that base
+binding each layer's own factors while touching nothing it did not train.
 
 [OCI image layout]: https://github.com/opencontainers/image-spec/blob/main/image-layout.md
 And, for the WebAssembly host: that
@@ -461,7 +480,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 386 passed; 0 failed
+test result: ok. 392 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

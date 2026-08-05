@@ -271,6 +271,29 @@ bit. The importer keeps the dtype `bool` and describes the storage with §04.4's
 `packed` layout — one element per 8-bit word — rather than importing masks as
 `u8`. The type stays true and the bytes round-trip.
 
+PEFT LoRA is the second row, and it is where the *digest* half of the object
+model earns its keep:
+
+```console
+$ omni import peft ./lora --base model.omni -o lora.omni
+$ omni adapter check model.omni lora.omni
+```
+
+`--base` is required rather than convenient. An `adapter_config.json` names its
+base with a string; §08.1 pins it with a digest, so an adapter can never silently
+attach to a different base. There is no honest way to synthesize the digest of a
+model you were handed the *name* of, so the base container is an argument and
+PEFT's name for it is kept as a name. `use_dora`, `fan_in_fan_out`, `use_rslora`,
+`rank_pattern`, `alpha_pattern`, `modules_to_save` and any `peft_type` but `LORA`
+each change what the update is, and each is refused by name.
+
+One detail is worth recording because it took a real attach to find: the R-A03
+rank-axis requirement is written **only** when the base names its axes. A base
+imported from safetensors names none — safetensors says nothing about what a
+dimension means — so asserting the requirement made every attach report as
+*invalid* rather than merely unchecked. The shapes are still checked (R-A02),
+which is what can actually be decided from the tensors.
+
 Every other row of the matrix in §3 is unimplemented. A request to import one is
 refused by name, with a pointer to this document, rather than half-attempted.
 

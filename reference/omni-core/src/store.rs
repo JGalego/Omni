@@ -174,6 +174,33 @@ impl EnumerableStore for MemoryStore {
 
 // --------------------------------------------------------------- container --
 
+/// A [`Store`] view of a container someone else owns.
+///
+/// [`ContainerStore`] takes ownership, which a read-only caller holding a `&`
+/// cannot give it — and the evaluator only ever needs `resolve`. Both the CLI's
+/// read-only verbs and the importers want this, so it lives here rather than
+/// being written twice.
+pub struct Borrowed<'a>(pub &'a Container);
+
+impl Store for Borrowed<'_> {
+    fn hash(&self) -> HashAlgo {
+        self.0.header.hash
+    }
+
+    fn resolve(&self, d: &Digest) -> Res<Option<Vec<u8>>> {
+        match self.0.read(d) {
+            Ok(b) => Ok(Some(b)),
+            // Absent is not an error: §01.4 makes a partial store legal.
+            Err(crate::container::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(Error::Corrupt(e.to_string())),
+        }
+    }
+
+    fn has(&self, d: &Digest) -> Res<bool> {
+        Ok(self.0.find(d).is_some())
+    }
+}
+
 /// A sealed `.omni` file, read-only (§01.8: append-only in general; this
 /// implementation does not append).
 pub struct ContainerStore {

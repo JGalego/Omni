@@ -365,8 +365,14 @@ pub struct Note {
 
 /// The fidelity report of §2: what was represented, what was not, and what the
 /// importer declined to guess.
-#[derive(Clone, Debug, Default)]
+///
+/// Shared by every importer rather than reimplemented per format — the report is
+/// part of the *contract* (I3), not part of safetensors. `format` and `importer`
+/// say which one filled it in.
+#[derive(Clone, Debug)]
 pub struct Fidelity {
+    pub format: &'static str,
+    pub importer: &'static str,
     pub source_path: String,
     pub source_digest: Digest,
     pub source_size: u64,
@@ -378,6 +384,25 @@ pub struct Fidelity {
     pub verified_tensors: usize,
     pub verified_bytes: u64,
     pub warnings: Vec<String>,
+}
+
+impl Default for Fidelity {
+    fn default() -> Self {
+        Fidelity {
+            format: "safetensors",
+            importer: IMPORTER,
+            source_path: String::new(),
+            source_digest: [0u8; 32],
+            source_size: 0,
+            lossless: false,
+            represented: Vec::new(),
+            unrepresented: Vec::new(),
+            assumptions: Vec::new(),
+            verified_tensors: 0,
+            verified_bytes: 0,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 impl Fidelity {
@@ -404,7 +429,7 @@ impl Fidelity {
             (
                 "source",
                 C::map(vec![
-                    ("format", C::text("safetensors")),
+                    ("format", C::text(self.format)),
                     ("path", C::text(self.source_path.clone())),
                     ("digest", C::Bytes(self.source_digest.to_vec())),
                     ("size", C::U(self.source_size)),
@@ -413,7 +438,7 @@ impl Fidelity {
             (
                 "importer",
                 C::map(vec![
-                    ("name", C::text(IMPORTER)),
+                    ("name", C::text(self.importer)),
                     ("version", C::text(env!("CARGO_PKG_VERSION"))),
                 ]),
             ),

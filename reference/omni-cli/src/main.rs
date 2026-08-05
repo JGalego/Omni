@@ -120,6 +120,9 @@ VERBS:
                               Absorb another format and report the fidelity:
                               every tensor verified against the source, nothing
                               invented, the unrepresentable preserved (§1.1)
+    import  peft <adapter-dir> --base <base.omni> -o <out.omni>
+                              A PEFT LoRA as an §08 Adapter, pinned to that base
+                              by digest rather than by the name PEFT gives it
     export  safetensors <in.omni> [-o <out.safetensors>] [--plan]
                               [--allow-lossy]
                               Emit into another format. --plan says what would
@@ -1062,8 +1065,73 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
     let mut invalid = 0usize;
     let mut indeterminate = 0usize;
 
+    // An adapter container has no `model` asset and is not supposed to: §08.1
+    // makes an adapter a publishable artifact in its own right. Looking for a
+    // model and shrugging when there is none reported every LoRA ever written as
+    // indeterminate, which is the tool failing to understand its own output.
+    let is_adapter = c
+        .root()
+        .ok()
+        .and_then(|m| m.get("kind").and_then(|k| k.as_str()).map(str::to_string))
+        .as_deref()
+        == Some("adapter");
+
     // V5 — semantics. The tensor rules of §15.2, decided from descriptors.
-    if level >= 5 {
+    if level >= 5 && is_adapter {
+        let store = Borrowed(c);
+        let ctx = Ctx::new(&store);
+        match adapter_of(c) {
+            Ok(Some(a)) => {
+                // Its own tensors, checked with the same V5 rules a model's get.
+                let own = match omni_core::tensor::TensorTable::load(&ctx, &a.tensors) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // An adapter whose own tensor table does not load has
+                        // nothing left to check, so this is the verdict rather
+                        // than a finding to accumulate.
+                        pr!("V5 adapter     ✗ its tensor table does not load: {e}");
+                        return Ok(1);
+                    }
+                };
+                let findings = omni_core::tensor::validate_table(&ctx, &own);
+                let bad = findings
+                    .iter()
+                    .filter(|f| f.severity == omni_core::tensor::Severity::Invalid)
+                    .count();
+                if bad == 0 {
+                    pr!(
+                        "V5 adapter     ✓ {} over {} factor tensor(s), {} attach rule(s), \
+                         rank {}",
+                        a.method.name(),
+                        own.len(),
+                        a.attach.len(),
+                        a.rank.map(|r| r.to_string()).unwrap_or_else(|| "—".into())
+                    );
+                } else {
+                    pr!("V5 adapter     ✗ {bad} invalid finding(s):");
+                    for f in &findings {
+                        pr!("     {f}");
+                    }
+                    invalid += bad;
+                }
+                // The rules that need the base cannot be decided here, and saying
+                // so is the honest answer rather than passing them silently.
+                pr!(
+                    "     the base is pinned but absent; `omni adapter check <base> \
+                     <this>` decides R-A01–R-A03"
+                );
+            }
+            Ok(None) => {
+                pr!("V5 adapter     ⚠ the manifest says `adapter` but carries none");
+                indeterminate += 1;
+            }
+            Err(e) => {
+                pr!("V5 adapter     ⚠ {e}");
+                indeterminate += 1;
+            }
+        }
+    }
+    if level >= 5 && !is_adapter {
         let store = Borrowed(c);
         // §11.6: with the model's own plugin modules loaded, a `plugin` node is
         // checkable rather than indeterminate — which is the difference between
@@ -3728,10 +3796,14 @@ fn cmd_import(args: &[String]) -> R {
         eprint!("{USAGE}");
         return Ok(2);
     };
+    if format == "peft" {
+        return cmd_import_peft(args, input);
+    }
     if format != "safetensors" {
         prr!(
-            "omni: no importer for `{format}`. This build imports safetensors; \
-             `docs/design/import-export.md` §3 lists what the others would need\n"
+            "omni: no importer for `{format}`. This build imports safetensors and \
+             peft; `docs/design/import-export.md` §3 lists what the others would \
+             need\n"
         );
         return Ok(2);
     }
@@ -3805,6 +3877,115 @@ fn cmd_import(args: &[String]) -> R {
         100.0 * packed.len() as f64 / r.source_size.max(1) as f64
     );
     pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni import peft` — a PEFT LoRA over a base, as an §08 `Adapter`.
+///
+/// `--base` is required, and that is the point rather than an inconvenience: PEFT
+/// names its base with a string, OMNI pins it with a digest, and the digest is the
+/// guarantee OMNI adds. `input` is the adapter directory or its config file.
+fn cmd_import_peft(args: &[String], input: &str) -> R {
+    use omni_core::peft::{import, ImportOpts};
+    let (Some(out), Some(base_path)) = (
+        flag(args, "-o").or(flag(args, "--out")),
+        flag(args, "--base"),
+    ) else {
+        prr!(
+            "omni: import peft needs -o <out.omni> and --base <base.omni>; the base \
+             is what the adapter is pinned to (§08.1)\n"
+        );
+        return Ok(2);
+    };
+
+    // A PEFT adapter is two files. Given a directory, they are the two PEFT
+    // always writes; given a file, the weights sit beside it.
+    let dir = std::path::Path::new(input);
+    let (config_path, weights_path) = if dir.is_dir() {
+        (
+            dir.join("adapter_config.json"),
+            dir.join("adapter_model.safetensors"),
+        )
+    } else {
+        let parent = dir.parent().unwrap_or(std::path::Path::new("."));
+        (dir.to_path_buf(), parent.join("adapter_model.safetensors"))
+    };
+    for p in [&config_path, &weights_path] {
+        if !p.exists() {
+            prr!("omni: {} is not there\n", p.display());
+            return Ok(2);
+        }
+    }
+
+    let base = Container::open(std::fs::read(base_path)?)?;
+    let imported = import(
+        &std::fs::read(&config_path)?,
+        &std::fs::read(&weights_path)?,
+        &base,
+        &ImportOpts {
+            name: flag(args, "--name")
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("imported/{}", stem(input))),
+            config_path: config_path.display().to_string(),
+            weights_path: weights_path.display().to_string(),
+            chunk_size: flag(args, "--chunk")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1 << 20),
+        },
+    )?;
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: base.header.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+
+    let r = &imported.report;
+    pr!("imported {} -> {out}", config_path.display());
+    pr!("  source       peft, {}", human(r.source_size));
+    pr!(
+        "  base         {}  (pinned by digest, not by the name PEFT gave)",
+        short(base.header.hash, &base.header.root_digest)
+    );
+    pr!("  factors      {} tensor pair(s):", imported.factors.len());
+    for f in imported.factors.iter().take(6) {
+        pr!(
+            "     {}  A{:?} · B{:?}",
+            f.base_tensor,
+            f.a_shape,
+            f.b_shape
+        );
+    }
+    if imported.factors.len() > 6 {
+        pr!("     … {} more", imported.factors.len() - 6);
+    }
+    pr!(
+        "  tensors      {} verified byte-for-byte against the source ({}) — I4",
+        commas(r.verified_tensors as u64),
+        human(r.verified_bytes)
+    );
+    if r.unrepresented.is_empty() {
+        pr!("  unrepresented  nothing");
+    } else {
+        pr!("  unrepresented");
+        for n in &r.unrepresented {
+            pr!("     {} — {}", n.item, n.reason);
+        }
+    }
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    pr!(
+        "  size         {} ({} objects)",
+        human(packed.len() as u64),
+        commas(imported.objects.len() as u64)
+    );
+    pr!("  check it     omni adapter check {base_path} {out}");
     Ok(0)
 }
 
@@ -5630,6 +5811,23 @@ fn cmd_delta(args: &[String]) -> R {
     Ok(0)
 }
 
+/// The container's own `Adapter` object, if its manifest declares one.
+fn adapter_of(
+    c: &Container,
+) -> Result<Option<omni_core::adapter::Adapter>, Box<dyn std::error::Error>> {
+    let Some(d) = c
+        .root()?
+        .get("assets")
+        .and_then(|a| a.get("adapter"))
+        .and_then(as_ref_digest)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(omni_core::adapter::Adapter::from_value(
+        &c.get_value(&d)?,
+    )?))
+}
+
 /// `omni adapter check` — §08.3 attachment validation, before any weights load.
 fn cmd_adapter(args: &[String]) -> R {
     match args.get(1).map(|s| s.as_str()) {
@@ -5788,7 +5986,13 @@ fn cmd_adapter_make(args: &[String]) -> R {
                     role: "base".into(),
                     name: Some(base_path.to_string()),
                     locators: vec![],
-                    required: true,
+                    // Not required: §08.1 makes an adapter a publishable artifact
+                    // of its own, and one is always published without its base.
+                    // Marking it required reported every standalone LoRA as an
+                    // incomplete container, which said nothing useful — the base
+                    // is pinned either way, and `omni adapter check` is what
+                    // decides whether it attaches.
+                    required: false,
                 }
                 .to_value()]),
             ),
