@@ -4,8 +4,6 @@ The specification is worthless without an implementation that proves it and a
 governance structure that outlives its authors. This is the plan, with gates
 that can fail.
 
----
-
 ## Phase 0 — Prove the container (months 0–3)
 
 **Goal:** the binary format is implementable, fast, and correct.
@@ -110,8 +108,6 @@ At least one production deployment outside the authoring organizations.
 - OMNI/1.0 declared stable; container framing frozen.
 - Archival deposit (Software Heritage + an academic library) in OMNI-A form.
 
----
-
 ## Engineering practices (non-negotiable)
 
 | Practice | Why |
@@ -150,7 +146,5 @@ At least one production deployment outside the authoring organizations.
 5. A new architecture shipping as a dialect plugin, running on
    unmodified-but-older runtimes via its shipped lowering.
 6. The container framing unchanged since 1.0.
-
----
 
 **See also:** [Comparison](comparison.md) · [§15 Conformance](../spec/15-conformance.md)

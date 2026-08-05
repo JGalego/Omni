@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.toolchain }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        toolchain: [stable, beta]
+        include:
+          # The container format is little-endian only (§03.9) and the parser
+          # does explicit byte-order conversion, so cross-platform agreement is
+          # a correctness property worth testing rather than assuming.
+          - os: macos-latest
+            toolchain: stable
+          - os: windows-latest
+            toolchain: stable
+    defaults:
+      run:
+        working-directory: reference
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt,clippy
+          rustup default ${{ matrix.toolchain }}
+          rustc --version && cargo --version
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all --all-features
+
+      - name: Build (release)
+        run: cargo build --release --all
+
+  container-conformance:
+    name: container conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        working-directory: reference
+        run: cargo build --release
+
+      - name: Container round-trips and validates
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" --version
+          "$OMNI" example /tmp/ci.omni
+          "$OMNI" inspect /tmp/ci.omni
+          "$OMNI" verify  /tmp/ci.omni
+
+      - name: Packing is byte-reproducible (writer rule W1)
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example /tmp/a.omni >/dev/null
+          "$OMNI" example /tmp/b.omni >/dev/null
+          cmp /tmp/a.omni /tmp/b.omni
+          echo "two independent packs are byte-identical"
+
+      - name: Committed example matches a fresh build
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example /tmp/fresh.omni >/dev/null
+          if ! cmp -s /tmp/fresh.omni examples/toy.omni; then
+            echo "::error::examples/toy.omni differs from a fresh pack."
+            echo "The container encoding changed. Regenerate it and update"
+            echo "examples/README.md and docs/spec/02-container.md §2.11:"
+            echo "    cd examples && ../reference/target/release/omni example toy.omni"
+            sha256sum /tmp/fresh.omni examples/toy.omni
+            exit 1
+          fi
+          echo "committed example is reproducible from source"
+
+      - name: Corruption is detected
+        run: |
+          OMNI=reference/target/release/omni
+          cp examples/toy.omni /tmp/bad.omni
+          # Flip a bit inside the BLOB segment; verification must fail.
+          printf '\x01' | dd of=/tmp/bad.omni bs=1 seek=20000 count=1 conv=notrunc status=none
+          if "$OMNI" verify /tmp/bad.omni >/dev/null 2>&1; then
+            echo "::error::verify accepted a corrupted container"; exit 1
+          fi
+          echo "corruption detected"
+          # Truncation must also fail, not crash.
+          head -c 40000 examples/toy.omni > /tmp/trunc.omni
+          if "$OMNI" verify /tmp/trunc.omni >/dev/null 2>&1; then
+            echo "::error::verify accepted a truncated container"; exit 1
+          fi
+          echo "truncation detected"
+
+      - name: Digests are real SHA-256
+        run: |
+          python3 - <<'PY'
+          import hashlib, struct, sys
+          d = open('examples/toy.omni', 'rb').read()
+          assert d[:8] == bytes([0x89]) + b'OMNI\r\n\x1a', "magic"
+          size = struct.unpack('<Q', d[56:64])[0]
+          assert size == len(d), f"header file_size {size} != {len(d)}"
+          assert d[-8:] == bytes([0x1a, 0x0a, 0x0d]) + b'INMO' + bytes([0x89]), "end magic"
+          # The trailer locates the superblock; check its digest independently.
+          sb_off, sb_len = struct.unpack('<QQ', d[-64:-48])
+          sb_dig = d[-48:-16]
+          assert hashlib.sha256(d[sb_off:sb_off + sb_len]).digest() == sb_dig, "superblock digest"
+          print("magic, file_size, trailer and superblock digest all check out")
+          PY
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Internal links resolve
+        run: |
+          python3 - <<'PY'
+          import re, os, glob, sys
+          bad = []
+          for f in glob.glob('**/*.md', recursive=True):
+              d = os.path.dirname(f)
+              for m in re.finditer(r'\[([^\]]*)\]\(([^)#\s]+)(#[^)]*)?\)', open(f, encoding='utf-8').read()):
+                  t = m.group(2)
+                  if t.startswith(('http://', 'https://', 'mailto:')):
+                      continue
+                  if not os.path.exists(os.path.normpath(os.path.join(d, t))):
+                      bad.append((f, t))
+          for f, t in bad:
+              print(f"::error file={f}::broken link -> {t}")
+          print(f"checked links, {len(bad)} broken")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Assets are well-formed SVG
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET, glob
+          for f in sorted(glob.glob('assets/*.svg')):
+              ET.parse(f)
+              print(f"{f} ok")
+          PY
+
+      - name: No trailing whitespace in specification text
+        run: |
+          if grep -rnE ' +$' --include='*.md' docs/ ; then
+            echo "::error::trailing whitespace in docs"; exit 1
+          fi
+          echo "clean"

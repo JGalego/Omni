@@ -13,8 +13,6 @@ Global flags: `--json` (machine-readable output on every verb), `--quiet`,
 `--verify <level>` (V0–V8, default V3-selective), `--policy <file>`,
 `--offline`, `--jobs N`, `--color`.
 
----
-
 ## 1 Inspection
 
 ### `omni inspect`
@@ -245,7 +243,7 @@ $ omni migrate model.omni --to omni/1.4 -o new.omni
 
 ## 10 Output discipline
 
-Three rules that make the CLI trustworthy:
+What makes the output trustworthy:
 
 1. **`--json` on everything.** Every verb emits a stable, schema'd JSON document
    with `--json`; the human rendering is a view of it. No scraping.
@@ -267,7 +265,5 @@ Three rules that make the CLI trustworthy:
 
 Code 3 is the one most tools get wrong, and the one that keeps ecosystems from
 fragmenting (§14.4).
-
----
 
 **See also:** [SDK](sdk.md) · [Import/Export](import-export.md) · [§15 Conformance](../spec/15-conformance.md)

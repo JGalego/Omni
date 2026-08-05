@@ -3,8 +3,6 @@
 The object model is layer L1. Everything above it is expressed in terms of
 objects and references; everything below it is a way of storing bytes.
 
----
-
 ## 1.1 Axioms
 
 **A1. Immutability.** An object, once created, never changes. "Editing a model"
@@ -27,7 +25,7 @@ There is no global state, no central authority, and no ordering requirement.
 URL, or a machine. Objects can therefore be moved, copied, cached and mirrored
 without rewriting.
 
-These five axioms are what make deduplication, delta models, resumable
+These axioms are what make deduplication, delta models, resumable
 downloads, partial loading, signing and reproducible builds all be *the same
 mechanism* rather than five features.
 
@@ -351,7 +349,5 @@ sufficient alone:
 OMNI is the missing middle: typed content-addressed objects with *alignment and
 range semantics designed for tensors*, that can be **stored in** any of the
 above.
-
----
 
 **Prev:** [§00 Overview](00-overview.md) · **Next:** [§02 Container Binary Format](02-container.md)

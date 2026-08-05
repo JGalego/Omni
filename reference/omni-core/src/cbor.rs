@@ -364,7 +364,9 @@ impl<'a> Dec<'a> {
             3 => {
                 let s = self.take(arg as usize)?;
                 Ok(Value::Text(
-                    std::str::from_utf8(s).map_err(|_| Error::BadUtf8)?.to_string(),
+                    std::str::from_utf8(s)
+                        .map_err(|_| Error::BadUtf8)?
+                        .to_string(),
                 ))
             }
             4 => {
@@ -592,7 +594,10 @@ mod tests {
         assert_eq!(Value::Text("a".into()).encode(), vec![0x61, 0x61]);
         assert_eq!(Value::F64(1.0).encode(), vec![0xf9, 0x3c, 0x00]);
         assert_eq!(Value::F64(1.5).encode(), vec![0xf9, 0x3e, 0x00]);
-        assert_eq!(Value::F64(100000.0).encode(), vec![0xfa, 0x47, 0xc3, 0x50, 0x00]);
+        assert_eq!(
+            Value::F64(100000.0).encode(),
+            vec![0xfa, 0x47, 0xc3, 0x50, 0x00]
+        );
         assert_eq!(
             Value::F64(1.1).encode(),
             vec![0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a]
@@ -621,7 +626,10 @@ mod tests {
         // D1: 0 encoded in two bytes.
         assert!(matches!(decode(&[0x18, 0x00]), Err(Error::NonCanonicalInt)));
         // D2: indefinite-length array.
-        assert!(matches!(decode(&[0x9f, 0x01, 0xff]), Err(Error::IndefiniteLength)));
+        assert!(matches!(
+            decode(&[0x9f, 0x01, 0xff]),
+            Err(Error::IndefiniteLength)
+        ));
         // D8: trailing bytes.
         assert!(matches!(decode(&[0x00, 0x00]), Err(Error::Trailing(1))));
         // D3: unsorted map keys {"b":1,"a":2}.
@@ -640,7 +648,10 @@ mod tests {
             Err(Error::NonCanonicalFloat)
         ));
         // D7: unregistered tag.
-        assert!(matches!(decode(&[0xc1, 0x00]), Err(Error::UnregisteredTag(1))));
+        assert!(matches!(
+            decode(&[0xc1, 0x00]),
+            Err(Error::UnregisteredTag(1))
+        ));
     }
 
     #[test]

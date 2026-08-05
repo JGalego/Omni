@@ -37,7 +37,12 @@ impl Default for Sha256 {
 
 impl Sha256 {
     pub fn new() -> Self {
-        Sha256 { h: H0, buf: [0u8; 64], buf_len: 0, total: 0 }
+        Sha256 {
+            h: H0,
+            buf: [0u8; 64],
+            buf_len: 0,
+            total: 0,
+        }
     }
 
     pub fn update(&mut self, mut data: &[u8]) {

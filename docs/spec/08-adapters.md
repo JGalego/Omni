@@ -4,8 +4,6 @@ Adapters and deltas are the same mechanism viewed at two scales: both are
 **expressions over a parent's tensors** (§04.7). Nothing is merged, nothing is
 copied.
 
----
-
 ## 8.1 Adapter object
 
 ```cbor-diag
@@ -251,7 +249,5 @@ A serving stack holding one base and 200 LoRAs benefits directly:
 - **Deep parent chains cost latency** on first load (one index lookup per level,
   all cheap, but network round trips if parents are remote). Flatten for
   distribution; keep the chain for provenance.
-
----
 
 **Prev:** [§07 Execution Graph](07-graph.md) · **Next:** [§09 Training State](09-training.md)

@@ -16,8 +16,6 @@ packing is deterministic (§01.10, writer rule W1).
 > BLAKE3-256 so that every digest here can be checked with `sha256sum` and the
 > crate can stay dependency-free. Both algorithms are mandatory in §03.5.1.
 
----
-
 ## 1 The example model
 
 A toy 2-layer decoder: 12 tensors, 57 472 parameters, bf16 attention
@@ -80,7 +78,7 @@ read          header 128 B + trailer 64 B + superblock 337 B + index 3200 B + st
               = 9.68 KiB total, 0 tensor payload bytes
 ```
 
-Three things in that output are the specification's claims made concrete:
+Several of the specification's claims are made concrete in that output:
 
 1. **`dedup 112.50 KiB → 80.50 KiB (28.4 % saved)`.** `lm_head` and
    `embed_tokens` have *different* `TensorDesc` objects (different `semantic`),

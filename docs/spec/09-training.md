@@ -3,8 +3,6 @@
 Training state is **optional and separable**. An inference container must not
 pay for it — in bytes, in parse time, or in complexity.
 
----
-
 ## 9.1 Separability requirement
 
 Normative rules:
@@ -168,7 +166,7 @@ omni log run.omnid
 ```
 
 `Δ` is genuinely that small when optimizer moments are stored in bf16/fp8 and
-chunk-level dedup catches the slow-moving portions. `omni gc --keep-every 10 
+chunk-level dedup catches the slow-moving portions. `omni gc --keep-every 10
 --keep-last 5` implements retention policy at object granularity, which is
 strictly better than deleting whole checkpoint directories.
 
@@ -189,7 +187,5 @@ no interoperability benefit, since resuming a run in a different framework is
 rarely meaningful even when the tensors transfer. What OMNI *does* guarantee is
 that the tensors, their sharding, their RNG streams and their step counters
 transfer losslessly — which is the part that is currently broken.
-
----
 
 **Prev:** [§08 Adapters](08-adapters.md) · **Next:** [§10 Runtime & Capability Negotiation](10-runtime.md)

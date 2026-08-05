@@ -4,8 +4,6 @@ The specification's job is to define a *substrate*, not a catalogue. Everything
 domain-specific — architectures, quantizers, tokenizers, codecs, metadata
 vocabularies — enters through this section.
 
----
-
 ## 11.1 Extension points
 
 | Point | Mechanism | Section |
@@ -61,7 +59,7 @@ wrapper.
 | 2 | `SAFE_TO_COPY` | …it MAY preserve it when rewriting the container. If clear, a rewrite that changes related content MUST drop it (it may have become stale). |
 | 3 | `STRUCTURAL` | …it MUST understand it to validate integrity (e.g. a new index format). Failing this bit means "cannot verify", which is distinct from "invalid". |
 
-The four combinations that matter:
+The combinations that matter:
 
 | CRITICAL | SAFE_TO_COPY | Meaning | Example |
 |:--:|:--:|---|---|
@@ -220,7 +218,5 @@ Suppose "Hyperion blocks" replace attention in 2032.
 Step 3 is the property no existing format has. GGUF would report an unknown
 architecture enum; ONNX would fail on an unknown op with no recourse;
 safetensors would load the weights and leave the user to guess.
-
----
 
 **Prev:** [§10 Runtime](10-runtime.md) · **Next:** [§12 Security Model](12-security.md)

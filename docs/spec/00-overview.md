@@ -4,8 +4,6 @@
 **Normative keywords:** MUST, MUST NOT, SHOULD, SHOULD NOT, MAY are to be
 interpreted as in RFC 2119 / RFC 8174.
 
----
-
 ## 0.1 The problem
 
 Every model format in use today conflates things that are logically independent:
@@ -40,7 +38,7 @@ OMNI's thesis is that these are all the *same* problem: the format has no
 
 ## 0.2 The layer model
 
-OMNI is defined as five independent planes. Each may be implemented,
+OMNI is defined as a stack of independent planes. Each may be implemented,
 transported, versioned and cached separately. This separation is the
 specification's single most important property; every other feature is a
 consequence of it.
@@ -82,7 +80,7 @@ Rules that make the separation real, not decorative:
   It stores nothing that cannot be recomputed. *Consequence: every hardware
   artifact is a cache and may be deleted at any time without loss.*
 
-## 0.3 The four-word summary of each borrowed idea
+## 0.3 Borrowed ideas
 
 OMNI is deliberately unoriginal where prior art is strong:
 
@@ -246,7 +244,5 @@ The concrete answers:
    either inside it or explicitly declared missing.
 6. **Nothing executes on load.** A 2076 reader is not required to implement a
    2026 sandbox to read 2026 weights (§12.2).
-
----
 
 **Next:** [§01 Object Model](01-object-model.md)

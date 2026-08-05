@@ -32,9 +32,7 @@ pub mod model;
 pub mod sha256;
 
 pub use cbor::Value;
-pub use container::{
-    otype, pack, seg, verify, Container, Digest, Object, PackOptions, Report,
-};
+pub use container::{otype, pack, seg, verify, Container, Digest, Object, PackOptions, Report};
 pub use model::{DType, ModelBuilder, TensorSpec};
 pub use sha256::hex;
 

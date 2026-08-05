@@ -4,8 +4,6 @@ Each format below is compared on what it was *designed* to do, then on what it
 cannot do. Most of them are good at their job; the argument for OMNI is not that
 they are bad, but that their jobs are disjoint and nobody owns the union.
 
----
-
 ## 1 The capability matrix
 
 **Legend:** ● yes · ◐ partial / by convention · ○ no
@@ -235,7 +233,5 @@ safetensors, and ride OCI for distribution, so nobody has to switch to benefit.
 5. **It is unproven.** Every claim here is a design claim. The roadmap's gates
    are structured so that the format is validated against real corpora before it
    asks anyone to adopt it.
-
----
 
 **See also:** [Performance](performance.md) · [Import/Export](import-export.md) · [Rationale](../rationale/tradeoffs.md)

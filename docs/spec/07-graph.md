@@ -4,8 +4,6 @@ Layer L3. Optional: a model may be weights-only. When present, OMNI-IR is what
 makes a model *self-describing* — executable by a runtime that has never heard of
 its architecture.
 
----
-
 ## 7.1 The problem with existing model IRs
 
 | IR | Failure mode |
@@ -179,7 +177,7 @@ self-describing one.
 
 ## 7.6 Custom operators
 
-Three tiers, in decreasing portability:
+In decreasing order of portability:
 
 1. **Declarative composite** — the op is defined by a `lower_to` rule expressed
    in `omni.core` + `omni.tensor`. Fully portable; any C2 runtime can run it.
@@ -263,7 +261,5 @@ skipped for structural validation, printed by tooling, and preserved on rewrite
 - **No Python.** Not a subset, not an embedding, not a fallback.
 - **No implicit numerics.** Accumulation dtype, math mode and reduction order are
   explicit attributes where they matter; nothing is inferred from a global flag.
-
----
 
 **Prev:** [§06 Metadata](06-metadata.md) · **Next:** [§08 Adapters & Delta Models](08-adapters.md)

@@ -3,8 +3,6 @@
 The unit of transfer is the **object**, not the file. Everything in this section
 follows from that.
 
----
-
 ## 13.1 Access patterns to support
 
 | Pattern | Requirement |
@@ -93,7 +91,7 @@ GET /models/llm-8b.omni
 Range: bytes=…, …, …                    → Manifest+Metadata      (multipart ranges)
 ```
 
-**Three round trips to a fully planned load of an arbitrarily large model**, and
+**A fully planned load of an arbitrarily large model in three round trips**, and
 the index is immutable so a CDN caches it forever.
 
 For servers or CDNs with poor suffix-range support, publish the sidecar:
@@ -256,7 +254,5 @@ opening it mid-write finds the last valid superblock and sees a consistent
 snapshot. Torn writes are detected by CRC and by the trailing superblock's
 digest, and never produce a partially-valid model — the previous superblock
 remains authoritative.
-
----
 
 **Prev:** [§12 Security](12-security.md) · **Next:** [§14 Versioning & Migration](14-versioning.md)

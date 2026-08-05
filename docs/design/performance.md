@@ -8,8 +8,6 @@
 > structural (e.g. "two round trips to open"), it follows from the specification
 > and is not an estimate.
 
----
-
 ## 1 What determines model load time
 
 ```
@@ -156,7 +154,7 @@ One 8 B base model, published as:
 | **Total (no opaque caches)** | **142.2 GB** (−54 %) |
 | **Total (fp16 + int4-AWQ only, others derived on demand)** | **~60 GB** (−81 %) |
 
-Two honest observations:
+Stated plainly:
 
 1. **Quantization schemes that are genuinely different bit-layouts still cost
    their bytes.** GPTQ, AWQ and MXFP4 weights are different numbers, not
@@ -288,7 +286,5 @@ The roadmap's Phase 3 gate is a published benchmark suite covering:
 
 Results are to be published as OMNI containers with signed `Evaluation` objects
 (§06.8) — the format should eat its own dog food for its own benchmarks.
-
----
 
 **See also:** [Comparison](comparison.md) · [Roadmap](roadmap.md) · [§13 Streaming](../spec/13-streaming.md)

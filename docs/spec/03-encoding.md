@@ -1,7 +1,5 @@
 # OMNI/1.0 — §3 Encoding, Hashing, and Compression
 
----
-
 ## 3.1 Why CBOR
 
 Structure objects are encoded in **OMNI-CBOR**, a deterministic profile of CBOR
@@ -112,7 +110,7 @@ Schema evolution rules:
 **BLAKE3-256 is the default**; SHA-256 MUST also be implemented for
 interoperability with OCI, Sigstore, and every existing supply-chain tool.
 
-BLAKE3 is chosen for three properties that matter here and nowhere else:
+BLAKE3 is chosen for properties that matter here and nowhere else:
 
 1. **Parallel.** Hashing a 400 GB model at ~5–15 GB/s per core-group means
    verification is not the bottleneck; SHA-256 without hardware acceleration is
@@ -171,7 +169,7 @@ where its dedup wins outweigh the loss of offset arithmetic; use `block` for any
 quantized tensor, so that partial loads never straddle a block; use `row` for MoE
 expert weights so a runtime can fetch only the experts it will route to.
 
-Chunk size trades three ways:
+Chunk size involves competing pressures:
 
 - Smaller chunks → better dedup, finer partial fetch, more resumable; but more
   objects (index size = 64 B × n), more syscalls, more per-chunk overhead.
@@ -268,7 +266,5 @@ for deployments where that leak is unacceptable, at the cost of dedup.
   yields identical bytes. Where a dtype admits multiple NaN payloads, the
   canonical encoder MUST emit the canonical NaN, and a validator MAY flag
   non-canonical NaNs (which are a known channel for hiding data in weights).
-
----
 
 **Prev:** [§02 Container](02-container.md) · **Next:** [§04 Tensors](04-tensors.md)

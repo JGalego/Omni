@@ -7,8 +7,6 @@ All multi-byte integers are **little-endian**. `u8/u16/u32/u64` denote unsigned
 integers of that width. Offsets are absolute from the start of the file unless
 stated otherwise.
 
----
-
 ## 2.1 File shape
 
 ```
@@ -28,7 +26,7 @@ stated otherwise.
 └────────────────────────────────────────────┘  offset = file_size
 ```
 
-Two access patterns are both first-class:
+Both access patterns are first-class:
 
 - **Seek-capable readers** (local file, S3, HTTP with ranges) read the last 64
   bytes, follow one pointer to the superblock, and one more to the index. Two
@@ -391,7 +389,5 @@ verify` ladder.
 | **Flat header + blob (safetensors)** | The right instinct, but a single JSON header means no streaming, no dedup, no extensibility, no signatures, and O(n) header re-parse on every open. |
 | **FlatBuffers/Cap'n Proto for everything** | Zero-copy is attractive, but schema evolution is by-field-id only, canonical encoding is not guaranteed (so hashing is unstable), and losing the schema loses the data. We use the *idea* — a fixed-layout, zero-parse table — exactly where it pays (§2.6) and self-describing CBOR everywhere else. |
 | **SQLite as container** | Tempting (indexes, transactions, ubiquity) but no alignment control, page-oriented storage defeats `mmap` of large values, and it puts a B-tree in the trust boundary. |
-
----
 
 **Prev:** [§01 Object Model](01-object-model.md) · **Next:** [§03 Encoding & Hashing](03-encoding.md)

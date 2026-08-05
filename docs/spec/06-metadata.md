@@ -5,8 +5,6 @@ query**, and **open enough to never block a publisher**. OMNI achieves the first
 by putting metadata in small objects near the front of the container (§13.2), the
 second with schemas (§03.4), and the third with namespaced extensions (§11).
 
----
-
 ## 6.1 Metadata object
 
 ```cbor-diag
@@ -356,7 +354,5 @@ answer everything `omni inspect` prints (§CLI) by reading the header, the
 trailer, the superblock, the index, and the objects listed above — bounded by
 `min(4 MiB, file_size)` of transfer beyond the index in the overwhelming
 majority of cases, and never requiring a single tensor chunk.
-
----
 
 **Prev:** [§05 Quantization](05-quantization.md) · **Next:** [§07 Execution Graph](07-graph.md)

@@ -4,8 +4,6 @@ Layer L2. This section contains OMNI's central technical contribution: a tensor
 is not a byte range, it is a **pure expression** whose byte range is one possible
 leaf.
 
----
-
 ## 4.1 The idea
 
 In every existing format, a tensor *is* its bytes. Therefore:
@@ -369,7 +367,7 @@ through the model's `dims` binding table before materialization.
 
 ### 4.7.4 Evaluation
 
-An evaluator is a straightforward tree walk with three refinements:
+An evaluator is a straightforward tree walk, with these refinements:
 
 1. **Lazy and range-driven.** `eval_range(expr, byte_range)` pushes the range
    through structural nodes so that reading rows 100–200 of
@@ -434,7 +432,7 @@ C1 reader can still load the model. If `crit` is true and no fallback exists, a
 reader without the plugin MUST refuse the tensor — but MAY still read the rest of
 the model, report the missing plugin, and load a different realization (§10).
 
-## 4.8 Worked example: one linear layer, four ways
+## 4.8 Worked example: a linear layer as several representations
 
 All four share the *same stored bytes*.
 
@@ -475,7 +473,5 @@ and no relationship between them beyond a naming convention.
 | Automatic partial loading | Range pushdown is only exact through structural nodes; `matmul` in a LoRA chain forces the full low-rank factors to be read (they are tiny, so this is fine). |
 | Adapters cost their delta | Materialization is now a runtime step with a latency cost; §10.6 caches exist precisely to amortize it, and `materialize:"eager"` opts out per tensor. |
 | Lossy transforms are visible | Publishers who want to hide a lossy step cannot. This is the point. |
-
----
 
 **Prev:** [§03 Encoding](03-encoding.md) · **Next:** [§05 Quantization](05-quantization.md)

@@ -5,8 +5,6 @@ and are loaded by processes with GPUs, credentials and network access. The
 current state of the art — `pickle` in PyTorch checkpoints, executable engine
 blobs, Jinja templates evaluated at load, no signatures — is indefensible.
 
----
-
 ## 12.1 Threat model
 
 **Assets:** the loading process's memory and control flow; the host's
@@ -160,7 +158,7 @@ that belongs in a model card, a paper, or a compliance record.
 
 ### 12.5.5 Identity and key distribution
 
-Three interoperable models, because different ecosystems have settled
+Several interoperable models, because different ecosystems have settled
 differently:
 
 1. **Keys** — raw public keys pinned by the consumer (simplest, best for
@@ -253,7 +251,7 @@ For proprietary weights at rest and in transit beyond TLS.
   per-recipient wrapped keys via HPKE (RFC 9180), age, or a KMS reference. The
   container is decryptable by any authorized recipient without re-encrypting the
   payload.
-- **Two modes:**
+- **Key-derivation modes:**
 
 | Mode | Key derivation | Dedup | Leak |
 |---|---|---|---|
@@ -331,7 +329,5 @@ Stated plainly:
    flags it rather than solving it.
 6. **WASM plugins can consume resources** up to their fuel/memory budget; the
    budget is the mitigation, and defaults are conservative.
-
----
 
 **Prev:** [§11 Plugins](11-plugins.md) · **Next:** [§13 Streaming & Transport](13-streaming.md)

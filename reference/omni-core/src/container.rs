@@ -163,7 +163,11 @@ impl Object {
     }
 
     pub fn blob(payload: Vec<u8>) -> Object {
-        Object { otype: otype::BLOB, payload, oflags: oflags::CRITICAL | oflags::SAFE_TO_COPY }
+        Object {
+            otype: otype::BLOB,
+            payload,
+            oflags: oflags::CRITICAL | oflags::SAFE_TO_COPY,
+        }
     }
 
     pub fn digest(&self) -> Digest {
@@ -534,12 +538,7 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
         Value::U(seg::SUPER as u64),
     ]));
 
-    let total_logical: u64 = l
-        .structs
-        .iter()
-        .chain(l.blobs.iter())
-        .map(|p| p.len)
-        .sum();
+    let total_logical: u64 = l.structs.iter().chain(l.blobs.iter()).map(|p| p.len).sum();
 
     Value::map(vec![
         ("t", Value::text("omni.core/superblock")),
@@ -554,10 +553,7 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
         (
             "index",
             Value::map(vec![
-                (
-                    "off",
-                    Value::U((l.index_hdr_off + SEG_HEADER_SIZE) as u64),
-                ),
+                ("off", Value::U((l.index_hdr_off + SEG_HEADER_SIZE) as u64)),
                 (
                     "len",
                     Value::U((IDX_HEADER_SIZE + l.n_entries * IDX_ENTRY_SIZE) as u64),
@@ -577,10 +573,7 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
         (
             "features",
             Value::map(vec![
-                (
-                    "required",
-                    Value::Array(vec![Value::text("omni.core/1.0")]),
-                ),
+                ("required", Value::Array(vec![Value::text("omni.core/1.0")])),
                 ("optional", Value::Array(vec![])),
             ]),
         ),
@@ -703,7 +696,12 @@ impl Container {
         let ilen = idx.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let index = parse_index(&bytes, ioff, ilen)?;
 
-        Ok(Container { bytes, header, superblock, index })
+        Ok(Container {
+            bytes,
+            header,
+            superblock,
+            index,
+        })
     }
 
     /// Binary search over the fixed-layout index — the hot path (§02.6.2).
@@ -760,7 +758,10 @@ impl Container {
             let plen = u64::from_le_bytes(self.bytes[off + 8..off + 16].try_into().unwrap());
             let p = off + SEG_HEADER_SIZE;
             if p as u64 + plen > end as u64 {
-                return Err(rule("R-C05", format!("segment payload overruns file at {off:#x}")));
+                return Err(rule(
+                    "R-C05",
+                    format!("segment payload overruns file at {off:#x}"),
+                ));
             }
             let pc = u32::from_le_bytes(self.bytes[off + 24..off + 28].try_into().unwrap());
             if crc32c(&self.bytes[p..p + plen as usize]) != pc {

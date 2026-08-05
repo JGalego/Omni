@@ -14,8 +14,15 @@ use crate::container::{otype, Digest, Object};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DType {
     /// (total bits, exponent bits, mantissa bits)
-    Float { w: u16, e: u16, m: u16 },
-    Int { w: u16, signed: bool },
+    Float {
+        w: u16,
+        e: u16,
+        m: u16,
+    },
+    Int {
+        w: u16,
+        signed: bool,
+    },
     Bool,
 }
 
@@ -25,7 +32,10 @@ impl DType {
     pub const BF16: DType = DType::Float { w: 16, e: 8, m: 7 };
     pub const F8E4M3: DType = DType::Float { w: 8, e: 4, m: 3 };
     pub const I8: DType = DType::Int { w: 8, signed: true };
-    pub const U4: DType = DType::Int { w: 4, signed: false };
+    pub const U4: DType = DType::Int {
+        w: 4,
+        signed: false,
+    };
 
     /// Bits per element. Fractional widths (e.g. base-3 ternary packing) would
     /// return a rational here; the registered types in this subset are all
@@ -52,7 +62,11 @@ impl DType {
             DType::F8E4M3 => "f8e4m3",
             DType::I8 => "i8",
             DType::U4 => "u4",
-            DType::Float { w: 64, e: 11, m: 52 } => "f64",
+            DType::Float {
+                w: 64,
+                e: 11,
+                m: 52,
+            } => "f64",
             DType::Bool => "bool",
             _ => return None,
         })
@@ -127,7 +141,10 @@ impl ModelBuilder {
 
     pub fn arch(mut self, family: impl Into<String>, params: Vec<(&str, Value)>) -> Self {
         self.arch_family = Some(family.into());
-        self.arch_params = params.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        self.arch_params = params
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
         self
     }
 
@@ -423,10 +440,7 @@ mod tests {
         let mut d = [0u8; 32];
         d.copy_from_slice(meta_ref[1].as_bytes().unwrap());
         let meta = c.get_value(&d).unwrap();
-        assert_eq!(
-            meta.get("params_total").and_then(|v| v.as_u64()),
-            Some(512)
-        );
+        assert_eq!(meta.get("params_total").and_then(|v| v.as_u64()), Some(512));
         assert_eq!(meta.get("name").and_then(|v| v.as_str()), Some("test/tiny"));
     }
 }

@@ -3,9 +3,7 @@
 The design target is: **a file written today opens in 2076, and a file written in
 2076 does not break today's tooling more than necessary.**
 
----
-
-## 14.1 Four independent version axes
+## 14.1 Independent version axes
 
 Conflating these is the mistake that kills formats.
 
@@ -203,7 +201,7 @@ A format outlives its authors only with governance:
 
 1. **Open working group** with a published charter, public archives, and a
    documented decision process (rough consensus + running code).
-2. **Two independent implementations** required before any `omni.*` registration
+2. **Independent implementations** — at least two — required before any `omni.*` registration
    is finalized.
 3. **Conformance suite is normative** (§15) and versioned alongside the spec; a
    claim of conformance is a claim about test results.
@@ -230,7 +228,5 @@ For adopters, the promises are:
 5. No registry entry may be denied for a non-`omni.*` namespace.
 6. Every derived artifact is droppable, and the canonical model never depends on
    one.
-
----
 
 **Prev:** [§13 Streaming](13-streaming.md) · **Next:** [§15 Conformance](15-conformance.md)

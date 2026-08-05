@@ -3,8 +3,6 @@
 OMNI's value depends entirely on whether it can absorb the existing world without
 losing anything, and emit into it without lying about what was lost.
 
----
-
 ## 1 The two contracts
 
 ### 1.1 Importer contract
@@ -260,7 +258,5 @@ Importers and exporters are **out-of-tree-capable plugins**: the CLI discovers
 `omni-import-<fmt>` binaries on `PATH` speaking a documented JSON-lines protocol,
 so a vendor can ship an importer for a proprietary format without patching OMNI.
 This is what keeps the core small and the ecosystem open.
-
----
 
 **See also:** [CLI](cli.md) · [SDK](sdk.md) · [§05 Quantization](../spec/05-quantization.md)

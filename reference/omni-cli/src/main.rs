@@ -176,7 +176,11 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
             0x1e => "blake3-256",
             _ => "unknown",
         },
-        if h.flags & 1 != 0 { "sealed" } else { "unsealed" }
+        if h.flags & 1 != 0 {
+            "sealed"
+        } else {
+            "unsealed"
+        }
     );
     pr!("  creator     {}", h.creator);
     pr!("  uuid        {}", hex(&h.uuid));
@@ -190,13 +194,18 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
     }
     if let Some(meta_d) = manifest.get("meta").and_then(as_ref_digest) {
         let meta = c.get_value(&meta_d)?;
-        let name = meta.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)");
+        let name = meta
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unnamed)");
         pr!("model  {name}");
         match meta.get("arch") {
             Some(a) => {
                 pr!(
                     "  architecture  {}",
-                    a.get("family").and_then(|v| v.as_str()).unwrap_or("(not stated)")
+                    a.get("family")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(not stated)")
                 );
                 if let Some(Value::Map(p)) = a.get("params") {
                     let mut parts = Vec::new();
@@ -214,7 +223,11 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
             Some(p) => pr!("  parameters    {}", commas(p)),
             None => pr!("  parameters    (not stated)"),
         }
-        match meta.get("license").and_then(|l| l.get("spdx")).and_then(|v| v.as_str()) {
+        match meta
+            .get("license")
+            .and_then(|l| l.get("spdx"))
+            .and_then(|v| v.as_str())
+        {
             Some(l) => pr!("  license       {l}"),
             None => pr!("  license       (not stated)"),
         }
@@ -253,7 +266,11 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
                         .unwrap_or_default();
                     let dt = desc
                         .get("dtype")
-                        .and_then(|d| d.get("alias").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                        .and_then(|d| {
+                            d.get("alias")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or_else(|| "(structural)".into());
                     let bytes = desc
                         .get("value")
@@ -267,7 +284,11 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
                         k.as_str().unwrap_or("?").to_string(),
                         format!(
                             "[{}]",
-                            shape.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+                            shape
+                                .iter()
+                                .map(|x| x.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
                         ),
                         dt,
                         bytes,
@@ -287,7 +308,13 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
     pr!("tensors       {:<6} {:>28}", n_tensors, human(tensor_bytes));
     rows.sort_by(|a, b| b.3.cmp(&a.3));
     for (name, shape, dt, bytes) in rows.iter().take(8) {
-        pr!("  {:<44} {:<14} {:<8} {:>10}", name, shape, dt, human(*bytes));
+        pr!(
+            "  {:<44} {:<14} {:<8} {:>10}",
+            name,
+            shape,
+            dt,
+            human(*bytes)
+        );
     }
     if rows.len() > 8 {
         pr!("  … {} more (use `omni ls`)", rows.len() - 8);
@@ -306,7 +333,14 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
     pr!("graph         none (weights-only)");
     pr!("tokenizer     (not present)");
     pr!("adapters      none");
-    pr!("signatures    {}", if c.header.flags & 8 != 0 { "present" } else { "none" });
+    pr!(
+        "signatures    {}",
+        if c.header.flags & 8 != 0 {
+            "present"
+        } else {
+            "none"
+        }
+    );
 
     let stats = c.superblock.get("stats");
     pr!();
@@ -385,7 +419,10 @@ fn cmd_verify(c: &Container, _args: &[String]) -> R {
         if r.alignment_ok { "✓" } else { "✗" },
         1u64 << c.header.log2_align
     );
-    pr!("V1 index       ✓ {} entries, sorted, complete", c.index.len());
+    pr!(
+        "V1 index       ✓ {} entries, sorted, complete",
+        c.index.len()
+    );
     pr!(
         "V2 structure   ✓ canonical CBOR, schemas present on {} objects",
         c.index.iter().filter(|e| e.otype != otype::BLOB).count()
@@ -396,7 +433,10 @@ fn cmd_verify(c: &Container, _args: &[String]) -> R {
         human(r.bytes_verified)
     );
     if r.dangling.is_empty() {
-        pr!("V4 graph       ✓ {} objects reachable from root", r.reachable);
+        pr!(
+            "V4 graph       ✓ {} objects reachable from root",
+            r.reachable
+        );
     } else {
         pr!(
             "V4 graph       ⚠ {} reachable, {} dangling ref(s):",
@@ -419,7 +459,11 @@ fn cmd_verify(c: &Container, _args: &[String]) -> R {
 fn cmd_ls(c: &Container, _args: &[String]) -> R {
     pr!(
         "{:<20} {:<16} {:>12} {:>12}  {}",
-        "DIGEST", "TYPE", "OFFSET", "BYTES", "FLAGS"
+        "DIGEST",
+        "TYPE",
+        "OFFSET",
+        "BYTES",
+        "FLAGS"
     );
     let mut entries: Vec<&IndexEntry> = c.index.iter().collect();
     entries.sort_by_key(|e| e.offset);
@@ -461,7 +505,9 @@ fn cmd_dump(c: &Container, args: &[String]) -> R {
         return dump_header(c);
     }
     if let Some(i) = args.iter().position(|a| a == "--object") {
-        let want = args.get(i + 1).ok_or("--object needs a hex digest prefix")?;
+        let want = args
+            .get(i + 1)
+            .ok_or("--object needs a hex digest prefix")?;
         let matches: Vec<_> = c
             .index
             .iter()
@@ -534,12 +580,24 @@ fn dump_header(c: &Container) -> R {
 }
 
 fn hexdump(b: &[u8], base: u64, limit: usize) -> R {
-    for (i, row) in b.iter().take(limit).collect::<Vec<_>>().chunks(16).enumerate() {
+    for (i, row) in b
+        .iter()
+        .take(limit)
+        .collect::<Vec<_>>()
+        .chunks(16)
+        .enumerate()
+    {
         let off = base + (i * 16) as u64;
         let hexs: Vec<String> = row.iter().map(|x| format!("{x:02x}")).collect();
         let ascii: String = row
             .iter()
-            .map(|&&x| if (0x20..0x7f).contains(&x) { x as char } else { '.' })
+            .map(|&&x| {
+                if (0x20..0x7f).contains(&x) {
+                    x as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         let mut h = hexs.join(" ");
         if h.len() < 47 {
@@ -593,10 +651,15 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
         .and_then(as_ref_digest)
         .ok_or("tensor value is not a literal (evaluator not implemented: profile C1)")?;
     let chunklist = c.get_value(&cl)?;
-    let chunks = chunklist.get("chunks").and_then(|v| v.as_array()).unwrap_or(&[]);
+    let chunks = chunklist
+        .get("chunks")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&[]);
     let mut shown = 0usize;
     for ch in chunks {
-        let Some(d) = ch.get("r").and_then(as_ref_digest) else { continue };
+        let Some(d) = ch.get("r").and_then(as_ref_digest) else {
+            continue;
+        };
         let e = c.find(&d).ok_or("chunk missing")?;
         let bytes = c.get(&d)?;
         pr!("; chunk {} @ file offset {}", short(&d), e.offset);
@@ -666,7 +729,12 @@ fn cmd_example(args: &[String]) -> R {
     });
 
     for layer in 0..2u32 {
-        for (proj, out_dim) in [("q_proj", 64u64), ("k_proj", 32), ("v_proj", 32), ("o_proj", 64)] {
+        for (proj, out_dim) in [
+            ("q_proj", 64u64),
+            ("k_proj", 32),
+            ("v_proj", 32),
+            ("o_proj", 64),
+        ] {
             let name = format!("model.layers.{layer}.attn.{proj}.weight");
             let data = pattern(DType::BF16.packed_bytes(out_dim * hidden) as usize, &name);
             b = b.tensor(TensorSpec {
@@ -705,7 +773,11 @@ fn cmd_example(args: &[String]) -> R {
     pr!("  root           {}", short(&root));
     pr!("  objects        {}", c.index.len());
     pr!("  reachable      {}", r.reachable);
-    pr!("  verified       {} objects, {}", r.objects_verified, human(r.bytes_verified));
+    pr!(
+        "  verified       {} objects, {}",
+        r.objects_verified,
+        human(r.bytes_verified)
+    );
     pr!("  reproducible   ✓ (two packs byte-identical)");
     Ok(0)
 }

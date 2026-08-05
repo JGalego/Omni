@@ -3,8 +3,6 @@
 Every significant decision, the alternatives considered, and what each one costs.
 A specification that only lists what it chose is not reviewable.
 
----
-
 ## 1 Content addressing everywhere
 
 **Chosen:** every object is identified by the digest of its bytes; the file is a
@@ -238,7 +236,7 @@ implementations and conformance vectors are required.
 | Mutable state inside a container | breaks immutability, which everything else depends on |
 | Ordering guarantees between unrelated objects | would constrain packers with no benefit |
 
-## 17 The three things most likely to be wrong
+## 17 Where this is most likely to be wrong
 
 Stated so reviewers know where to look hardest:
 
@@ -253,7 +251,5 @@ Stated so reviewers know where to look hardest:
    overwhelming majority, publishers will keep shipping Jinja2 and the safety
    property evaporates. Gate 2 measures this explicitly and the design commits to
    reacting rather than declaring victory.
-
----
 
 **See also:** [§00 Overview](../spec/00-overview.md) · [Comparison](../design/comparison.md) · [Roadmap](../design/roadmap.md)

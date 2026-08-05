@@ -4,8 +4,6 @@ Quantization in OMNI is **a transformation, not a file type**. There is no
 "quantized model"; there are tensors whose values are expressed as
 `dequantize(integer_literal, scheme)`.
 
----
-
 ## 5.1 The quantization scheme descriptor
 
 A scheme is data consumed by the `quantize` / `dequantize` nodes (§04.7.2).
@@ -55,7 +53,7 @@ value = (q − zero) * scale
 
 ### 5.2.2 GPTQ
 
-GPTQ's *output* is uniform affine, group-wise, with two wrinkles:
+GPTQ's *output* is uniform affine, group-wise, with a couple of wrinkles:
 
 - **Column permutation** (`desc_act` / act-order). Expressed as
   `order`, a permutation tensor, applied via a `gather` node — no special case.
@@ -246,7 +244,5 @@ fails on five counts:
    evaluate whether the quantization is trustworthy.
 
 Making quantization a transformation costs one evaluator and removes all five.
-
----
 
 **Prev:** [§04 Tensors](04-tensors.md) · **Next:** [§06 Metadata & Tokenizers](06-metadata.md)

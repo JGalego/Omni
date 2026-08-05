@@ -3,8 +3,6 @@
 A specification without an executable definition of "conforming" becomes folklore
 within two years. This section is normative.
 
----
-
 ## 15.1 Validation levels
 
 `omni verify` implements a strict ladder. Each level subsumes the previous.
@@ -198,7 +196,5 @@ maintains a list; the corpus is the arbiter, not the list.
 - **Numerical equivalence between representations.** `omni verify --numeric`
   compares materializations against declared tolerances *when the model declares
   them*; it does not judge whether the tolerance is appropriate.
-
----
 
 **Prev:** [§14 Versioning](14-versioning.md) · **Index:** [README](../../README.md)

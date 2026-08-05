@@ -5,8 +5,6 @@ untrusted binary input is written **once**, in Rust, and everything else calls
 into it. Reimplementing an untrusted-input parser per language is how every media
 format acquired its CVE list.
 
----
-
 ## 1 Crate topology
 
 ```
@@ -199,7 +197,7 @@ tensors.
 
 ### 4.3 Go
 
-Two layers: a **pure-Go reader** for `C0` (no cgo — matters enormously for
+Layered: a **pure-Go reader** for `C0` (no cgo — matters enormously for
 deployment) and a cgo binding for full functionality.
 
 ```go
@@ -245,7 +243,7 @@ plus `mmap` with `MADV_WILLNEED` tuned for unified memory.
 
 ### 4.6 JavaScript / TypeScript
 
-Two builds:
+Shipped as:
 
 - **Node** (`napi-rs`): full functionality, native mmap.
 - **Browser** (`wasm-bindgen`): C0/C1 reader over `fetch` + HTTP range requests,
@@ -328,7 +326,5 @@ converges on correct writers.
   and their offsets are known before any parse, a DMA descriptor list can be
   built from the index alone and handed to `cuFileRead` — weights land in GPU
   memory without ever touching host RAM.
-
----
 
 **See also:** [CLI](cli.md) · [Performance](performance.md) · [§10 Runtime](../spec/10-runtime.md)

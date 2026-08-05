@@ -4,8 +4,6 @@ Layer L4. The canonical model is hardware-independent (§00.2). This section
 defines how a *specific* runtime on *specific* hardware gets a representation it
 can execute, and where the resulting artifacts live.
 
----
-
 ## 10.1 The negotiation problem
 
 A runtime can do some things and not others. A model can be represented in many
@@ -268,7 +266,5 @@ Because tensor dependencies are explicit and load order is declared
 (`TensorTable.order`), a runtime can begin prefill on layer 0 while layer 31 is
 still in flight. The format supplies the ordering; the runtime supplies the
 overlap.
-
----
 
 **Prev:** [§09 Training](09-training.md) · **Next:** [§11 Plugin System](11-plugins.md)
