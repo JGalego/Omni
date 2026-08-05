@@ -71,7 +71,6 @@ pub const INDEX_JSON_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 pub const CONFIG_TYPE: &str = "application/vnd.omni.manifest.v1+cbor";
 pub const PACK_TYPE: &str = "application/vnd.omni.pack.v1";
 pub const OMNI_INDEX_TYPE: &str = "application/vnd.omni.index.v1";
-pub const EMPTY_TYPE: &str = "application/vnd.oci.empty.v1+json";
 
 /// §13.5's caveat: "registries dislike very large individual blobs and very many
 /// small ones. Target 100 MB – 2 GB packs." One GiB is the reference default the
@@ -105,15 +104,6 @@ type Res<T> = Result<T, Error>;
 type Extent = (u64, u64);
 /// The pack extents and the index extent, which is always the last layer.
 type Cuts = (Vec<Extent>, Extent);
-
-/// One blob in the layout, keyed by the sha256 the registry knows it by.
-pub struct Blob {
-    /// Lower-case hex, without the `sha256:` prefix — the filename under
-    /// `blobs/sha256/`.
-    pub sha256: String,
-    pub media_type: String,
-    pub bytes: Vec<u8>,
-}
 
 /// A complete OCI image layout, in memory.
 pub struct Layout {
@@ -264,7 +254,11 @@ impl Default for ExportOpts {
 /// Maps a container onto an OCI image layout (§13.5).
 pub fn export_layout(c: &Container, opts: &ExportOpts) -> Res<Layout> {
     let (packs, index_extent) = cut_points(c, opts.pack_bytes)?;
-    let mut blobs: Vec<Blob> = Vec::new();
+    // Each blob goes straight to the path its content names, which is the only
+    // place a layout can hold it.
+    let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut put =
+        |bytes: Vec<u8>| blobs.push((format!("blobs/sha256/{}", sha256_hex(&bytes)), bytes));
 
     // The config is the OMNI Manifest object itself, which is what §13.5 says
     // and what makes `docker inspect`-shaped tooling show something meaningful.
@@ -272,11 +266,7 @@ pub fn export_layout(c: &Container, opts: &ExportOpts) -> Res<Layout> {
         .read(&c.header.root_digest)
         .map_err(|e| Error::Malformed(e.to_string()))?;
     let config = descriptor(CONFIG_TYPE, &manifest_obj, Vec::new());
-    blobs.push(Blob {
-        sha256: sha256_hex(&manifest_obj),
-        media_type: CONFIG_TYPE.into(),
-        bytes: manifest_obj,
-    });
+    put(manifest_obj);
 
     let mut layers = Vec::new();
     for (i, (a, b)) in packs.iter().enumerate() {
@@ -292,11 +282,7 @@ pub fn export_layout(c: &Container, opts: &ExportOpts) -> Res<Layout> {
                 ("dev.omni.pack", format!("{}/{}", i + 1, packs.len())),
             ],
         ));
-        blobs.push(Blob {
-            sha256: sha256_hex(piece),
-            media_type: PACK_TYPE.into(),
-            bytes: piece.to_vec(),
-        });
+        put(piece.to_vec());
     }
     let index_piece = &c.bytes[index_extent.0 as usize..index_extent.1 as usize];
     layers.push(descriptor(
@@ -304,11 +290,7 @@ pub fn export_layout(c: &Container, opts: &ExportOpts) -> Res<Layout> {
         index_piece,
         vec![("dev.omni.offset", index_extent.0.to_string())],
     ));
-    blobs.push(Blob {
-        sha256: sha256_hex(index_piece),
-        media_type: OMNI_INDEX_TYPE.into(),
-        bytes: index_piece.to_vec(),
-    });
+    put(index_piece.to_vec());
 
     // Annotations: what a registry UI can show without pulling anything, and
     // what a mirror can index on. Every value is read from the container; none
@@ -401,11 +383,7 @@ pub fn export_layout(c: &Container, opts: &ExportOpts) -> Res<Layout> {
 
     let manifest_digest = sha256_hex(&manifest_json);
     let manifest_size = manifest_json.len() as u64;
-    blobs.push(Blob {
-        sha256: manifest_digest.clone(),
-        media_type: MANIFEST_TYPE.into(),
-        bytes: manifest_json,
-    });
+    put(manifest_json);
 
     let mut files = vec![
         (
@@ -416,9 +394,7 @@ pub fn export_layout(c: &Container, opts: &ExportOpts) -> Res<Layout> {
         ),
         ("index.json".to_string(), index_json),
     ];
-    for b in &blobs {
-        files.push((format!("blobs/sha256/{}", b.sha256), b.bytes.clone()));
-    }
+    files.extend(blobs);
     Ok(Layout {
         files,
         manifest_digest,
