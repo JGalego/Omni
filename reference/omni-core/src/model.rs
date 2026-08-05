@@ -48,6 +48,9 @@ pub struct ModelBuilder {
     /// identities depend on it, so it has to be fixed before the graph is
     /// built rather than at pack time.
     pub hash: HashAlgo,
+    /// The execution graph (§07), with the rewrites the model ships so a
+    /// runtime that does not know a dialect can lower it (§07.2).
+    pub graph: Option<(crate::ir::Module, Vec<crate::ir::Rewrite>)>,
 }
 
 impl ModelBuilder {
@@ -64,7 +67,19 @@ impl ModelBuilder {
             extra_objects: Vec::new(),
             assets: Vec::new(),
             hash: HashAlgo::default(),
+            graph: None,
         }
+    }
+
+    /// Attaches an OMNI-IR module, with the rewrites a runtime may need.
+    ///
+    /// The dialects it declares are embedded as `DialectRef` objects and the
+    /// rewrites as CBOR blobs, so the container carries everything needed to
+    /// validate — and, for a dialect the runtime lacks, to lower — the graph
+    /// without fetching anything (§11.5).
+    pub fn graph(mut self, module: crate::ir::Module, rewrites: Vec<crate::ir::Rewrite>) -> Self {
+        self.graph = Some((module, rewrites));
+        self
     }
 
     pub fn hash(mut self, algo: HashAlgo) -> Self {
@@ -310,20 +325,57 @@ impl ModelBuilder {
         let table_digest = table.digest(self.hash);
         objects.push(table);
 
-        let model = Object::structure(
-            otype::MODEL,
-            &Value::map(vec![
-                ("t", Value::text("omni.core/model")),
-                ("v", Value::U(1)),
-                (
-                    "tensors",
-                    Value::Array(vec![
-                        Value::U(otype::TENSOR_TABLE as u64),
-                        Value::Bytes(table_digest.to_vec()),
-                    ]),
-                ),
-            ]),
-        );
+        // §07: the graph, its dialect definitions and its shipped rewrites.
+        let graph_ref = self.graph.as_ref().map(|(module, rewrites)| {
+            let mut module = module.clone();
+            for du in module.dialects.iter_mut() {
+                if let Some(d) = crate::ir::dialect(&du.ns) {
+                    let obj =
+                        Object::structure(otype::DIALECT_REF, &crate::ir::dialect_ref_value(d));
+                    let dg = obj.digest(self.hash);
+                    objects.push(obj);
+                    du.reference = Some((otype::DIALECT_REF, dg));
+                }
+            }
+            // §07.4.2 stores a rewrite rule as a blob ref, and so does this: the
+            // object registry of §01.6 has no rewrite type, and inventing one
+            // would need a registration this proposal has not made.
+            module.rewrites = rewrites
+                .iter()
+                .map(|w| {
+                    let obj = Object::blob(w.to_value().encode());
+                    let d = obj.digest(self.hash);
+                    objects.push(obj);
+                    (otype::BLOB, d)
+                })
+                .collect();
+            let obj = Object::structure(otype::GRAPH_MODULE, &module.to_value());
+            let d = obj.digest(self.hash);
+            objects.push(obj);
+            d
+        });
+
+        let mut model_pairs: Vec<(&str, Value)> = vec![
+            ("t", Value::text("omni.core/model")),
+            ("v", Value::U(1)),
+            (
+                "tensors",
+                Value::Array(vec![
+                    Value::U(otype::TENSOR_TABLE as u64),
+                    Value::Bytes(table_digest.to_vec()),
+                ]),
+            ),
+        ];
+        if let Some(d) = graph_ref {
+            model_pairs.push((
+                "graph",
+                Value::Array(vec![
+                    Value::U(otype::GRAPH_MODULE as u64),
+                    Value::Bytes(d.to_vec()),
+                ]),
+            ));
+        }
+        let model = Object::structure(otype::MODEL, &Value::map(model_pairs));
         let model_digest = model.digest(self.hash);
         objects.push(model);
 

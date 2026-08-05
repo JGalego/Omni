@@ -247,6 +247,75 @@ jobs:
           "$OMNI" inspect /tmp/ct.omni | grep -q 'chat template omni-ct/1'
           echo "the template renders identically, or says why not"
 
+      # §07: a model that describes its own computation, and the property no
+      # other format has — an unknown high-level op recovered from a shipped
+      # lowering rather than refused.
+      - name: The graph is self-describing, verified, and lowerable
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --graph /tmp/graph.omni
+          # A weights-only model says so, in the words §07.5 uses.
+          "$OMNI" example /tmp/weights.omni >/dev/null
+          "$OMNI" inspect /tmp/weights.omni | grep -q 'graph         none (weights-only)'
+          "$OMNI" inspect /tmp/weights.omni | grep -q 'requires a runtime with built-in support'
+          # And the synthesized one reports its level, dialects and size.
+          "$OMNI" inspect /tmp/graph.omni | grep -q 'graph         semantic'
+          # Every op type-checked against the weights it names (R-I10): the graph
+          # cannot drift from the tensors, because the check is the same one a
+          # reader runs.
+          "$OMNI" graph /tmp/graph.omni --verify | tee /tmp/gv.txt
+          grep -q '0 unchecked, 0 unknown' /tmp/gv.txt
+          "$OMNI" verify /tmp/graph.omni --level 6 | grep -q 'V5 graph       ✓'
+          "$OMNI" graph /tmp/graph.omni | grep -q 'omni.nn/attention@2'
+          # §07.9: the same graph in the fixed-layout binary encoding, which must
+          # round-trip exactly — the CLI refuses to report a size it cannot
+          # reproduce the graph from.
+          "$OMNI" graph /tmp/graph.omni --binary | grep -q '28 bytes per op'
+          # §07.4: omni.core is frozen and embedded; a reader gets the dialect
+          # definitions without fetching anything.
+          "$OMNI" graph /tmp/graph.omni --dialects | grep -q 'omni.core        v1 frozen     embedded'
+
+          # §07.2's key move: lower the shipped rules and the result is a
+          # primitive-level graph that verifies on its own terms.
+          "$OMNI" graph lower /tmp/graph.omni -o /tmp/lowered.omni | tee /tmp/low.txt
+          grep -q 'level        semantic -> primitive' /tmp/low.txt
+          grep -q 'applied      omni.nn/norm@1\[rms\]→primitive' /tmp/low.txt
+          # What could not be lowered is named, not glossed over.
+          grep -q 'still needed omni.nn/attention@2' /tmp/low.txt
+          "$OMNI" graph /tmp/lowered.omni --verify | grep -q '0 unknown'
+          # A lowered graph is derived and droppable, so V6 recomputes it from
+          # its parent and compares (§07.2, §15.1).
+          "$OMNI" verify /tmp/lowered.omni --level 6 | tee /tmp/lv.txt
+          grep -q '2 derived object(s) recomputed, 0 mismatched' /tmp/lv.txt
+          # The weights kept their identities across both rewrites: a model that
+          # gains a graph is the same weights.
+          python3 - <<'PY'
+          import subprocess
+          def tensors(path):
+              out = subprocess.run(['reference/target/release/omni', 'ls', path],
+                                   capture_output=True, text=True, check=True).stdout
+              return sorted(l.split()[0] for l in out.splitlines()[1:]
+                            if l.split()[1] == 'Blob')
+          a, b, c = tensors('/tmp/weights.omni'), tensors('/tmp/graph.omni'), tensors('/tmp/lowered.omni')
+          # The graph containers carry extra blobs (the shipped rewrite rules),
+          # so the weights are a subset rather than the whole list.
+          missing = [d for d in a if d not in b or d not in c]
+          assert not missing, f"{len(missing)} weight chunk(s) changed identity"
+          print(f"all {len(a)} data objects unchanged through synthesis and lowering")
+          PY
+
+          # A model with no graph is *indeterminate* for graph work, not invalid.
+          expect() {
+            local want=$1; shift
+            local got=0
+            "$@" >/dev/null 2>&1 || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          expect 3 "$OMNI" graph /tmp/weights.omni
+          echo "the graph verifies, lowers, and says what it cannot do"
+
       # §10: resolution is a function of the model and the capability set, so a
       # CI job can answer "will this run on our fleet?" without the fleet.
       - name: Capability negotiation and planning

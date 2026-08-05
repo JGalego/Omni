@@ -80,6 +80,18 @@ VERBS:
     repack  <file.omni> -o <out.omni> [--codec ID[:level]] [--align N]
                               Re-store the same objects under different
                               compression — every digest unchanged (§03.7)
+    graph   <file.omni> [--verify] [--dialects] [--binary]
+                              Print the OMNI-IR module (§07), verify it against
+                              the dialects and the weights, or measure the
+                              §07.9 binary encoding
+    graph   synthesize <file.omni> -o <out.omni>
+                              Build a graph from `arch.params` for a registered
+                              family, upgrading a weights-only model (§07.5)
+    graph   lower <file.omni> -o <out.omni> [--allow-approximate]
+                              Apply the shipped lowerings; the result is a
+                              derived, droppable module (§07.2)
+    graph   migrate <file.omni> -o <out.omni>
+                              Apply shipped op-version rewrites (§07.4.1)
     fsck    <file> [--rebuild -o <out.omni>]
                               Diagnose damage; rebuild by segment scan (§02.8)
     caps    [--out caps.cbor]  Emit this build's CapabilitySet (§10.2)
@@ -134,6 +146,7 @@ fn main() -> ExitCode {
         "pack" => cmd_pack(&args),
         "unpack" => cmd_unpack(&args),
         "repack" => cmd_repack(&args),
+        "graph" => cmd_graph(&args),
         // fsck must work on files that do not open, so it does not go through
         // `run`, which opens the container first.
         "fsck" => cmd_fsck(&args),
@@ -186,6 +199,82 @@ impl Store for Borrowed<'_> {
     fn has(&self, d: &Digest) -> Result<bool, omni_core::store::Error> {
         Ok(self.0.find(d).is_some())
     }
+}
+
+/// The model's execution graph, if it carries one (§07).
+fn graph_of(c: &Container) -> Result<Option<omni_core::ir::Module>, Box<dyn std::error::Error>> {
+    let manifest = c.root()?;
+    let Some(model_d) = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+    else {
+        return Ok(None);
+    };
+    let model = c.get_value(&model_d)?;
+    let Some(g) = model.get("graph").and_then(as_ref_digest) else {
+        return Ok(None);
+    };
+    Ok(Some(omni_core::ir::Module::from_value(&c.get_value(&g)?)?))
+}
+
+/// The rewrites a module ships, read from the blobs it points at (§07.7).
+fn graph_rewrites(
+    c: &Container,
+    m: &omni_core::ir::Module,
+) -> Result<Vec<omni_core::ir::Rewrite>, Box<dyn std::error::Error>> {
+    let mut out = Vec::with_capacity(m.rewrites.len());
+    for (_, d) in &m.rewrites {
+        let bytes = c.read(d)?;
+        let v = omni_core::cbor::decode(&bytes)?;
+        out.push(omni_core::ir::Rewrite::from_value(&v)?);
+    }
+    Ok(out)
+}
+
+/// A lookup from tensor name to declared shape and dtype, for R-I10.
+fn tensor_shapes(c: &Container) -> std::collections::BTreeMap<String, (Vec<u64>, DType)> {
+    let mut out = std::collections::BTreeMap::new();
+    if let Ok(table) = tensor_table(c) {
+        for (name, r) in &table.tensors {
+            if let Ok(v) = c.get_value(&r.1) {
+                if let Ok(desc) = omni_core::tensor::TensorDesc::from_value(&v) {
+                    // Only concrete shapes can be compared against a graph's
+                    // declaration; a symbolic tensor shape is not a thing §04
+                    // produces, but the type says it could be.
+                    if let Some(shape) = omni_core::expr::concrete(&desc.shape) {
+                        out.insert(name.clone(), (shape, desc.dtype.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn meta_arch_family(c: &Container) -> Option<String> {
+    let manifest = c.root().ok()?;
+    let meta_d = manifest.get("meta").and_then(as_ref_digest)?;
+    let meta = c.get_value(&meta_d).ok()?;
+    let arch = meta.get("arch")?;
+    let family = arch.get("family")?.as_str()?.to_string();
+    let dialect = arch
+        .get("dialects")
+        .and_then(|d| match d {
+            Value::Array(a) => a.first().cloned(),
+            _ => None,
+        })
+        .and_then(|d| {
+            Some(format!(
+                "{}@{}",
+                d.get("ns")?.as_str()?,
+                d.get("v")?.as_u64()?
+            ))
+        });
+    Some(match dialect {
+        Some(d) => format!("{family}  (dialect {d})"),
+        None => family,
+    })
 }
 
 /// The model's tensor table, from the manifest.
@@ -542,14 +631,38 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
         }
     }
     let adapters = c.index.iter().filter(|e| e.otype == otype::ADAPTER).count();
-    pr!(
-        "graph         {}",
-        if c.index.iter().any(|e| e.otype == otype::GRAPH_MODULE) {
-            "present"
-        } else {
-            "none (weights-only)"
+    // §07.5 spells out what to print in both cases, and the weights-only case is
+    // the interesting one: it is an honest statement of a real limitation.
+    match graph_of(c) {
+        Ok(Some(m)) => {
+            let dialects: Vec<String> = m
+                .dialects
+                .iter()
+                .map(|d| format!("{}@{}", d.ns, d.version))
+                .collect();
+            pr!(
+                "graph         {} · {} · {} function(s), {} ops",
+                m.level.name(),
+                dialects.join(" "),
+                m.functions.len(),
+                commas(m.op_count() as u64)
+            );
+            if !m.rewrites.is_empty() {
+                pr!(
+                    "  rewrites     {} shipped (§07.7), so an unknown op is recoverable",
+                    m.rewrites.len()
+                );
+            }
         }
-    );
+        Ok(None) => {
+            pr!("graph         none (weights-only)");
+            if let Some(fam) = meta_arch_family(c) {
+                pr!("  architecture {fam}");
+                pr!("  portability  requires a runtime with built-in support for this family");
+            }
+        }
+        Err(e) => pr!("graph         ⚠ {e}"),
+    }
     pr!(
         "adapters      {}",
         if adapters == 0 {
@@ -789,6 +902,52 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         }
     }
 
+    // V5 also covers the execution graph: §15.1 puts "IR verification" at this
+    // level, and a graph whose declared types contradict its ops is exactly the
+    // kind of error that otherwise surfaces as garbage at inference time.
+    if level >= 5 {
+        match graph_of(c) {
+            Ok(None) => {}
+            Ok(Some(module)) => {
+                let shipped = graph_rewrites(c, &module).unwrap_or_default();
+                let shapes = tensor_shapes(c);
+                let lookup = |name: &str| shapes.get(name).cloned();
+                let cx = omni_core::ir::Context {
+                    tensor: Some(&lookup),
+                    rewrites: &shipped,
+                };
+                let r = omni_core::ir::verify(&module, &cx);
+                let bad = r.findings.iter().filter(|f| f.is_invalid()).count();
+                let unknown = r.findings.len() - bad;
+                invalid += bad;
+                indeterminate += unknown;
+                pr!(
+                    "V5 graph       {} {} ops in {} function(s): {} type-checked, {} unchecked, \
+                     {} unknown",
+                    if bad > 0 {
+                        "✗"
+                    } else if unknown > 0 {
+                        "⚠"
+                    } else {
+                        "✓"
+                    },
+                    commas(r.ops as u64),
+                    r.functions,
+                    r.checked,
+                    r.unchecked,
+                    r.unknown
+                );
+                for f in r.findings.iter().take(10) {
+                    pr!("     {f}");
+                }
+            }
+            Err(e) => {
+                pr!("V5 graph       ⚠ {e}");
+                indeterminate += 1;
+            }
+        }
+    }
+
     // V6 — derived. Recompute every object a reader is allowed to throw away
     // and compare (§00.5's droppability invariant is only true if it holds).
     if level >= 6 {
@@ -848,6 +1007,36 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
                     .filter(|f| f.contains("compiled"))
                     .count();
                 wrong += bad;
+            }
+        }
+        // §07.2: a lowered graph is derived and droppable, so V6 recomputes it —
+        // apply the shipped rules to the parent module and compare the result
+        // with what the container claims.
+        if let Ok(Some(module)) = graph_of(c) {
+            if let Some((_, parent)) = module.lowered_from {
+                checked += 1;
+                match c
+                    .get_value(&parent)
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| omni_core::ir::Module::from_value(&v).map_err(|e| e.to_string()))
+                {
+                    Ok(from) => {
+                        let rules = graph_rewrites(c, &from).unwrap_or_default();
+                        let rules = if rules.is_empty() {
+                            omni_core::ir::shipped_lowerings()
+                        } else {
+                            rules
+                        };
+                        let (mut again, _) = omni_core::ir::apply_rewrites(&from, &rules, false);
+                        again.lowered_from = module.lowered_from;
+                        if again.to_value().encode() != module.to_value().encode() {
+                            wrong += 1;
+                        }
+                    }
+                    // The parent is not in this container: incomplete, not wrong
+                    // (§01.4).
+                    Err(_) => indeterminate += 1,
+                }
             }
         }
         invalid += wrong;
@@ -1599,6 +1788,403 @@ fn codec_flag(args: &[String]) -> Result<Option<omni_core::codec::Codec>, String
     Ok(Some(c))
 }
 
+/// `omni graph` — the §07 verb: print, verify, synthesize, lower, migrate.
+fn cmd_graph(args: &[String]) -> R {
+    use omni_core::ir;
+    let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let (mode, path) = match sub {
+        "synthesize" | "lower" | "migrate" => (sub, args.get(2)),
+        _ => ("show", args.get(1)),
+    };
+    let Some(path) = path else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let c = Container::open(std::fs::read(path)?)?;
+
+    // Everything below needs the module, except synthesis, which exists because
+    // there is not one.
+    if mode == "synthesize" {
+        let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+            prr!("omni: graph synthesize needs -o <out.omni>\n");
+            return Ok(2);
+        };
+        if graph_of(&c)?.is_some() {
+            prr!("omni: {path} already carries a graph\n");
+            return Ok(2);
+        }
+        let manifest = c.root()?;
+        let Some(meta_d) = manifest.get("meta").and_then(as_ref_digest) else {
+            prr!("omni: {path} has no metadata, so there are no arch params to work from\n");
+            return Ok(3);
+        };
+        let meta = c.get_value(&meta_d)?;
+        let Some(arch) = meta.get("arch") else {
+            prr!("omni: {path} declares no architecture family (§06.2)\n");
+            return Ok(3);
+        };
+        let family = arch.get("family").and_then(|x| x.as_str()).unwrap_or("");
+        let params = arch.get("params").cloned().unwrap_or(Value::map(vec![]));
+        let table = tensor_table(&c)?;
+        let names: Vec<String> = table.tensors.keys().cloned().collect();
+        let module = match ir::synthesize(family, &params, &names) {
+            Ok(m) => m,
+            Err(e) => {
+                prr!("omni: {e}\n");
+                return Ok(3);
+            }
+        };
+        // Rebuild the container with the graph attached. Every tensor object is
+        // reused verbatim, so the weights keep their digests.
+        let bytes = attach_graph(&c, &module, &ir::shipped_lowerings())?;
+        std::fs::write(out, &bytes)?;
+        let fresh = Container::open(bytes.clone())?;
+        pr!("synthesized a graph for {family}");
+        pr!("  functions      {}", module.functions.len());
+        pr!("  ops            {}", commas(module.op_count() as u64));
+        pr!("  level          {}", module.level.name());
+        pr!("  wrote          {out} ({})", human(bytes.len() as u64));
+        pr!("  objects        {}", fresh.index.len());
+        return Ok(0);
+    }
+
+    let Some(module) = graph_of(&c)? else {
+        prr!("omni: {path} is weights-only; there is no graph to work with (§07.5)\n");
+        prr!("      `omni graph synthesize` can build one for a registered family\n");
+        return Ok(3);
+    };
+    let shipped = graph_rewrites(&c, &module)?;
+
+    match mode {
+        "lower" | "migrate" => {
+            let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+                prr!("omni: graph {mode} needs -o <out.omni>\n");
+                return Ok(2);
+            };
+            let rules: Vec<ir::Rewrite> = if mode == "migrate" {
+                ir::shipped_migrations()
+            } else if shipped.is_empty() {
+                ir::shipped_lowerings()
+            } else {
+                shipped.clone()
+            };
+            let allow = args.iter().any(|a| a == "--allow-approximate");
+            let (lowered, applied) = ir::apply_rewrites(&module, &rules, allow);
+            if applied.applied.is_empty() {
+                pr!("no rule applied; the module is unchanged");
+                for (name, why) in &applied.refused {
+                    pr!("  refused      {name}: {why}");
+                }
+                return Ok(if applied.refused.is_empty() { 0 } else { 3 });
+            }
+            let mut lowered = lowered;
+            if mode == "lower" {
+                // The derived module records what it came from, which is what
+                // makes it droppable (§07.2, §00.5).
+                let g = module_digest(&c)?;
+                lowered.lowered_from = Some((otype::GRAPH_MODULE, g));
+            }
+            let bytes = attach_graph(&c, &lowered, &shipped)?;
+            std::fs::write(out, &bytes)?;
+            pr!("{mode}ed {path} -> {out}");
+            for (name, n) in &applied.applied {
+                pr!("  applied      {name} ×{n}");
+            }
+            for (name, why) in &applied.refused {
+                pr!("  refused      {name}: {why}");
+            }
+            pr!(
+                "  level        {} -> {}",
+                module.level.name(),
+                lowered.level.name()
+            );
+            pr!(
+                "  ops          {} -> {}",
+                commas(module.op_count() as u64),
+                commas(lowered.op_count() as u64)
+            );
+            if applied.approximate {
+                pr!("  soundness    numeric-approximate: results may differ (§07.7)");
+            }
+            // What is left above the primitive level, so the report says what a
+            // runtime still has to understand rather than implying it is done.
+            let mut left: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for (_, op) in lowered.ops() {
+                if op.dialect != "omni.core" && op.dialect != "omni.tensor" {
+                    *left.entry(op.qualified()).or_default() += 1;
+                }
+            }
+            for (op, n) in &left {
+                pr!("  still needed {op} ×{n} — no shipped rule covers it");
+            }
+            Ok(0)
+        }
+        _ => {
+            if args.iter().any(|a| a == "--dialects") {
+                for d in &module.dialects {
+                    let known = ir::dialect(&d.ns);
+                    pr!(
+                        "{:<16} v{} {:<10} {}",
+                        d.ns,
+                        d.version,
+                        match known {
+                            Some(k) if k.frozen => "frozen",
+                            Some(_) => "known",
+                            None => "unknown",
+                        },
+                        match &d.reference {
+                            Some(r) => format!("embedded {}", short(c.header.hash, &r.1)),
+                            None => "not embedded".into(),
+                        }
+                    );
+                    if let Some(k) = known {
+                        for op in k.ops {
+                            pr!("    {:<16} versions {:?}", op.name, op.versions);
+                        }
+                    }
+                }
+                return Ok(0);
+            }
+            if args.iter().any(|a| a == "--binary") {
+                // §07.9: the same graph in the fixed-layout encoding, which is
+                // what a 100k-op module would actually ship as.
+                let mut total = 0usize;
+                for (name, f) in &module.functions {
+                    let blob = ir::binary::encode(f);
+                    let back = ir::binary::decode(&blob)?;
+                    if back != *f {
+                        prr!("omni: the binary encoding of @{name} does not round-trip\n");
+                        return Ok(1);
+                    }
+                    let cbor = f.to_value().encode().len();
+                    pr!(
+                        "@{name:<14} {} ops   cbor {}   binary {}   ({:.0} % )",
+                        commas(count_ops(f) as u64),
+                        human(cbor as u64),
+                        human(blob.len() as u64),
+                        100.0 * blob.len() as f64 / cbor as f64
+                    );
+                    total += blob.len();
+                }
+                pr!(
+                    "record         {} bytes per op (§07.9)",
+                    ir::binary::OP_RECORD
+                );
+                pr!("total          {}", human(total as u64));
+                return Ok(0);
+            }
+            if args.iter().any(|a| a == "--verify") {
+                let shapes = tensor_shapes(&c);
+                let lookup = |name: &str| shapes.get(name).cloned();
+                let cx = ir::Context {
+                    tensor: Some(&lookup),
+                    rewrites: &shipped,
+                };
+                let r = ir::verify(&module, &cx);
+                let invalid = r.findings.iter().filter(|f| f.is_invalid()).count();
+                let unknown = r.findings.len() - invalid;
+                pr!(
+                    "{} {} function(s), {} ops: {} type-checked, {} unchecked, {} unknown, \
+                     {} recoverable by a shipped lowering",
+                    if invalid > 0 {
+                        "✗"
+                    } else if unknown > 0 {
+                        "⚠"
+                    } else {
+                        "✓"
+                    },
+                    r.functions,
+                    commas(r.ops as u64),
+                    r.checked,
+                    r.unchecked,
+                    r.unknown,
+                    r.recoverable
+                );
+                for f in &r.findings {
+                    pr!("  {f}");
+                }
+                return Ok(if invalid > 0 {
+                    1
+                } else if unknown > 0 {
+                    3
+                } else {
+                    0
+                });
+            }
+            print!("{}", module.print());
+            Ok(0)
+        }
+    }
+}
+
+fn count_ops(f: &omni_core::ir::Function) -> usize {
+    fn walk(r: &omni_core::ir::Region) -> usize {
+        r.blocks
+            .iter()
+            .map(|b| {
+                b.ops.len()
+                    + b.ops
+                        .iter()
+                        .map(|o| o.regions.iter().map(walk).sum::<usize>())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+    walk(&f.body)
+}
+
+/// The digest of the container's current GraphModule object.
+fn module_digest(c: &Container) -> Result<Digest, Box<dyn std::error::Error>> {
+    let manifest = c.root()?;
+    let model_d = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+        .ok_or("no model asset")?;
+    let model = c.get_value(&model_d)?;
+    model
+        .get("graph")
+        .and_then(as_ref_digest)
+        .ok_or_else(|| "this container has no graph".into())
+}
+
+/// Rewrites a container with a different (or a first) graph attached.
+///
+/// Every object other than the ones on the path from the manifest to the graph
+/// is reused byte for byte, so the weights keep their digests: a model that gains
+/// a graph is the same weights with a new manifest, and §12.6 records that
+/// relationship rather than pretending nothing changed.
+fn attach_graph(
+    c: &Container,
+    module: &omni_core::ir::Module,
+    rewrites: &[omni_core::ir::Rewrite],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use omni_core::ir;
+    let hash = c.header.hash;
+    let mut objects = container_objects(c)?;
+    let mut module = module.clone();
+
+    for du in module.dialects.iter_mut() {
+        if let Some(d) = ir::dialect(&du.ns) {
+            let obj = omni_core::Object::structure(otype::DIALECT_REF, &ir::dialect_ref_value(d));
+            du.reference = Some((otype::DIALECT_REF, obj.digest(hash)));
+            objects.push(obj);
+        }
+    }
+    module.rewrites = rewrites
+        .iter()
+        .map(|w| {
+            let obj = omni_core::Object::blob(w.to_value().encode());
+            let d = obj.digest(hash);
+            objects.push(obj);
+            (otype::BLOB, d)
+        })
+        .collect();
+    let graph_obj = omni_core::Object::structure(otype::GRAPH_MODULE, &module.to_value());
+    let graph_d = graph_obj.digest(hash);
+    objects.push(graph_obj);
+
+    // The Model object gains (or replaces) its `graph` ref, and everything above
+    // it in the DAG is rebuilt because content addressing leaves no choice.
+    let manifest_v = c.root()?;
+    let model_d = manifest_v
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+        .ok_or("no model asset")?;
+    let model_v = c.get_value(&model_d)?;
+    let mut pairs: Vec<(Value, Value)> = match &model_v {
+        Value::Map(m) => m.clone(),
+        _ => return Err("the model asset is not a map".into()),
+    };
+    pairs.retain(|(k, _)| k.as_str() != Some("graph"));
+    pairs.push((
+        Value::text("graph"),
+        Value::Array(vec![
+            Value::U(otype::GRAPH_MODULE as u64),
+            Value::Bytes(graph_d.to_vec()),
+        ]),
+    ));
+    let new_model = omni_core::Object::structure(otype::MODEL, &Value::Map(pairs));
+    let new_model_d = new_model.digest(hash);
+    objects.push(new_model);
+
+    let mut mpairs: Vec<(Value, Value)> = match &manifest_v {
+        Value::Map(m) => m.clone(),
+        _ => return Err("the manifest is not a map".into()),
+    };
+    for (k, v) in mpairs.iter_mut() {
+        if k.as_str() == Some("assets") {
+            if let Value::Map(assets) = v {
+                for (slot, target) in assets.iter_mut() {
+                    if slot.as_str() == Some("model") {
+                        *target = Value::Array(vec![
+                            Value::U(otype::MODEL as u64),
+                            Value::Bytes(new_model_d.to_vec()),
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+    let new_manifest = omni_core::Object::structure(otype::MANIFEST, &Value::Map(mpairs));
+    let root = new_manifest.digest(hash);
+    objects.push(new_manifest);
+
+    // The old manifest, model and graph are no longer reachable; dropping them
+    // keeps the result a clean pack rather than an accumulating one.
+    let reachable = reachable_from(&objects, &root, hash);
+    objects.retain(|o| reachable.contains(&o.digest(hash)));
+
+    let opts = PackOptions {
+        hash,
+        log2_align: c.header.log2_align,
+        ..Default::default()
+    };
+    Ok(pack(&objects, &root, &opts)?)
+}
+
+/// Digests reachable from `root` within a set of objects.
+fn reachable_from(
+    objects: &[omni_core::Object],
+    root: &Digest,
+    hash: HashAlgo,
+) -> std::collections::BTreeSet<Digest> {
+    let mut by_digest: std::collections::BTreeMap<Digest, &omni_core::Object> =
+        std::collections::BTreeMap::new();
+    for o in objects {
+        by_digest.insert(o.digest(hash), o);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![*root];
+    while let Some(d) = stack.pop() {
+        if !seen.insert(d) {
+            continue;
+        }
+        let Some(o) = by_digest.get(&d) else { continue };
+        if o.otype == otype::BLOB {
+            continue;
+        }
+        if let Ok(v) = omni_core::cbor::decode(&o.payload) {
+            collect_refs(&v, &mut stack);
+        }
+    }
+    seen
+}
+
+fn collect_refs(v: &Value, out: &mut Vec<Digest>) {
+    if let Some(d) = as_ref_digest(v) {
+        out.push(d);
+    }
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| collect_refs(x, out)),
+        Value::Map(m) => m.iter().for_each(|(_, x)| collect_refs(x, out)),
+        Value::Tag(_, inner) => collect_refs(inner, out),
+        _ => {}
+    }
+}
+
 /// `omni repack <file.omni> -o <out.omni>` — change the storage codec without
 /// changing what the container *is*.
 ///
@@ -2020,7 +2606,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn cmd_example(args: &[String]) -> R {
     // Options come in two shapes: valueless switches, and `--name value`
     // pairs whose value must not be mistaken for the positional output path.
-    const SWITCHES: &[&str] = &["--quantized", "--tokenizer", "--chat-template"];
+    const SWITCHES: &[&str] = &["--quantized", "--tokenizer", "--chat-template", "--graph"];
     let tune: Option<u64> = flag(args, "--tune").and_then(|s| s.parse().ok());
     let mut positional = Vec::new();
     let mut i = 1;
@@ -2153,6 +2739,25 @@ fn cmd_example(args: &[String]) -> R {
     }
     if args.iter().any(|a| a == "--chat-template") {
         b = add_chat_template(b);
+    }
+    if args.iter().any(|a| a == "--graph") {
+        // §07.5's upgrade path, exercised end to end: the graph is synthesized
+        // from the same arch params the metadata carries, so it cannot drift
+        // from the model it describes.
+        let params = Value::map(
+            b.arch_params
+                .iter()
+                .map(|(k, v)| (Box::leak(k.clone().into_boxed_str()) as &str, v.clone()))
+                .collect(),
+        );
+        let names: Vec<String> = b.tensors.iter().map(|t| t.name.clone()).collect();
+        match omni_core::ir::synthesize("transformer.decoder", &params, &names) {
+            Ok(m) => b = b.graph(m, omni_core::ir::shipped_lowerings()),
+            Err(e) => {
+                prr!("omni: could not synthesize the example graph: {e}\n");
+                return Ok(1);
+            }
+        }
     }
     let (objs, root) = b.build();
     let opts = PackOptions {

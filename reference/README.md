@@ -22,6 +22,10 @@ $ ./target/release/omni adapter check base.omni lora.omni
 $ ./target/release/omni example --tokenizer tok.omni
 $ ./target/release/omni verify tok.omni --tokenizer     # runs its §06.7.1 vectors
 $ ./target/release/omni tokenize tok.omni --text "hello"
+$ ./target/release/omni example --graph graph.omni      # a synthesized OMNI-IR graph
+$ ./target/release/omni graph graph.omni                # print the module (§07)
+$ ./target/release/omni graph graph.omni --verify        # V5 IR rules, against the weights
+$ ./target/release/omni graph lower graph.omni -o low.omni   # apply the shipped lowerings
 $ ./target/release/omni pack model.omnid -o packed.omni --codec zstd:9
 $ ./target/release/omni repack packed.omni -o smaller.omni --codec bitshuffle+zstd:9:2
 $ ./target/release/omni example --chat-template ct.omni
@@ -33,8 +37,8 @@ $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, model builder | §01–§06, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, model builder | §01–§08, §10, §12, §13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · graph · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -101,6 +105,19 @@ implemented:
   as an uncompressed one, the superblock names the codecs a reader will meet and
   reports stored bytes apart from logical ones, and `omni repack` changes the
   storage codec while proving every digest survived
+- §07 OMNI-IR: the `GraphModule`/`Function`/`Region`/`Block`/`Op` structure in
+  SSA form, the type system with symbolic dimensions and per-function
+  constraints, the dialect mechanism with per-op versions and attribute defaults
+  (`omni.core` frozen, plus `omni.tensor`, `omni.nn`, `omni.quant`, `omni.io`),
+  `DialectRef` objects embedded in the container, shape and dtype inference for
+  the ops this build knows, verification under rules R-I01–R-I11, rewrites as
+  data (§07.7) driving both op-version migration and dialect lowering, the
+  fixed-layout binary op array of §07.9, and `graph synthesize` (§07.5), which
+  turns a weights-only transformer into a self-describing one from its
+  `arch.params`. §07.2's load-bearing claim is exercised end to end: a runtime
+  that knows only `omni.tensor` applies the lowering the *model* ships and
+  proceeds, and `omni graph lower` names every op no shipped rule covers rather
+  than pretending it lowered everything
 - §10 capability negotiation: capability sets with the three-valued support of
   §10.2, candidate enumeration, the deterministic resolver of §10.5 under all
   five objectives, budget retry, and the informative failures of §10.5.2
@@ -131,7 +148,7 @@ implemented:
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §07 OMNI-IR · §09 training state
+- §09 training state
 - §11 WASM plugins
 - §03.7's MAY-level codecs `lz4`, `brotli`, `xz`, `ans-lut` and the two lossy
   ones: reported as unsupported rather than half-decoded · §13 HTTP/OCI
@@ -142,7 +159,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-284 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+306 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -230,14 +247,28 @@ dates on both sides of the epoch, that a runaway product of template and input
 size hits the budget instead of running, that a cached AST disagreeing with its
 source is reported, that a capability declared but never read is reported, and
 that a container claiming Jinja2 as its template *language* is refused —
-executing one is the problem §06.9 exists to fix. And that an object whose `t`
+executing one is the problem §06.9 exists to fix. And, for OMNI-IR: that a module round-trips
+through canonical CBOR with every type kind present, that a value defined twice,
+a use with no definition, a missing entry function, an undeclared dialect, a
+declared type that contradicts inference, a wrong operand count, a missing
+required attribute, a region that does not terminate, an effect token used twice,
+contradictory dimension constraints and a constant that disagrees with the tensor
+it names are each invalid and each name their rule; that an op from an unknown
+dialect is *indeterminate* rather than invalid, and not even that when the model
+ships a lowering for it; that the shipped lowerings produce primitive graphs
+which verify on their own terms while a causal attention — which cannot be
+lowered without ops for building a mask — keeps its high-level form and is
+reported; that an approximate rewrite is refused unless allowed; that the §07.9
+binary encoding round-trips nested regions and ten thousand ops and refuses a
+truncated one; and that synthesis fails by naming the weight it wanted rather
+than by inventing one. And that an object whose `t`
 contradicts the index's otype is invalid (R-O02).
 Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 284 passed; 0 failed
+test result: ok. 306 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

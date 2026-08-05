@@ -101,6 +101,25 @@ conformance violation.
   declares `allow_unmatched`.
 - R-A03 Shapes and `require` constraints hold for every match.
 
+### Graph / OMNI-IR (V5)
+
+- R-I01 Every value is defined exactly once within its function (SSA).
+- R-I02 Every use refers to a value already in scope, i.e. defined earlier in the
+  same block or in an enclosing one.
+- R-I03 `entry` names a function the module defines.
+- R-I04 Every op's dialect is declared in the module's `dialects`.
+- R-I05 The op exists in that dialect at that version, or a shipped rewrite
+  (§07.7) migrates or lowers it. Failing both is *indeterminate*, not invalid.
+- R-I06 Declared result types equal the types inferred from the operands.
+- R-I07 Operand and result counts, required attributes, region counts and block
+  terminators match the op's contract.
+- R-I08 A `token` value is consumed exactly once, so the effect order it
+  expresses is total (§07.3.2).
+- R-I09 The function's symbolic-dimension constraints are satisfiable.
+- R-I10 A `core.constant` naming a tensor agrees with that tensor's declared
+  shape and dtype.
+- R-I11 A module carrying `lowered_from` is below the `semantic` level.
+
 ### Security (V7)
 
 - R-S01 Signature covers the manifest with `attestations` removed.

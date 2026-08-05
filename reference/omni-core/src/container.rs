@@ -204,6 +204,7 @@ pub mod otype {
             CHUNK_LIST => "omni.tensor/chunklist",
             CODEBOOK => "omni.tensor/codebook",
             GRAPH_MODULE => "omni.ir/module",
+            DIALECT_REF => "omni.ir/dialect",
             TOKENIZER => "omni.tok/tokenizer",
             CHAT_TEMPLATE => "omni.tok/chat-template",
             ADAPTER => "omni.adapt/adapter",
