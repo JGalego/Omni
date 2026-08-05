@@ -32,6 +32,7 @@ pub mod cbor;
 pub mod container;
 pub mod crc32c;
 pub mod dtype;
+pub mod layout;
 pub mod model;
 pub mod recover;
 pub mod sha256;
@@ -44,6 +45,7 @@ pub use container::{
     otype, pack, seg, verify, Container, Digest, HashAlgo, Object, PackOptions, Report,
 };
 pub use dtype::{DType, FloatFmt, Round};
+pub use layout::Layout;
 pub use model::{ModelBuilder, TensorSpec};
 pub use sha256::hex;
 pub use store::{ContainerStore, DirStore, MemoryStore, Store, WritableStore};
