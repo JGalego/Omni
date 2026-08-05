@@ -157,7 +157,8 @@ pub fn dims(shape: &[u64]) -> Shape {
     shape.iter().map(|d| Dim::N(*d)).collect()
 }
 
-fn shape_value(shape: &[Dim]) -> Value {
+/// Encodes a shape (§03.3 tag 1004's untagged form).
+pub fn shape_to_value(shape: &[Dim]) -> Value {
     Value::Array(
         shape
             .iter()
@@ -170,7 +171,8 @@ fn shape_value(shape: &[Dim]) -> Value {
     )
 }
 
-fn parse_shape(v: &Value) -> Res<Shape> {
+/// Parses a shape, tagged or untagged.
+pub fn parse_shape_value(v: &Value) -> Res<Shape> {
     let v = match v {
         Value::Tag(crate::cbor::TAG_SHAPE, inner) => inner.as_ref(),
         other => other,
@@ -461,7 +463,8 @@ fn ref_value(r: &Ref) -> Value {
     Value::Array(vec![Value::U(r.0 as u64), Value::Bytes(r.1.to_vec())])
 }
 
-fn parse_ref(v: &Value) -> Res<Ref> {
+/// Parses a typed reference `[otype, digest]`, tagged or untagged.
+pub fn parse_ref_value(v: &Value) -> Res<Ref> {
     let v = match v {
         Value::Tag(crate::cbor::TAG_REF, inner) => inner.as_ref(),
         other => other,
@@ -1420,7 +1423,7 @@ impl Expr {
             } => {
                 p.push(("chunks", ref_value(chunks)));
                 p.push(("dtype", dtype.to_value()));
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
                 if layout != &Layout::default() {
                     p.push(("layout", layout.to_value()));
                 }
@@ -1439,7 +1442,7 @@ impl Expr {
                     p.push(("digest", Value::Bytes(d.to_vec())));
                 }
                 p.push(("dtype", dtype.to_value()));
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
             }
             Expr::Full {
                 value,
@@ -1448,7 +1451,7 @@ impl Expr {
             } => {
                 p.push(("value", value.to_value()));
                 p.push(("dtype", dtype.to_value()));
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
             }
             Expr::Arange {
                 start,
@@ -1459,7 +1462,7 @@ impl Expr {
                 p.push(("start", start.to_value()));
                 p.push(("step", step.to_value()));
                 p.push(("dtype", dtype.to_value()));
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
             }
             Expr::Eye { rows, cols, dtype } => {
                 p.push(("rows", Value::U(*rows)));
@@ -1489,11 +1492,11 @@ impl Expr {
                 ));
                 p.push(("seed", Value::U(*seed)));
                 p.push(("dtype", dtype.to_value()));
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
             }
             Expr::Reshape { x, shape } | Expr::Expand { x, shape } => {
                 p.push(("x", x.to_value()));
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
             }
             Expr::Permute { x, perm } => {
                 p.push(("x", x.to_value()));
@@ -1646,7 +1649,7 @@ impl Expr {
                         }
                     }
                 }
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
                 p.push(("dtype", dtype.to_value()));
                 p.push(("fill", fill.to_value()));
             }
@@ -1708,7 +1711,7 @@ impl Expr {
                 ));
                 p.push(("attrs", attrs.clone()));
                 p.push(("crit", Value::Bool(*crit)));
-                p.push(("shape", shape_value(shape)));
+                p.push(("shape", shape_to_value(shape)));
                 p.push(("dtype", dtype.to_value()));
                 if let Some(f) = fallback {
                     p.push(("fallback", f.to_value()));
@@ -1752,7 +1755,7 @@ impl Expr {
             .map_err(Error::Type)
         };
         let shape = |key: &'static str| -> Res<Shape> {
-            parse_shape(
+            parse_shape_value(
                 v.get(key)
                     .ok_or_else(|| Error::Type(format!("{op}: missing `{key}`")))?,
             )
@@ -1802,7 +1805,7 @@ impl Expr {
         };
         Ok(match op {
             "literal" => Expr::Literal {
-                chunks: parse_ref(
+                chunks: parse_ref_value(
                     v.get("chunks")
                         .ok_or_else(|| Error::Type("literal: missing `chunks`".into()))?,
                 )?,
@@ -2525,7 +2528,7 @@ impl<'a> Ctx<'a> {
             .ok_or_else(|| Error::Type("ChunkList has no `chunks`".into()))?;
         let mut out = Vec::with_capacity(total as usize);
         for c in chunks {
-            let cr = parse_ref(
+            let cr = parse_ref_value(
                 c.get("r")
                     .ok_or_else(|| Error::Type("chunk entry has no `r`".into()))?,
             )?;

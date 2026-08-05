@@ -42,6 +42,7 @@ pub mod recover;
 pub mod sha256;
 pub mod sparse;
 pub mod store;
+pub mod tensor;
 
 pub use bao::BaoTree;
 pub use blake3::blake3 as blake3_256;

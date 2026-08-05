@@ -69,7 +69,11 @@ implemented:
   codebooks with reproducible construction recipes, double quantization, and the
   R-T04 consistency check; the catalogue of §05.2 is covered by tests built only
   from core nodes
-- §15.1 validation levels V0–V4
+- §04.2 reader-side `TensorTable` and `TensorDesc` views, with the V5 tensor
+  rules: R-T01 (declared type equals inferred type), R-T02 (chunk sizing),
+  R-T03, R-T04, R-T05, R-T06, R-T07 and R-M01
+- §15.1 validation levels V0–V4 (V5 rules are implemented; the CLI ladder still
+  stops at V4)
 
 What is **not** implemented, and is reported as such rather than faked:
 
@@ -82,7 +86,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-132 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+147 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -114,12 +118,15 @@ sparsity, that each scheme densifies correctly and that a malformed one — an
 index out of range, a non-monotone `indptr`, a 3-in-4 group in a 2:4 tensor, a
 values array that disagrees with its mask — is refused; and, for selectors,
 that glob captures index adapter tensors correctly and that catastrophic regex
-backtracking hits a step budget instead of hanging. Every
+backtracking hits a step budget instead of hanging; and, for the V5 rules, that
+a declared shape, chunk total, layout, quantization scheme or statistic that
+disagrees with the value is reported as invalid while an unimplemented plugin or
+an absent object is reported as indeterminate. Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 132 passed; 0 failed
+test result: ok. 147 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
