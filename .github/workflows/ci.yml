@@ -409,6 +409,160 @@ jobs:
           PY
           echo "the plugin host runs what the model shipped, and only that"
 
+      # Phase 1's premise: OMNI is worth nothing if it cannot absorb the
+      # existing world without losing anything. safetensors is the format with
+      # the least excuse, and the capability matrix calls its round-trip
+      # lossless — so the round-trip is run, against a file this repository did
+      # not write.
+      - name: safetensors round-trips through OMNI without losing a byte
+        run: |
+          OMNI=reference/target/release/omni
+
+          # A safetensors file built from the format's own definition in Python,
+          # so the fixture is not this implementation's opinion of itself.
+          python3 - <<'PY_ST'
+          import json, struct
+          tensors, data = {}, b""
+          def add(name, dtype, shape, payload):
+              global data
+              tensors[name] = {"dtype": dtype, "shape": shape,
+                               "data_offsets": [len(data), len(data) + len(payload)]}
+              data += payload
+          add("model.embed_tokens.weight", "F32", [64, 8],
+              b"".join(struct.pack("<f", (i % 97) * 0.125) for i in range(512)))
+          add("model.layers.0.attn.q_proj.weight", "BF16", [8, 8],
+              b"".join(struct.pack("<H", (i * 37) % 0x4000) for i in range(64)))
+          add("model.norm.weight", "F64", [8],
+              b"".join(struct.pack("<d", i / 3) for i in range(8)))
+          add("position_ids", "I64", [4], b"".join(struct.pack("<q", -i) for i in range(4)))
+          add("mask", "BOOL", [8], bytes([1, 0, 1, 1, 0, 0, 1, 0]))
+          add("bytes", "U8", [4], bytes([0, 127, 128, 255]))
+          tensors["__metadata__"] = {"format": "pt", "trained_on": "a fixture",
+                                     "note": "a key with no OMNI schema"}
+          h = json.dumps(tensors).encode()
+          open("/tmp/src.safetensors", "wb").write(struct.pack("<Q", len(h)) + h + data)
+          print(f"fixture: {len(tensors) - 1} tensors, {len(data)} bytes of payload")
+          PY_ST
+
+          # I4: the importer verifies every tensor against the source rather than
+          # asserting that it copied them.
+          "$OMNI" import safetensors /tmp/src.safetensors -o /tmp/imported.omni \
+            | tee /tmp/imp.txt
+          grep -q 'verified byte-for-byte against the source' /tmp/imp.txt
+          grep -q '6 verified' /tmp/imp.txt
+          # I1: nothing invented. safetensors declares no license and no
+          # architecture, so neither is written.
+          grep -q 'license — field omitted' /tmp/imp.txt
+          grep -q 'arch.family — field omitted' /tmp/imp.txt
+          # I2: the metadata keys with no schema are preserved, and named.
+          grep -q '__metadata__.note — free-form key with no OMNI schema' /tmp/imp.txt
+          # The result is a valid container, and it carries the report (I3).
+          "$OMNI" verify /tmp/imported.omni --level 6 | grep -q '^valid'
+          "$OMNI" ls /tmp/imported.omni | grep -q Provenance
+
+          # E1: what an export would cost, without writing anything.
+          set +e
+          "$OMNI" export safetensors /tmp/imported.omni --plan > /tmp/plan.txt 2>&1
+          rc=$?
+          set -e
+          # 3 = indeterminate: the export is possible but not lossless.
+          test "$rc" = 3
+          grep -q 'lossless     no' /tmp/plan.txt
+          grep -q 'provenance' /tmp/plan.txt
+          # E2: a lossy export without consent writes nothing at all. The target
+          # is removed first so the check is about this run rather than about
+          # whatever was in the directory.
+          rm -f /tmp/nope.safetensors
+          set +e
+          "$OMNI" export safetensors /tmp/imported.omni -o /tmp/nope.safetensors \
+            > /tmp/refuse.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          test ! -f /tmp/nope.safetensors
+          grep -q 'allow-lossy' /tmp/refuse.txt
+
+          "$OMNI" export safetensors /tmp/imported.omni -o /tmp/out.safetensors \
+            --allow-lossy | tee /tmp/exp.txt
+          # E3: the loss report travels with the artifact.
+          test -f /tmp/out.safetensors.loss.json
+          python3 -c "
+          import json
+          r = json.load(open('/tmp/out.safetensors.loss.json'))
+          assert r['lossless'] is False and r['lost'], r
+          assert r['tensors'] == 6, r
+          print('loss report names', len(r['lost']), 'lost item(s)')"
+
+          # The claim in the capability matrix, checked by a reader that is not
+          # this implementation: every tensor identical in dtype, shape and bytes,
+          # and every source metadata key recovered from where I2 kept it.
+          python3 - <<'PY_CHECK'
+          import json, struct
+          def read(p):
+              b = open(p, "rb").read()
+              n = struct.unpack("<Q", b[:8])[0]
+              h, d = json.loads(b[8:8 + n]), b[8 + n:]
+              t = {k: (v["dtype"], tuple(v["shape"]),
+                       d[v["data_offsets"][0]:v["data_offsets"][1]])
+                   for k, v in h.items() if k != "__metadata__"}
+              return t, h.get("__metadata__", {})
+          a, ma = read("/tmp/src.safetensors")
+          b, mb = read("/tmp/out.safetensors")
+          assert set(a) == set(b), f"tensor sets differ: {set(a) ^ set(b)}"
+          for k in a:
+              assert a[k][0] == b[k][0], f"{k}: dtype {a[k][0]} -> {b[k][0]}"
+              assert a[k][1] == b[k][1], f"{k}: shape {a[k][1]} -> {b[k][1]}"
+              assert a[k][2] == b[k][2], f"{k}: bytes differ"
+          for k, v in ma.items():
+              assert mb.get(k) == v, f"__metadata__.{k} lost: {v!r} -> {mb.get(k)!r}"
+          print(f"{len(a)} tensors and {len(ma)} metadata keys survived exactly")
+          PY_CHECK
+
+          # And back again: importing the export must reach the same tensor
+          # objects, because the identities are the digests (§01.2).
+          "$OMNI" import safetensors /tmp/out.safetensors -o /tmp/again.omni >/dev/null
+          python3 - <<'PY_DIGESTS'
+          import subprocess
+          def blobs(p):
+              out = subprocess.run(["reference/target/release/omni", "ls", p],
+                                   capture_output=True, text=True, check=True).stdout
+              return sorted(r.split()[0] for r in out.splitlines()[1:]
+                            if r.strip() and r.split()[1] == "Blob")
+          a, b = blobs("/tmp/imported.omni"), blobs("/tmp/again.omni")
+          assert a == b, f"tensor object digests changed:\n{a}\n{b}"
+          print(f"all {len(a)} tensor objects kept their digests through the round trip")
+          PY_DIGESTS
+
+          # A header that lies is refused rather than followed into someone
+          # else's bytes. The extent is the field that matters: it is what a
+          # reader would trust.
+          python3 - <<'PY_BAD'
+          import json, struct
+          h = json.dumps({"x": {"dtype": "F32", "shape": [4],
+                                "data_offsets": [0, 8]}}).encode()
+          open("/tmp/bad.safetensors", "wb").write(
+              struct.pack("<Q", len(h)) + h + bytes(8))
+          PY_BAD
+          rm -f /tmp/bad.omni
+          set +e
+          "$OMNI" import safetensors /tmp/bad.safetensors -o /tmp/bad.omni \
+            > /tmp/bad.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          test ! -f /tmp/bad.omni
+          grep -qi 'claims\|malformed' /tmp/bad.txt
+          echo "a safetensors header that disagrees with its buffer is refused"
+
+          # An unknown format is a refusal that says what this build does, not a
+          # silent no-op.
+          set +e
+          "$OMNI" import gguf /tmp/src.safetensors -o /tmp/x.omni > /tmp/nofmt.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 2
+          grep -q 'no importer for `gguf`' /tmp/nofmt.txt
+
       # §13: the unit of transfer is the object. A container read over HTTP by
       # range, with the round trips counted — a transport claim nothing counts
       # is not a claim.

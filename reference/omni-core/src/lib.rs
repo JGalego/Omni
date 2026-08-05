@@ -4,7 +4,9 @@
 //! CBOR encoding (§03), object model (§01) and the tensor layer (§04): the
 //! numeric type algebra, layouts, and the tensor expression algebra with its
 //! typing, identity, evaluation and range pushdown, plus the quantization
-//! sparsity and quantization scheme catalogues of §04.6 and §05.
+//! sparsity and quantization scheme catalogues of §04.6 and §05. Above those:
+//! OMNI-IR (§07), training state (§09), a WebAssembly plugin host (§11.6),
+//! streaming transport (§13), and safetensors import and export.
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
 //!
@@ -25,7 +27,9 @@
 //! mapping of §13.5, `omni mount` (§13.9) and `omni serve` are unimplemented.
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
-//! host of §11.6 runs the core instruction set but not SIMD.
+//! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
+//! in `docs/design/import-export.md` §3, [`safetensors`] is the one that is
+//! implemented; a request to import another is refused by name.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -44,6 +48,7 @@ pub mod dtype;
 pub mod ed25519;
 pub mod expr;
 pub mod ir;
+pub mod json;
 pub mod layout;
 pub mod model;
 pub mod pattern;
@@ -51,6 +56,7 @@ pub mod plan;
 pub mod plugin;
 pub mod quant;
 pub mod recover;
+pub mod safetensors;
 pub mod sha256;
 pub mod sha512;
 pub mod sign;

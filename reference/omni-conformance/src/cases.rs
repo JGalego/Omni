@@ -64,6 +64,7 @@ fn base(hash: HashAlgo, align: u8) -> (Vec<u8>, Vec<Object>, Digest) {
             axes: None,
             semantic: "weight",
             data: (0..8 * 8 * 4).map(|i| (i % 251) as u8).collect(),
+            layout: None,
         })
         .build();
     let opts = PackOptions {

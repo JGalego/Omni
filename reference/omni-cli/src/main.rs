@@ -114,6 +114,17 @@ VERBS:
                               Read a container over HTTP by range (§13.4.2),
                               coalescing requests and verifying every object;
                               https is refused rather than downgraded
+    import  safetensors <in.safetensors> -o <out.omni> [--name N]
+                              [--license SPDX] [--arch FAMILY] [--codec C]
+                              Absorb another format and report the fidelity:
+                              every tensor verified against the source, nothing
+                              invented, the unrepresentable preserved (§1.1)
+    export  safetensors <in.omni> [-o <out.safetensors>] [--plan]
+                              [--allow-lossy]
+                              Emit into another format. --plan says what would
+                              be lost without writing; a lossy export needs
+                              --allow-lossy, and the loss report is written
+                              beside the artifact (§1.2)
     log     <file.omni> [--with <prev.omni>]…
                               The checkpoint chain: step, loss, and what each
                               one costs over its parent (§09.6)
@@ -200,6 +211,8 @@ fn main() -> ExitCode {
         // extension it writes.
         "index" | "idx" => cmd_idx(&args),
         "fetch" => cmd_fetch(&args),
+        "import" => cmd_import(&args),
+        "export" => cmd_export(&args),
         "-h" | "--help" | "help" => cmd_help(),
         "--version" => cmd_version(),
         other => {
@@ -3685,6 +3698,192 @@ fn cmd_fetch(args: &[String]) -> R {
     Ok(0)
 }
 
+/// `omni import` — absorb another format, and say what that cost.
+///
+/// The verb prints the fidelity report rather than hiding it, because §1.1's I3
+/// makes the report part of the import rather than a diagnostic: an import whose
+/// losses are not visible is an import nobody can trust.
+fn cmd_import(args: &[String]) -> R {
+    use omni_core::safetensors::{import, ImportOpts};
+    let (Some(format), Some(input)) = (args.get(1), args.get(2)) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    if format != "safetensors" {
+        prr!(
+            "omni: no importer for `{format}`. This build imports safetensors; \
+             `docs/design/import-export.md` §3 lists what the others would need\n"
+        );
+        return Ok(2);
+    }
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+
+    let bytes = std::fs::read(input)?;
+    let opts = ImportOpts {
+        // I1 again, at the CLI boundary: the name is the caller's to give, and
+        // the file's stem is the caller giving it. Nothing else is inferred.
+        name: flag(args, "--name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("imported/{}", stem(input))),
+        source_path: input.clone(),
+        hash: if flag(args, "--hash") == Some("sha256") {
+            HashAlgo::Sha256
+        } else {
+            HashAlgo::Blake3_256
+        },
+        chunk_size: flag(args, "--chunk")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 20),
+        license: flag(args, "--license").map(str::to_string),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+    };
+    let imported = import(&bytes, &opts)?;
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: opts.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+
+    let r = &imported.report;
+    pr!("imported {input} -> {out}");
+    pr!(
+        "  source       safetensors, {}, {}",
+        human(r.source_size),
+        short(opts.hash, &r.source_digest)
+    );
+    pr!(
+        "  tensors      {} verified byte-for-byte against the source ({}) — I4",
+        commas(r.verified_tensors as u64),
+        human(r.verified_bytes)
+    );
+    pr!("  represented  {}", r.represented.join(", "));
+    if r.unrepresented.is_empty() {
+        pr!("  unrepresented  nothing");
+    } else {
+        pr!("  unrepresented");
+        for n in &r.unrepresented {
+            pr!("     {} — {} ({})", n.item, n.reason, n.action);
+        }
+    }
+    // The honest counterpart of "importers preserve everything": what this one
+    // chose not to invent.
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    pr!(
+        "  size         {} -> {} ({:.1} %)",
+        human(r.source_size),
+        human(packed.len() as u64),
+        100.0 * packed.len() as f64 / r.source_size.max(1) as f64
+    );
+    pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni export` — emit into another format, refusing to lie about what was lost.
+fn cmd_export(args: &[String]) -> R {
+    use omni_core::safetensors::{export, plan};
+    let (Some(format), Some(input)) = (args.get(1), args.get(2)) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    if format != "safetensors" {
+        prr!(
+            "omni: no exporter for `{format}`. This build exports safetensors; \
+             `docs/design/import-export.md` §5.2 lists the others\n"
+        );
+        return Ok(2);
+    }
+    let c = Container::open(std::fs::read(input)?)?;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let table = tensor_table(&c)?;
+    let manifest = c.root()?;
+    let descs = |d: &Digest| {
+        c.get_value(d)
+            .ok()
+            .and_then(|v| TensorDesc::from_value(&v).ok())
+    };
+
+    // E1: the plan first, with no bytes written, so a refusal costs nothing.
+    let p = plan(&ctx, &table, &manifest, &descs)?;
+    pr!("{input} -> safetensors");
+    pr!(
+        "  tensors      {}, {} of payload",
+        commas(p.tensors.len() as u64),
+        human(p.bytes)
+    );
+    if p.lossless() {
+        pr!("  lossless     yes");
+    } else {
+        pr!(
+            "  lossless     no — {} thing(s) would be lost:",
+            p.loss.len()
+        );
+        for l in &p.loss {
+            pr!("     {} — {}", l.item, l.reason);
+        }
+    }
+    if args.iter().any(|a| a == "--plan") {
+        return Ok(if p.lossless() { 0 } else { 3 });
+    }
+
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let allow = args.iter().any(|a| a == "--allow-lossy");
+    // I2's preservation, cashed in: keys an earlier import kept in a Foreign
+    // object go back into the header they came from.
+    let objects = |d: &Digest| c.get_value(d).ok();
+    let kept = omni_core::safetensors::preserved_metadata(&manifest, &objects);
+    if !kept.is_empty() {
+        pr!(
+            "  recovered    {} `__metadata__` key(s) an earlier import preserved",
+            kept.len()
+        );
+    }
+    // E2: no silent degradation. The plan above already said what would be lost,
+    // so this is a refusal the caller can act on rather than a surprise.
+    let bytes = match export(&ctx, &table, &p, &descs, &kept, allow) {
+        Ok(b) => b,
+        Err(omni_core::safetensors::Error::Lossy(m)) => {
+            prr!("omni: {m}\n");
+            prr!("omni: pass --allow-lossy to write it anyway\n");
+            return Ok(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    std::fs::write(out, &bytes)?;
+    pr!("wrote {out}  {}", human(bytes.len() as u64));
+
+    // E3: the loss report travels with the artifact.
+    let report_path = format!("{out}.loss.json");
+    std::fs::write(
+        &report_path,
+        p.loss_report(&c.header.root_digest, c.header.hash),
+    )?;
+    pr!("wrote {report_path}");
+    Ok(0)
+}
+
+/// The file-name stem, for turning `model.safetensors` into a default name.
+fn stem(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
 fn cmd_bench(args: &[String]) -> R {
     let n: usize = flag(args, "--objects")
         .and_then(|s| s.parse().ok())
@@ -3897,6 +4096,7 @@ fn cmd_example(args: &[String]) -> R {
         axes: Some(vec!["vocab".into(), "hidden".into()]),
         semantic: "embedding",
         data: embed.clone(),
+        layout: None,
     });
     b = b.tensor(TensorSpec {
         name: "lm_head.weight".into(),
@@ -3905,6 +4105,7 @@ fn cmd_example(args: &[String]) -> R {
         axes: Some(vec!["vocab".into(), "hidden".into()]),
         semantic: "weight",
         data: embed,
+        layout: None,
     });
 
     for layer in 0..2u32 {
@@ -3936,6 +4137,7 @@ fn cmd_example(args: &[String]) -> R {
                 axes: Some(vec!["out_features".into(), "in_features".into()]),
                 semantic: "weight",
                 data,
+                layout: None,
             });
         }
         let name = format!("model.layers.{layer}.norm.weight");
@@ -3947,6 +4149,7 @@ fn cmd_example(args: &[String]) -> R {
             axes: Some(vec!["hidden".into()]),
             semantic: "scale",
             data,
+            layout: None,
         });
     }
 

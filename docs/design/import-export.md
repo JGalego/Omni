@@ -243,6 +243,37 @@ tensors expressed over the existing ones and a new manifest. The result is a
 int4-GPTQ, int4-AWQ and MXFP4 variants of a model stores the base once plus five
 small manifests and the quantization parameters — instead of five full copies.
 
+## 6.1 What the reference implementation has
+
+safetensors, both directions, with the contracts above implemented rather than
+described:
+
+```console
+$ omni import safetensors model.safetensors -o model.omni
+$ omni export safetensors model.omni --plan            # E1: what would be lost
+$ omni export safetensors model.omni -o out.safetensors --allow-lossy
+```
+
+The importer verifies every tensor against the source before it claims to have
+copied it (I4), records the source digest (I6), omits every field safetensors does
+not state instead of guessing it (I1), preserves `__metadata__` keys with no OMNI
+schema in a `Foreign` object (I2) — and the exporter puts them back — and attaches
+the fidelity report as a `Provenance` object (I3). `--plan` computes the loss
+report without writing bytes (E1); a lossy export without `--allow-lossy` writes
+nothing at all (E2); the report is written to `<out>.loss.json` (E3); and CI
+checks E4 against a fixture built from the format's own definition, comparing
+every tensor's dtype, shape and bytes, and the tensor object digests either side
+of the round trip.
+
+One detail worth naming, because it is the kind of thing that quietly corrupts a
+mask: safetensors stores a boolean in a whole byte, while §04.3 gives `bool` one
+bit. The importer keeps the dtype `bool` and describes the storage with §04.4's
+`packed` layout — one element per 8-bit word — rather than importing masks as
+`u8`. The type stays true and the bytes round-trip.
+
+Every other row of the matrix in §3 is unimplemented. A request to import one is
+refused by name, with a pointer to this document, rather than half-attempted.
+
 ## 7 Implementation topology
 
 ```

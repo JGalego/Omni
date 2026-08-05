@@ -1714,6 +1714,7 @@ mod tests {
                     axes: None,
                     semantic: "weight",
                     data: vec![0u8; 16],
+                    layout: None,
                 })
                 .build();
             let c = Container::open(
@@ -1757,6 +1758,7 @@ mod tests {
                     axes: None,
                     semantic: "weight",
                     data,
+                    layout: None,
                 })
                 .build()
         }

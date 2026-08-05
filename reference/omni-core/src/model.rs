@@ -22,6 +22,16 @@ pub struct TensorSpec {
     pub axes: Option<Vec<String>>,
     pub semantic: &'static str,
     pub data: Vec<u8>,
+    /// How `data` is arranged. `None` means dense row-major, which is what
+    /// almost every tensor is.
+    ///
+    /// It exists for the ones that are not, and importing is where they come
+    /// from: safetensors stores a boolean as a whole byte, so a `bool` tensor
+    /// from that format is `Packed { elems_per_word: 1, word_bits: 8 }` and not
+    /// the bit-per-element packing §04.3 gives `bool` by default. Writing it as
+    /// `u8` instead would change the tensor's type to make the arithmetic
+    /// convenient.
+    pub layout: Option<crate::layout::Layout>,
 }
 
 pub struct ModelBuilder {
@@ -210,7 +220,12 @@ impl ModelBuilder {
         for t in &self.tensors {
             let numel: u64 = t.shape.iter().product();
             params_total += numel;
-            let expected = t.dtype.packed_bytes(numel);
+            let layout = t.layout.clone().unwrap_or_default();
+            // R-T02 is the layout's question, not the dtype's: a packed layout
+            // stores a different number of bytes for the same elements.
+            let expected = layout
+                .stored_bytes(&t.shape, &t.dtype)
+                .unwrap_or_else(|| t.dtype.packed_bytes(numel));
             assert_eq!(
                 expected,
                 t.data.len() as u64,
@@ -262,13 +277,7 @@ impl ModelBuilder {
                     Value::Array(t.shape.iter().map(|d| Value::U(*d)).collect()),
                 ),
                 ("dtype", t.dtype.to_value()),
-                (
-                    "layout",
-                    Value::map(vec![
-                        ("k", Value::text("strided")),
-                        ("order", Value::text("row-major")),
-                    ]),
-                ),
+                ("layout", layout.to_value()),
                 ("semantic", Value::text(t.semantic)),
                 (
                     "value",
@@ -540,6 +549,7 @@ mod tests {
                 axes: Some(vec!["out_features".into(), "in_features".into()]),
                 semantic: "weight",
                 data,
+                layout: None,
             })
             .build();
 

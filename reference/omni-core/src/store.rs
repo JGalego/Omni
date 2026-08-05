@@ -592,6 +592,7 @@ mod tests {
                 axes: None,
                 semantic: "weight",
                 data: (0..64 * 64 * 4).map(|i| (i % 251) as u8).collect(),
+                layout: None,
             })
             .build()
     }
@@ -1053,6 +1054,7 @@ mod file_store_tests {
                 axes: None,
                 semantic: "weight",
                 data,
+                layout: None,
             })
             .build();
         let bytes = pack(&objects, &root, &PackOptions::default()).unwrap();

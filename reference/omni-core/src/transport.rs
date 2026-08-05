@@ -879,6 +879,7 @@ mod tests {
                 axes: None,
                 semantic: "weight",
                 data: (0..256u32).map(|i| (i % 251) as u8).collect(),
+                layout: None,
             })
             .tensor(TensorSpec {
                 name: "b".into(),
@@ -887,6 +888,7 @@ mod tests {
                 axes: None,
                 semantic: "weight",
                 data: (0..128u32).map(|i| (i % 97) as u8).collect(),
+                layout: None,
             })
             .build();
         Container::open(pack(&objs, &root, &PackOptions::default()).unwrap()).unwrap()
@@ -1121,6 +1123,7 @@ mod tests {
                 axes: None,
                 semantic: "weight",
                 data: (0..262144u32).map(|i| (i % 251) as u8).collect(),
+                layout: None,
             })
             .build();
         let c = Container::open(pack(&objs, &root, &PackOptions::default()).unwrap()).unwrap();
@@ -1291,6 +1294,7 @@ mod tests {
                     axes: None,
                     semantic: "weight",
                     data: vec![9u8; 64],
+                    layout: None,
                 })
                 .build();
             Container::open(pack(&objs, &root, &PackOptions::default()).unwrap()).unwrap()
@@ -1307,6 +1311,7 @@ mod tests {
                     axes: None,
                     semantic: "weight",
                     data: (0..256u32).map(|i| (i % 241) as u8).collect(),
+                    layout: None,
                 })
                 .tensor(TensorSpec {
                     name: "b".into(),
@@ -1315,6 +1320,7 @@ mod tests {
                     axes: None,
                     semantic: "weight",
                     data: (0..128u32).map(|i| (i % 89) as u8).collect(),
+                    layout: None,
                 })
                 .build();
             Container::open(pack(&objs, &root, &PackOptions::default()).unwrap()).unwrap()
@@ -1485,6 +1491,7 @@ mod tests {
                 axes: None,
                 semantic: "weight",
                 data: (0..2048u32).map(|i| (i / 64) as u8).collect(),
+                layout: None,
             })
             .build();
         let c = Container::open(

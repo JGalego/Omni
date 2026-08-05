@@ -44,8 +44,8 @@ Deliverables:
 - Quantization schemes: affine, sym, codebook, nested; GPTQ/AWQ/NF4/MX/GGUF-K
   structural mappings.
 - Sparsity schemes.
-- `omni-import-safetensors`, `-gguf`, `-gptq`, `-awq`, `-peft`.
-- `omni-export-safetensors`, `-gguf`.
+- `omni-import-safetensors` ✅, `-gguf`, `-gptq`, `-awq`, `-peft`.
+- `omni-export-safetensors` ✅, `-gguf`.
 - `omni delta`, `omni adapter`, `omni convert`.
 - Conformance corpus: `numeric/`, `roundtrip/`, `valid/features`.
 
@@ -55,14 +55,21 @@ base/fine-tune pairs. Differential test against `llama.cpp`'s dequantization for
 every GGUF K-quant type: zero mismatches. *If the structural GGUF mapping cannot
 be made bit-exact, §05.2.4 is wrong and gets revised.*
 
-**Gate 1 status.** The *format* side is done and tested: the dtype algebra, the
-layouts, the expression algebra with range pushdown, the sparsity and
+**Gate 1 status.** Not met. The *format* side is done and tested: the dtype
+algebra, the layouts, the expression algebra with range pushdown, the sparsity and
 quantization catalogues, `omni delta` and `omni adapter`, and — as of the codec
-work — `zstd` in both directions, checked against libzstd on every push. The
-*importers and exporters do not exist*, so nothing in this gate is met: there is
-no round-trip claim to make on 100 real models, no delta-size study, and no
-differential test against `llama.cpp`. The catalogue being implemented is
-necessary for that work and is not a substitute for it.
+work — `zstd` in both directions, checked against libzstd on every push. **One
+importer and one exporter now exist**: safetensors, in both directions, with the
+I1–I6 and E1–E4 contracts of [`import-export.md`](import-export.md) implemented
+rather than summarised — every tensor verified byte-for-byte against the source on
+import, every loss named before an export writes anything, and a round-trip whose
+tensor digests are checked against a fixture built from the format's own
+definition in Python. That is one row of a 25-row capability matrix. GGUF, PyTorch,
+ONNX, PEFT, GPTQ and AWQ do not exist, so the gate's actual asks are still
+untouched: no round-trip over 100 real models, no delta-size study over 50 real
+pairs, and no differential test against `llama.cpp`'s dequantization. The
+catalogue and the one importer are necessary for that work and are not a
+substitute for it.
 
 ## Phase 2 — Prove the semantic layer (months 7–12)
 

@@ -42,14 +42,16 @@ $ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_
 $ ./target/release/omni index model.omni                # the §13.4.1 index sidecar
 $ ./target/release/omni fetch http://host/model.omni --sidecar model.omni.idx --all
 $ ./target/release/omni strip model.omni --weights -o catalogue.omni   # §13.8
+$ ./target/release/omni import safetensors w.safetensors -o w.omni  # with a report
+$ ./target/release/omni export safetensors w.omni --plan            # what it would cost
 ```
 
 ## What is here
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store with the `.omni.idx` sidecar, model builder | §01–§13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR, training state, a WebAssembly host, an HTTP range store with the `.omni.idx` sidecar, a JSON codec, safetensors import and export, model builder | §01–§13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -191,6 +193,24 @@ implemented:
   describes every object, holds no weights, and is *incomplete* rather than
   invalid — `omni fetch`, `omni index` and `omni strip --weights`, with the round
   trips counted so the claim is checkable
+- **safetensors, both directions**, with the importer and exporter contracts of
+  `docs/design/import-export.md` §1 implemented rather than paraphrased: every
+  tensor verified byte-for-byte against the source before the import claims to
+  have copied it (I4), the source digest recorded (I6), every field safetensors
+  does not state left *absent* rather than guessed (I1), `__metadata__` keys with
+  no OMNI schema preserved in a `Foreign` object and put back on export (I2), and
+  the fidelity report attached as a `Provenance` object (I3). On the way out:
+  `--plan` computes the loss report without writing a byte (E1), a lossy export
+  without `--allow-lossy` writes nothing (E2), and the report is written beside
+  the artifact (E3). Includes the detail that quietly corrupts masks — the format
+  stores a boolean in a byte where §04.3 gives `bool` a bit, so the import keeps
+  the dtype and describes the storage with §04.4's `packed` layout instead of
+  turning masks into `u8`
+- A strict JSON codec (RFC 8259), because the formats OMNI absorbs are described
+  in JSON and there are no dependencies to read it: bounded depth, exact
+  integers past 2^53, and refusal of trailing commas, comments, `NaN`, lone
+  surrogates and duplicate keys — a permissive reader is how two implementations
+  come to disagree about one file
 - §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
   reached through `omni sign --verify`
 
@@ -204,6 +224,10 @@ What is **not** implemented, and is reported as such rather than faked:
   rather than silently downgraded
 - The OCI mapping of §13.5, `omni mount` (§13.9) and `omni serve`. Each needs
   something outside this crate's reach — a registry client, FUSE, a server
+- Every importer and exporter except safetensors. The capability matrix in
+  `docs/design/import-export.md` §3 has 25 rows and this build implements one of
+  them; GGUF, PyTorch, ONNX, PEFT, GPTQ and AWQ do not exist, and a request for
+  one is refused by name rather than half-attempted
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
@@ -215,7 +239,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-351 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+370 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -364,14 +388,34 @@ same module truncated at every length, are errors rather than panics; and, end t
 end, that a plugin manifest round-trips, that a missing or unrunnable module is
 reported rather than hidden, and that the example module computes
 `x × f` through the host and refuses the argument count it was not written for.
-And that an object whose `t`
+And, for JSON: that every scalar kind
+parses, that an integer past 2^53 survives exactly rather than becoming a float,
+that escapes and surrogate pairs decode, that a truncated header is an error at
+every length, that malformed UTF-8 is refused rather than replaced, that nesting
+is bounded through both the array and the object arm, that the writer is
+deterministic and its output re-reads to the same value, and that thirty
+non-JSON inputs — trailing commas, comments, `NaN`, `+1`, `01`, lone surrogates,
+duplicate keys — are each an error. And, for safetensors: that every one of the
+format's fifteen dtypes maps onto exactly one OMNI dtype and back; that a header
+which disagrees with its buffer is refused, whether by a wrong extent, an
+overlap, a gap, trailing bytes, an offset past the end, an absurd declared header
+length, or truncation at any length; that a boolean mask keeps the dtype `bool`
+and the byte-per-element layout, validates under R-T02, and exports as `BOOL`
+byte-for-byte; that an import verifies every tensor against the source and
+reports what it checked, invents no field the file does not state, preserves the
+metadata keys it cannot model, and is reproducible and addressed by its source
+digest; that a preserved key comes back on export while a `Foreign` object from
+another format is not raided for keys; that an export refuses without consent and
+names each thing it would lose; that a dtype safetensors cannot spell is
+reported before it is widened to F32; and that export-then-import reproduces
+every tensor object digest. And that an object whose `t`
 contradicts the index's otype is invalid (R-O02).
 Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 351 passed; 0 failed
+test result: ok. 370 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

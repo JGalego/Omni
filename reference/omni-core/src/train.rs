@@ -1563,6 +1563,7 @@ mod tests {
             axes: None,
             semantic: "weight",
             data: weight,
+            layout: None,
         });
         // The moment lives in its own table, reachable only from the training
         // state — which is what makes it strippable.
