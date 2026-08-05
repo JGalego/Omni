@@ -20,10 +20,79 @@ pub const SEG_HEADER_SIZE: usize = 32;
 pub const IDX_HEADER_SIZE: usize = 64;
 pub const IDX_ENTRY_SIZE: usize = 64;
 
-/// Digest algorithm codes (§01.3). This implementation is SHA-256 only; see
-/// `sha256.rs` for why.
+/// Multicodec digest algorithm codes (§01.3).
 pub const HASH_SHA256: u8 = 0x12;
 pub const HASH_BLAKE3_256: u8 = 0x1e;
+
+/// The digest algorithm a container is built with (§01.3, §03.5.1).
+///
+/// A container declares exactly one primary algorithm in its header, and every
+/// digest in it — object identities, the root, the superblock digest, index
+/// entries — uses that one. Mixing algorithms within a container would make
+/// content addressing ambiguous: the same bytes would have two identities.
+///
+/// Agility lives *between* containers, not inside one. §12.11's hash-migration
+/// story is "rehash the objects, rewrite the graph"; it costs one pass over the
+/// data and no re-uploads, precisely because the algorithm is a single header
+/// field rather than a per-object choice.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum HashAlgo {
+    /// §03.5.1's default: parallel, tree-structured, Bao-verifiable.
+    #[default]
+    Blake3_256,
+    /// Mandatory for interoperability with OCI, Sigstore and SLSA.
+    Sha256,
+}
+
+impl HashAlgo {
+    pub fn code(self) -> u8 {
+        match self {
+            HashAlgo::Blake3_256 => HASH_BLAKE3_256,
+            HashAlgo::Sha256 => HASH_SHA256,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<HashAlgo> {
+        match code {
+            HASH_BLAKE3_256 => Some(HashAlgo::Blake3_256),
+            HASH_SHA256 => Some(HashAlgo::Sha256),
+            _ => None,
+        }
+    }
+
+    /// The multihash-style name used in digest prefixes and CLI output.
+    pub fn name(self) -> &'static str {
+        match self {
+            HashAlgo::Blake3_256 => "blake3-256",
+            HashAlgo::Sha256 => "sha2-256",
+        }
+    }
+
+    /// The short prefix printed before a digest, as in `b3:1a2b…`.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            HashAlgo::Blake3_256 => "b3",
+            HashAlgo::Sha256 => "sha2",
+        }
+    }
+
+    pub fn digest(self, data: &[u8]) -> Digest {
+        match self {
+            HashAlgo::Blake3_256 => crate::blake3::blake3(data),
+            HashAlgo::Sha256 => sha256(data),
+        }
+    }
+
+    /// Parses a CLI-facing name. Accepts both the multihash name and the
+    /// common short form.
+    pub fn parse(s: &str) -> Option<HashAlgo> {
+        match s {
+            "blake3" | "blake3-256" | "b3" => Some(HashAlgo::Blake3_256),
+            "sha256" | "sha2-256" | "sha-256" => Some(HashAlgo::Sha256),
+            _ => None,
+        }
+    }
+}
 
 pub mod otype {
     pub const BLOB: u16 = 0x0000;
@@ -100,6 +169,9 @@ pub mod oflags {
     pub const STRUCTURAL: u8 = 1 << 7;
 }
 
+/// §03.5.3 context string for the derived file UUID.
+const UUID_CONTEXT: &str = "omni/1.0 uuid";
+
 pub type Digest = [u8; 32];
 
 #[derive(Debug)]
@@ -170,8 +242,10 @@ impl Object {
         }
     }
 
-    pub fn digest(&self) -> Digest {
-        sha256(&self.payload)
+    /// The object's identity under `algo` (§03.5.2: a data object hashes its
+    /// logical bytes, a structure object its canonical CBOR).
+    pub fn digest(&self, algo: HashAlgo) -> Digest {
+        algo.digest(&self.payload)
     }
 }
 
@@ -182,6 +256,8 @@ pub struct PackOptions {
     pub creator: String,
     /// Zero timestamps and derive the UUID from the root digest (§01.10).
     pub reproducible: bool,
+    /// The container's primary digest algorithm (§03.5.1).
+    pub hash: HashAlgo,
 }
 
 impl Default for PackOptions {
@@ -190,6 +266,7 @@ impl Default for PackOptions {
             log2_align: 12,
             creator: format!("omni-rs/{}", env!("CARGO_PKG_VERSION")),
             reproducible: true,
+            hash: HashAlgo::default(),
         }
     }
 }
@@ -217,7 +294,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     // Deduplicate by digest and order deterministically by (otype, digest).
     let mut uniq: BTreeMap<(u16, Digest), &Object> = BTreeMap::new();
     for o in objects {
-        uniq.insert((o.otype, o.digest()), o);
+        uniq.insert((o.otype, o.digest(opts.hash)), o);
     }
     let ordered: Vec<&Object> = uniq.values().copied().collect();
     let (blobs, structs): (Vec<&Object>, Vec<&Object>) =
@@ -226,7 +303,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     // Fixed-point layout: the superblock's size affects the offsets it records.
     let mut sb_reserve = 4096usize;
     let (layout, sb_bytes) = loop {
-        let l = compute_layout(&structs, &blobs, align, sb_reserve);
+        let l = compute_layout(&structs, &blobs, align, sb_reserve, opts.hash);
         let sb = superblock_value(&l, root, align, opts).encode();
         let need = round_up(SEG_HEADER_SIZE + sb.len(), 64);
         if need <= sb_reserve {
@@ -239,9 +316,12 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
 
     // --- header ---------------------------------------------------------
     let uuid = if opts.reproducible {
-        derive_uuid(root)
+        derive_uuid(opts.hash, root)
     } else {
-        derive_uuid(&sha256(&layout.file_size.to_le_bytes()))
+        derive_uuid(
+            opts.hash,
+            &opts.hash.digest(&layout.file_size.to_le_bytes()),
+        )
     };
     let mut flags = hflags::SEALED | hflags::FRONT_SB;
     if structs.iter().any(|o| o.otype == otype::SIGNATURE) {
@@ -254,7 +334,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     out[13] = opts.log2_align;
     out[14..16].copy_from_slice(&(HEADER_SIZE as u16).to_le_bytes());
     out[16..32].copy_from_slice(&uuid);
-    out[32] = HASH_SHA256;
+    out[32] = opts.hash.code();
     out[33] = 0; // profile: core
     out[34] = 32; // digest_len
     out[35] = 0;
@@ -279,7 +359,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     for p in &layout.structs {
         let o = uniq
             .values()
-            .find(|o| o.digest() == p.digest && o.otype == p.otype)
+            .find(|o| o.digest(opts.hash) == p.digest && o.otype == p.otype)
             .expect("placed object exists");
         let rel = p.offset as usize - layout.obj_payload_off;
         obj_payload[rel..rel + o.payload.len()].copy_from_slice(&o.payload);
@@ -294,7 +374,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     for p in &layout.blobs {
         let o = uniq
             .values()
-            .find(|o| o.digest() == p.digest && o.otype == otype::BLOB)
+            .find(|o| o.digest(opts.hash) == p.digest && o.otype == otype::BLOB)
             .expect("placed blob exists");
         let rel = p.offset as usize - layout.blob_payload_off;
         blob_payload[rel..rel + o.payload.len()].copy_from_slice(&o.payload);
@@ -305,7 +385,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
         write_segment(&mut out, pad.0, seg::PAD, 4, &vec![0u8; pad.1]);
     }
 
-    let idx = build_index(&layout);
+    let idx = build_index(&layout, opts.hash);
     write_segment(&mut out, layout.index_hdr_off, seg::INDEX, 5, &idx);
 
     write_segment(&mut out, layout.back_sb_hdr_off, seg::SUPER, 6, &sb_bytes);
@@ -314,7 +394,7 @@ pub fn pack(objects: &[Object], root: &Digest, opts: &PackOptions) -> Res<Vec<u8
     let t = layout.file_size - TRAILER_SIZE;
     out[t..t + 8].copy_from_slice(&(layout.back_sb_payload_off as u64).to_le_bytes());
     out[t + 8..t + 16].copy_from_slice(&(sb_bytes.len() as u64).to_le_bytes());
-    out[t + 16..t + 48].copy_from_slice(&sha256(&sb_bytes));
+    out[t + 16..t + 48].copy_from_slice(&opts.hash.digest(&sb_bytes));
     out[t + 48..t + 52].copy_from_slice(&flags.to_le_bytes());
     let tcrc = crc32c(&out[t..t + 52]);
     out[t + 52..t + 56].copy_from_slice(&tcrc.to_le_bytes());
@@ -348,6 +428,7 @@ fn compute_layout(
     blobs: &[&Object],
     align: usize,
     sb_reserve: usize,
+    algo: HashAlgo,
 ) -> Layout {
     let front_sb_hdr_off = HEADER_SIZE;
     let front_sb_payload_off = front_sb_hdr_off + SEG_HEADER_SIZE;
@@ -361,7 +442,7 @@ fn compute_layout(
     for o in structs {
         rel = round_up(rel, 8);
         placed_structs.push(Placed {
-            digest: o.digest(),
+            digest: o.digest(algo),
             otype: o.otype,
             oflags: o.oflags,
             offset: (obj_payload_off + rel) as u64,
@@ -397,7 +478,7 @@ fn compute_layout(
     for o in blobs {
         rel = round_up(rel, align); // every data object is align-aligned (R-C08)
         placed_blobs.push(Placed {
-            digest: o.digest(),
+            digest: o.digest(algo),
             otype: otype::BLOB,
             oflags: o.oflags,
             offset: (blob_payload_off + rel) as u64,
@@ -469,7 +550,7 @@ fn write_segment(out: &mut [u8], hdr_off: usize, kind: u16, seq: u64, payload: &
     out[p..p + payload.len()].copy_from_slice(payload);
 }
 
-fn build_index(l: &Layout) -> Vec<u8> {
+fn build_index(l: &Layout, algo: HashAlgo) -> Vec<u8> {
     let mut entries: Vec<&Placed> = l.structs.iter().chain(l.blobs.iter()).collect();
     entries.sort_by_key(|a| a.digest);
 
@@ -480,7 +561,7 @@ fn build_index(l: &Layout) -> Vec<u8> {
     out[8..16].copy_from_slice(&(entries.len() as u64).to_le_bytes());
     out[16..24].copy_from_slice(&0u64.to_le_bytes()); // no bucket table
     out[24..28].copy_from_slice(&0u32.to_le_bytes());
-    out[28] = HASH_SHA256;
+    out[28] = algo.code();
     out[29] = 32;
     out[30..32].copy_from_slice(&0b11u16.to_le_bytes()); // SORTED | COMPLETE
     out[32..40].copy_from_slice(&0u64.to_le_bytes());
@@ -593,11 +674,18 @@ fn superblock_value(l: &Layout, root: &Digest, align: usize, opts: &PackOptions)
 /// Derives a deterministic UUIDv7-shaped identifier from the root digest
 /// (§01.10 clause 4). Version and variant bits are set so the value is a
 /// well-formed UUID even though it is not time-based.
-fn derive_uuid(root: &Digest) -> [u8; 16] {
-    let mut h = crate::sha256::Sha256::new();
-    h.update(b"omni/1.0 uuid");
-    h.update(root);
-    let d = h.finalize();
+fn derive_uuid(algo: HashAlgo, root: &Digest) -> [u8; 16] {
+    // §03.5.3 domain separation. BLAKE3 has a derive-key mode built for
+    // exactly this; SHA-256 has to prefix the context string instead.
+    let d = match algo {
+        HashAlgo::Blake3_256 => crate::blake3::derive_key(UUID_CONTEXT, root),
+        HashAlgo::Sha256 => {
+            let mut h = crate::sha256::Sha256::new();
+            h.update(UUID_CONTEXT.as_bytes());
+            h.update(root);
+            h.finalize()
+        }
+    };
     let mut u = [0u8; 16];
     u.copy_from_slice(&d[..16]);
     u[6] = (u[6] & 0x0f) | 0x70; // version 7
@@ -625,7 +713,8 @@ pub struct Header {
     pub log2_align: u8,
     pub header_size: u16,
     pub uuid: [u8; 16],
-    pub hash_algo: u8,
+    /// The container's primary digest algorithm, already validated.
+    pub hash: HashAlgo,
     pub profile: u8,
     pub flags: u32,
     pub front_sb_off: u64,
@@ -672,7 +761,7 @@ impl Container {
             return Err(rule("R-C12", "superblock extent out of range"));
         }
         let sb_bytes = &bytes[sb_off..sb_off + sb_len];
-        if sha256(sb_bytes) != sb_digest {
+        if header.hash.digest(sb_bytes) != sb_digest {
             return Err(rule("R-C09", "superblock digest mismatch"));
         }
         let superblock = cbor::decode(sb_bytes)?;
@@ -724,7 +813,7 @@ impl Container {
             return Err(rule("R-C12", "object extent out of range"));
         }
         let payload = &self.bytes[s..s + n];
-        if sha256(payload) != *d {
+        if self.header.hash.digest(payload) != *d {
             return Err(rule("R-O01", format!("digest mismatch for {}", hex(d))));
         }
         Ok(payload)
@@ -794,6 +883,17 @@ fn parse_header(b: &[u8]) -> Res<Header> {
     if !(6..=30).contains(&log2_align) {
         return Err(rule("R-C04", "log2_align out of range"));
     }
+    // An unknown algorithm is fatal, not something to work around: every
+    // digest in the file, including the root, would be uninterpretable.
+    let hash = HashAlgo::from_code(b[32]).ok_or_else(|| {
+        rule(
+            "R-C05",
+            format!("unsupported hash algorithm 0x{:02x}", b[32]),
+        )
+    })?;
+    if b[34] as usize != std::mem::size_of::<Digest>() {
+        return Err(rule("R-C05", "digest_len does not match the algorithm"));
+    }
     let creator_raw = &b[96..112];
     let creator = String::from_utf8_lossy(creator_raw)
         .trim_end_matches('\0')
@@ -804,7 +904,7 @@ fn parse_header(b: &[u8]) -> Res<Header> {
         log2_align,
         header_size,
         uuid: b[16..32].try_into().unwrap(),
-        hash_algo: b[32],
+        hash,
         profile: b[33],
         flags: u32::from_le_bytes(b[36..40].try_into().unwrap()),
         front_sb_off: u64::from_le_bytes(b[40..48].try_into().unwrap()),
@@ -976,10 +1076,22 @@ pub fn collect_refs(v: &Value, out: &mut Vec<Digest>) {
 mod tests {
     use super::*;
 
-    fn tiny_model() -> (Vec<Object>, Digest) {
+    /// Every container-level test runs under both mandatory algorithms
+    /// (§03.5.1). Anything that silently assumed 32-byte SHA-256 would pass
+    /// under one and fail under the other.
+    const ALGOS: [HashAlgo; 2] = [HashAlgo::Blake3_256, HashAlgo::Sha256];
+
+    fn opts(hash: HashAlgo) -> PackOptions {
+        PackOptions {
+            hash,
+            ..Default::default()
+        }
+    }
+
+    fn tiny_model(algo: HashAlgo) -> (Vec<Object>, Digest) {
         let data: Vec<u8> = (0..8192u32).map(|i| (i % 256) as u8).collect();
         let blob = Object::blob(data);
-        let blob_d = blob.digest();
+        let blob_d = blob.digest(algo);
 
         let chunks = Object::structure(
             otype::CHUNK_LIST,
@@ -996,7 +1108,7 @@ mod tests {
                 ),
             ]),
         );
-        let chunks_d = chunks.digest();
+        let chunks_d = chunks.digest(algo);
 
         let desc = Object::structure(
             otype::TENSOR_DESC,
@@ -1020,7 +1132,7 @@ mod tests {
                 ),
             ]),
         );
-        let desc_d = desc.digest();
+        let desc_d = desc.digest(algo);
 
         let manifest = Object::structure(
             otype::MANIFEST,
@@ -1040,83 +1152,139 @@ mod tests {
                 ),
             ]),
         );
-        let root = manifest.digest();
+        let root = manifest.digest(algo);
         (vec![blob, chunks, desc, manifest], root)
     }
 
     #[test]
     fn pack_open_verify() {
-        let (objs, root) = tiny_model();
-        let bytes = pack(&objs, &root, &PackOptions::default()).unwrap();
-        let c = Container::open(bytes).unwrap();
-        assert_eq!(c.header.root_digest, root);
-        assert_eq!(c.header.container_major, 1);
-        let r = verify(&c).unwrap();
-        assert!(r.padding_ok, "R-C07 zero padding");
-        assert!(r.alignment_ok, "R-C08 data alignment");
-        assert_eq!(r.objects_verified, 4);
-        assert_eq!(r.reachable, 4);
-        assert!(r.dangling.is_empty());
+        for algo in ALGOS {
+            let (objs, root) = tiny_model(algo);
+            let bytes = pack(&objs, &root, &opts(algo)).unwrap();
+            let c = Container::open(bytes).unwrap();
+            assert_eq!(c.header.root_digest, root);
+            assert_eq!(c.header.container_major, 1);
+            assert_eq!(c.header.hash, algo);
+            let r = verify(&c).unwrap();
+            assert!(r.padding_ok, "R-C07 zero padding");
+            assert!(r.alignment_ok, "R-C08 data alignment");
+            assert_eq!(r.objects_verified, 4);
+            assert_eq!(r.reachable, 4);
+            assert!(r.dangling.is_empty());
+        }
     }
 
     #[test]
     fn packing_is_reproducible() {
-        let (objs, root) = tiny_model();
-        let a = pack(&objs, &root, &PackOptions::default()).unwrap();
-        let b = pack(&objs, &root, &PackOptions::default()).unwrap();
-        assert_eq!(a, b, "W1: pack must be byte-reproducible");
+        for algo in ALGOS {
+            let (objs, root) = tiny_model(algo);
+            let a = pack(&objs, &root, &opts(algo)).unwrap();
+            let b = pack(&objs, &root, &opts(algo)).unwrap();
+            assert_eq!(a, b, "W1: pack must be byte-reproducible");
 
-        // Object order at the input must not matter.
-        let mut shuffled = objs.clone();
-        shuffled.reverse();
-        let c = pack(&shuffled, &root, &PackOptions::default()).unwrap();
-        assert_eq!(a, c, "emission order is (otype, digest), not input order");
+            // Object order at the input must not matter.
+            let mut shuffled = objs.clone();
+            shuffled.reverse();
+            let c = pack(&shuffled, &root, &opts(algo)).unwrap();
+            assert_eq!(a, c, "emission order is (otype, digest), not input order");
+        }
+    }
+
+    /// The same model under two algorithms is two different object graphs with
+    /// two different roots — but the same logical content. Identity is a hash,
+    /// so changing the hash changes every identity, which is exactly why the
+    /// algorithm is a container-wide header field (§12.11).
+    #[test]
+    fn the_algorithm_changes_every_identity() {
+        let (b3_objs, b3_root) = tiny_model(HashAlgo::Blake3_256);
+        let (sha_objs, sha_root) = tiny_model(HashAlgo::Sha256);
+        assert_ne!(b3_root, sha_root);
+
+        let b3 = Container::open(pack(&b3_objs, &b3_root, &opts(HashAlgo::Blake3_256)).unwrap())
+            .unwrap();
+        let sha =
+            Container::open(pack(&sha_objs, &sha_root, &opts(HashAlgo::Sha256)).unwrap()).unwrap();
+        assert_eq!(b3.header.hash, HashAlgo::Blake3_256);
+        assert_eq!(sha.header.hash, HashAlgo::Sha256);
+        assert_eq!(b3.index.len(), sha.index.len());
+
+        // The blob payload is identical in both; only its name differs.
+        let b3_blob = b3.index.iter().find(|e| e.otype == otype::BLOB).unwrap();
+        let sha_blob = sha.index.iter().find(|e| e.otype == otype::BLOB).unwrap();
+        assert_eq!(b3_blob.logical_len, sha_blob.logical_len);
+        assert_ne!(b3_blob.digest, sha_blob.digest);
+        assert_eq!(
+            b3.get(&b3_blob.digest).unwrap(),
+            sha.get(&sha_blob.digest).unwrap()
+        );
+    }
+
+    /// A reader that cannot compute the container's digests cannot verify
+    /// anything in it, so an unknown algorithm must be refused at open time
+    /// rather than tolerated as an unknown-but-skippable field.
+    #[test]
+    fn unknown_hash_algorithm_is_refused() {
+        let (objs, root) = tiny_model(HashAlgo::Blake3_256);
+        let mut bytes = pack(&objs, &root, &opts(HashAlgo::Blake3_256)).unwrap();
+        bytes[32] = 0x99;
+        let crc = crc32c(&bytes[0..124]);
+        bytes[124..128].copy_from_slice(&crc.to_le_bytes());
+        match Container::open(bytes) {
+            Err(e) => assert!(e.to_string().contains("R-C05"), "got: {e}"),
+            Ok(_) => panic!("unknown hash algorithm must be refused"),
+        }
     }
 
     #[test]
     fn blob_payloads_are_page_aligned() {
-        let (objs, root) = tiny_model();
-        let bytes = pack(&objs, &root, &PackOptions::default()).unwrap();
-        let c = Container::open(bytes).unwrap();
-        let align = 1u64 << c.header.log2_align;
-        for e in &c.index {
-            if e.otype == otype::BLOB {
-                assert_eq!(e.offset % align, 0, "R-C08");
+        for algo in ALGOS {
+            let (objs, root) = tiny_model(algo);
+            let bytes = pack(&objs, &root, &opts(algo)).unwrap();
+            let c = Container::open(bytes).unwrap();
+            let align = 1u64 << c.header.log2_align;
+            for e in &c.index {
+                if e.otype == otype::BLOB {
+                    assert_eq!(e.offset % align, 0, "R-C08");
+                }
             }
         }
     }
 
     #[test]
     fn tampering_is_detected() {
-        let (objs, root) = tiny_model();
-        let mut bytes = pack(&objs, &root, &PackOptions::default()).unwrap();
-        // Flip a bit inside the blob payload.
-        let c = Container::open(bytes.clone()).unwrap();
-        let blob = c.index.iter().find(|e| e.otype == otype::BLOB).unwrap();
-        let pos = blob.offset as usize + 10;
-        bytes[pos] ^= 0x01;
-        let c2 = Container::open(bytes).unwrap();
-        // Framing still parses (CRC covers the segment, so V0 fails first here);
-        // object-level verification must fail regardless.
-        let err = verify(&c2).err().expect("tampering must be detected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("R-O01") || msg.contains("R-C05"),
-            "unexpected error: {msg}"
-        );
+        for algo in ALGOS {
+            let (objs, root) = tiny_model(algo);
+            let mut bytes = pack(&objs, &root, &opts(algo)).unwrap();
+            // Flip a bit inside the blob payload.
+            let c = Container::open(bytes.clone()).unwrap();
+            let blob = c.index.iter().find(|e| e.otype == otype::BLOB).unwrap();
+            let pos = blob.offset as usize + 10;
+            bytes[pos] ^= 0x01;
+            let c2 = Container::open(bytes).unwrap();
+            // Framing still parses (CRC covers the segment, so V0 fails first
+            // here); object-level verification must fail regardless.
+            let err = verify(&c2).err().expect("tampering must be detected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("R-O01") || msg.contains("R-C05"),
+                "unexpected error: {msg}"
+            );
+        }
     }
 
     #[test]
     fn truncation_is_detected() {
-        let (objs, root) = tiny_model();
-        let bytes = pack(&objs, &root, &PackOptions::default()).unwrap();
-        let truncated = bytes[..bytes.len() - 100].to_vec();
-        assert!(Container::open(truncated).is_err());
+        for algo in ALGOS {
+            let (objs, root) = tiny_model(algo);
+            let bytes = pack(&objs, &root, &opts(algo)).unwrap();
+            let truncated = bytes[..bytes.len() - 100].to_vec();
+            assert!(Container::open(truncated).is_err());
+        }
     }
 
     #[test]
     fn header_crc_is_checked() {
-        let (objs, root) = tiny_model();
+        let (objs, root) = tiny_model(HashAlgo::default());
         let mut bytes = pack(&objs, &root, &PackOptions::default()).unwrap();
         bytes[13] = 20; // change log2_align without fixing the CRC
         match Container::open(bytes) {
@@ -1129,14 +1297,15 @@ mod tests {
     fn missing_object_is_incomplete_not_invalid() {
         // A ref to an object that is not present is a dangling ref, which is
         // legal for a partial container (§01.4).
-        let (mut objs, _) = tiny_model();
+        let algo = HashAlgo::default();
+        let (mut objs, _) = tiny_model(algo);
         objs.retain(|o| o.otype != otype::BLOB);
         let root = objs
             .iter()
             .find(|o| o.otype == otype::MANIFEST)
             .unwrap()
-            .digest();
-        let bytes = pack(&objs, &root, &PackOptions::default()).unwrap();
+            .digest(algo);
+        let bytes = pack(&objs, &root, &opts(algo)).unwrap();
         let c = Container::open(bytes).unwrap();
         let r = verify(&c).unwrap();
         assert_eq!(r.dangling.len(), 1);

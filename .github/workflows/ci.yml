@@ -121,20 +121,43 @@ jobs:
           fi
           echo "truncation detected"
 
-      - name: Digests are real SHA-256
+      - name: Both mandatory hash algorithms produce valid containers
         run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --hash sha256 /tmp/sha.omni >/dev/null
+          "$OMNI" verify /tmp/sha.omni >/dev/null
+          "$OMNI" inspect /tmp/sha.omni | grep -q 'hash=sha2-256'
+          "$OMNI" inspect examples/toy.omni | grep -q 'hash=blake3-256'
+          # Same model, same size, different identities: the algorithm is one
+          # header field and nothing else about the layout depends on it.
+          a=$(stat -c%s /tmp/sha.omni); b=$(stat -c%s examples/toy.omni)
+          [ "$a" = "$b" ] || { echo "::error::sizes differ: $a vs $b"; exit 1; }
+          cmp -s /tmp/sha.omni examples/toy.omni && \
+            { echo "::error::the two containers should not be identical"; exit 1; }
+          echo "blake3-256 and sha2-256 containers both valid, both $a bytes"
+
+      # The digests must be checkable by implementations that have nothing to do
+      # with this repository, or "content-addressed" is just a claim.
+      - name: Digests verify against independent implementations
+        run: |
+          pip install --quiet blake3
           python3 - <<'PY'
-          import hashlib, struct, sys
-          d = open('examples/toy.omni', 'rb').read()
-          assert d[:8] == bytes([0x89]) + b'OMNI\r\n\x1a', "magic"
-          size = struct.unpack('<Q', d[56:64])[0]
-          assert size == len(d), f"header file_size {size} != {len(d)}"
-          assert d[-8:] == bytes([0x1a, 0x0a, 0x0d]) + b'INMO' + bytes([0x89]), "end magic"
-          # The trailer locates the superblock; check its digest independently.
-          sb_off, sb_len = struct.unpack('<QQ', d[-64:-48])
-          sb_dig = d[-48:-16]
-          assert hashlib.sha256(d[sb_off:sb_off + sb_len]).digest() == sb_dig, "superblock digest"
-          print("magic, file_size, trailer and superblock digest all check out")
+          import hashlib, struct
+          import blake3 as b3
+
+          def check(path, h, name):
+              d = open(path, 'rb').read()
+              assert d[:8] == bytes([0x89]) + b'OMNI\r\n\x1a', "magic"
+              size = struct.unpack('<Q', d[56:64])[0]
+              assert size == len(d), f"header file_size {size} != {len(d)}"
+              assert d[-8:] == bytes([0x1a, 0x0a, 0x0d]) + b'INMO' + bytes([0x89]), "end magic"
+              # The trailer locates the superblock; check its digest independently.
+              sb_off, sb_len = struct.unpack('<QQ', d[-64:-48])
+              assert h(d[sb_off:sb_off + sb_len]) == d[-48:-16], "superblock digest"
+              print(f"{path}: magic, file_size, trailer and superblock digest check out ({name})")
+
+          check('examples/toy.omni', lambda b: b3.blake3(b).digest(), 'upstream BLAKE3')
+          check('/tmp/sha.omni', lambda b: hashlib.sha256(b).digest(), 'hashlib SHA-256')
           PY
 
   docs:

@@ -7,7 +7,7 @@
 //! examples in `examples/`.
 
 use crate::cbor::Value;
-use crate::container::{otype, Digest, Object};
+use crate::container::{otype, Digest, HashAlgo, Object};
 
 // ------------------------------------------------------------------ dtypes --
 
@@ -119,6 +119,10 @@ pub struct ModelBuilder {
     pub tensors: Vec<TensorSpec>,
     pub chunk_size: usize,
     pub extra: Vec<(String, Value)>,
+    /// The digest algorithm the resulting container will use. Object
+    /// identities depend on it, so it has to be fixed before the graph is
+    /// built rather than at pack time.
+    pub hash: HashAlgo,
 }
 
 impl ModelBuilder {
@@ -131,7 +135,13 @@ impl ModelBuilder {
             tensors: Vec::new(),
             chunk_size: 4 << 20,
             extra: Vec::new(),
+            hash: HashAlgo::default(),
         }
+    }
+
+    pub fn hash(mut self, algo: HashAlgo) -> Self {
+        self.hash = algo;
+        self
     }
 
     pub fn license(mut self, spdx: impl Into<String>) -> Self {
@@ -183,7 +193,7 @@ impl ModelBuilder {
             let mut chunk_refs = Vec::new();
             for chunk in t.data.chunks(self.chunk_size) {
                 let blob = Object::blob(chunk.to_vec());
-                let d = blob.digest();
+                let d = blob.digest(self.hash);
                 objects.push(blob);
                 chunk_refs.push(Value::map(vec![
                     (
@@ -210,7 +220,7 @@ impl ModelBuilder {
                     ("chunks", Value::Array(chunk_refs)),
                 ]),
             );
-            let cl_digest = chunklist.digest();
+            let cl_digest = chunklist.digest(self.hash);
             objects.push(chunklist);
 
             let mut desc_pairs: Vec<(&str, Value)> = vec![
@@ -251,7 +261,7 @@ impl ModelBuilder {
                 ));
             }
             let desc = Object::structure(otype::TENSOR_DESC, &Value::map(desc_pairs));
-            let d_digest = desc.digest();
+            let d_digest = desc.digest(self.hash);
             objects.push(desc);
 
             table_entries.push((
@@ -273,7 +283,7 @@ impl ModelBuilder {
                 ("order", Value::Array(order)),
             ]),
         );
-        let table_digest = table.digest();
+        let table_digest = table.digest(self.hash);
         objects.push(table);
 
         let model = Object::structure(
@@ -290,7 +300,7 @@ impl ModelBuilder {
                 ),
             ]),
         );
-        let model_digest = model.digest();
+        let model_digest = model.digest(self.hash);
         objects.push(model);
 
         // Metadata. Note what is *absent*: no license unless one was supplied,
@@ -335,7 +345,7 @@ impl ModelBuilder {
             meta_pairs.push((Box::leak(k.clone().into_boxed_str()), v.clone()));
         }
         let meta = Object::structure(otype::METADATA, &Value::map(meta_pairs));
-        let meta_digest = meta.digest();
+        let meta_digest = meta.digest(self.hash);
         objects.push(meta);
 
         let manifest = Object::structure(
@@ -378,7 +388,7 @@ impl ModelBuilder {
                 ),
             ]),
         );
-        let root = manifest.digest();
+        let root = manifest.digest(self.hash);
         objects.push(manifest);
 
         (objects, root)

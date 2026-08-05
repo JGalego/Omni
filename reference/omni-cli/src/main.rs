@@ -7,7 +7,9 @@
 
 use omni_core::cbor::Value;
 use omni_core::container::{otype, seg, IndexEntry};
-use omni_core::{hex, pack, verify, Container, DType, ModelBuilder, PackOptions, TensorSpec};
+use omni_core::{
+    hex, pack, verify, Container, DType, HashAlgo, ModelBuilder, PackOptions, TensorSpec,
+};
 use std::process::ExitCode;
 
 /// `println!` that treats a closed pipe as success rather than panicking, so
@@ -52,7 +54,8 @@ VERBS:
     dump    <file> --header   Annotated hexdump of the 128-byte file header
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
     cat     <file> --tensor <name> --hex [--limit N]
-    example <out.omni>        Build a small but complete example container
+    example <out.omni> [--hash blake3|sha256]
+                              Build a small but complete example container
 
 EXIT CODES (docs/design/cli.md §10):
     0 ok · 1 invalid · 2 usage · 3 indeterminate · 5 incomplete
@@ -171,11 +174,7 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
             _ => "?",
         },
         1u64 << h.log2_align,
-        match h.hash_algo {
-            0x12 => "sha2-256",
-            0x1e => "blake3-256",
-            _ => "unknown",
-        },
+        h.hash.name(),
         if h.flags & 1 != 0 {
             "sealed"
         } else {
@@ -184,7 +183,7 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
     );
     pr!("  creator     {}", h.creator);
     pr!("  uuid        {}", hex(&h.uuid));
-    pr!("  root        {}", short(&h.root_digest));
+    pr!("  root        {}", short(h.hash, &h.root_digest));
 
     // Manifest → Metadata, without touching a tensor payload.
     let manifest = c.root()?;
@@ -399,9 +398,8 @@ fn commas(n: u64) -> String {
     out
 }
 
-fn short(d: &[u8]) -> String {
-    let h = hex(d);
-    format!("sha2:{}…", &h[..16])
+fn short(algo: HashAlgo, d: &[u8]) -> String {
+    format!("{}:{}…", algo.prefix(), &hex(d)[..16])
 }
 
 fn cmd_verify(c: &Container, _args: &[String]) -> R {
@@ -444,7 +442,7 @@ fn cmd_verify(c: &Container, _args: &[String]) -> R {
             r.dangling.len()
         );
         for d in &r.dangling {
-            pr!("     {}", short(d));
+            pr!("     {}", short(c.header.hash, d));
         }
         pr!("\nincomplete: valid container, objects missing from all stores");
         return Ok(5);
@@ -549,7 +547,15 @@ fn dump_header(c: &Container) -> R {
         (13, 1, "log2_align"),
         (14, 2, "header_size"),
         (16, 16, "file_uuid (UUIDv7-shaped, derived)"),
-        (32, 1, "hash_algo (0x12 = sha2-256)"),
+        (
+            32,
+            1,
+            &format!(
+                "hash_algo (0x{:02x} = {})",
+                c.header.hash.code(),
+                c.header.hash.name()
+            ),
+        ),
         (33, 1, "profile (0 = core)"),
         (34, 1, "digest_len"),
         (35, 1, "reserved0"),
@@ -662,7 +668,11 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
         };
         let e = c.find(&d).ok_or("chunk missing")?;
         let bytes = c.get(&d)?;
-        pr!("; chunk {} @ file offset {}", short(&d), e.offset);
+        pr!(
+            "; chunk {} @ file offset {}",
+            short(c.header.hash, &d),
+            e.offset
+        );
         hexdump(bytes, e.offset, limit.saturating_sub(shown))?;
         shown += bytes.len().min(limit);
         if shown >= limit {
@@ -672,10 +682,42 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
     Ok(0)
 }
 
+/// Value of a `--name <value>` option, if present.
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).map(|s| s.as_str())
+}
+
 /// Builds the example container used by `examples/` and the specification's
 /// worked byte layout (§02.11).
 fn cmd_example(args: &[String]) -> R {
-    let out = args.get(1).map(|s| s.as_str()).unwrap_or("example.omni");
+    // Every option this verb takes has a value, so a `--name value` pair can be
+    // skipped wholesale to find the positional output path.
+    let mut positional = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i].starts_with("--") {
+            i += 2;
+        } else {
+            positional.push(args[i].as_str());
+            i += 1;
+        }
+    }
+    let out = positional.first().copied().unwrap_or("example.omni");
+
+    // `--hash sha256` produces a container whose every digest can be checked
+    // with `sha256sum`, which is worth having even though BLAKE3-256 is the
+    // default (§03.5.1).
+    let algo = match flag(args, "--hash") {
+        None => HashAlgo::default(),
+        Some(name) => match HashAlgo::parse(name) {
+            Some(a) => a,
+            None => {
+                prr!("omni: unknown hash algorithm `{name}` (try blake3 or sha256)");
+                return Ok(2);
+            }
+        },
+    };
 
     // A two-layer toy transformer: enough structure to be realistic, small
     // enough to hexdump.
@@ -758,19 +800,24 @@ fn cmd_example(args: &[String]) -> R {
         });
     }
 
+    let b = b.hash(algo);
     let (objs, root) = b.build();
-    let bytes = pack(&objs, &root, &PackOptions::default())?;
+    let opts = PackOptions {
+        hash: algo,
+        ..Default::default()
+    };
+    let bytes = pack(&objs, &root, &opts)?;
     std::fs::write(out, &bytes)?;
 
     // Reproducibility is a normative writer requirement (W1).
-    let again = pack(&objs, &root, &PackOptions::default())?;
+    let again = pack(&objs, &root, &opts)?;
     assert_eq!(bytes, again, "W1: pack must be byte-reproducible");
 
     let c = Container::open(bytes.clone())?;
     let r = verify(&c)?;
     pr!("wrote {out}");
     pr!("  size           {}", human(bytes.len() as u64));
-    pr!("  root           {}", short(&root));
+    pr!("  root           {}", short(algo, &root));
     pr!("  objects        {}", c.index.len());
     pr!("  reachable      {}", r.reachable);
     pr!(

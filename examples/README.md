@@ -9,12 +9,20 @@ $ cd ../examples && ../reference/target/release/omni example toy.omni
 ```
 
 `toy.omni` in this directory is a real, complete, valid OMNI container. It is
-113 856 bytes and its SHA-256 is stable across machines and runs, because
+113 856 bytes and identical byte for byte across machines and runs, because
 packing is deterministic (§01.10, writer rule W1).
 
-> The reference implementation uses **SHA-256** rather than the default
-> BLAKE3-256 so that every digest here can be checked with `sha256sum` and the
-> crate can stay dependency-free. Both algorithms are mandatory in §03.5.1.
+It uses **BLAKE3-256**, the default of §03.5.1. Passing `--hash sha256` produces
+a container that is byte-identical except for its digests — useful when you want
+to check every hash in the file with `sha256sum`:
+
+```console
+$ omni example --hash sha256 toy-sha256.omni
+```
+
+That the two files differ *only* in their digests is worth stating plainly: the
+algorithm is one header field, and §12.11's hash-migration story is "rehash and
+rewrite the graph", not "redesign the format".
 
 ## 1 The example model
 
@@ -27,7 +35,7 @@ pattern in real decoder models.
 $ omni example toy.omni
 wrote toy.omni
   size           111.19 KiB
-  root           sha2:8e02117540106e18…
+  root           b3:ef5e49b8b0c2faa7…
   objects        49
   reachable      49
   verified       49 objects, 86.54 KiB
@@ -39,10 +47,10 @@ wrote toy.omni
 ```console
 $ omni inspect toy.omni
 toy.omni                           111.19 KiB
-  container   OMNI/1.0  profile=core  align=4096  hash=sha2-256  sealed
+  container   OMNI/1.0  profile=core  align=4096  hash=blake3-256  sealed
   creator     omni-rs/0.1.0
-  uuid        586dd8a07b377bee8041aba8906c4557
-  root        sha2:8e02117540106e18…
+  uuid        cd5a1fe673227c0f9d739d3123dd0ccb
+  root        b3:ef5e49b8b0c2faa7…
 
 manifest    kind=model
 model  omni/example-toy
@@ -129,8 +137,8 @@ OMNI FileHeader (§02.3)
    12  01                                                  byte_order (01 = little)
    13  0c                                                  log2_align
    14  80 00                                               header_size
-   16  58 6d d8 a0 7b 37 7b ee 80 41 ab a8 90 6c 45 57     file_uuid (UUIDv7-shaped, derived)
-   32  12                                                  hash_algo (0x12 = sha2-256)
+   16  cd 5a 1f e6 73 22 7c 0f 9d 73 9d 31 23 dd 0c cb     file_uuid (UUIDv7-shaped, derived)
+   32  1e                                                  hash_algo (0x1e = blake3-256)
    33  00                                                  profile (0 = core)
    34  20                                                  digest_len
    35  00                                                  reserved0
@@ -138,21 +146,21 @@ OMNI FileHeader (§02.3)
    40  a0 00 00 00 00 00 00 00                             front_sb_off
    48  51 01 00 00 00 00 00 00                             front_sb_len
    56  c0 bc 01 00 00 00 00 00                             file_size
-   64  8e 02 11 75 40 10 6e 18 a8 f5 b9 8d 01 c2 8d 01 …   root_digest
+   64  ef 5e 49 b8 b0 c2 fa a7 54 5b d6 0a da 41 37 30 …   root_digest
    96  6f 6d 6e 69 2d 72 73 2f 30 2e 31 2e 30 00 00 00     creator
   112  00 00 00 00 00 00 00 00                             created_unix_ms
   120  00 00 00 00                                         reserved1
-  124  95 10 10 b2                                         header_crc32c
+  124  f8 42 36 49                                         header_crc32c
 
 raw:
 00000000  89 4f 4d 4e 49 0d 0a 1a 01 00 00 00 01 0c 80 00  |.OMNI...........|
-00000010  58 6d d8 a0 7b 37 7b ee 80 41 ab a8 90 6c 45 57  |Xm..{7{..A...lEW|
-00000020  12 00 20 00 03 00 00 00 a0 00 00 00 00 00 00 00  |.. .............|
+00000010  cd 5a 1f e6 73 22 7c 0f 9d 73 9d 31 23 dd 0c cb  |.Z..s"|..s.1#...|
+00000020  1e 00 20 00 03 00 00 00 a0 00 00 00 00 00 00 00  |.. .............|
 00000030  51 01 00 00 00 00 00 00 c0 bc 01 00 00 00 00 00  |Q...............|
-00000040  8e 02 11 75 40 10 6e 18 a8 f5 b9 8d 01 c2 8d 01  |...u@.n.........|
-00000050  c5 36 40 ff a6 f5 52 03 5c 8f 71 f0 3b 80 1d 46  |.6@...R.\.q.;..F|
+00000040  ef 5e 49 b8 b0 c2 fa a7 54 5b d6 0a da 41 37 30  |.^I.....T[...A70|
+00000050  fc c1 47 4f a7 3b e4 a5 b9 3f 5e 58 80 56 c8 d3  |..GO.;...?^X.V..|
 00000060  6f 6d 6e 69 2d 72 73 2f 30 2e 31 2e 30 00 00 00  |omni-rs/0.1.0...|
-00000070  00 00 00 00 00 00 00 00 00 00 00 00 95 10 10 b2  |................|
+00000070  00 00 00 00 00 00 00 00 00 00 00 00 f8 42 36 49  |.............B6I|
 ```
 
 `created_unix_ms` is zero and the UUID is derived from the root digest, so the
@@ -160,29 +168,34 @@ build is reproducible (§01.10).
 
 ## 5 Independent verification
 
-The root digest in the header is genuinely the SHA-256 of the manifest object at
-the offset the index reports — checkable with any SHA-256 implementation:
+The root digest in the header is genuinely the BLAKE3-256 of the manifest object
+at the offset the index reports — checkable against an implementation that has
+nothing to do with this repository:
 
 ```console
+$ pip install blake3   # the upstream implementation, not ours
 $ python3 -c "
-import hashlib
+import blake3
 d = open('toy.omni','rb').read()
-print('manifest at 4256, 211 bytes:', hashlib.sha256(d[4256:4256+211]).hexdigest())
+print('manifest at 4256, 211 bytes:', blake3.blake3(d[4256:4256+211]).hexdigest())
 print('root_digest in header      :', d[64:96].hex())"
-manifest at 4256, 211 bytes: 8e02117540106e18a8f5b98d01c28d01c53640ffa6f552035c8f71f03b801d46
-root_digest in header      : 8e02117540106e18a8f5b98d01c28d01c53640ffa6f552035c8f71f03b801d46
+manifest at 4256, 211 bytes: ef5e49b8b0c2faa7545bd60ada413730fcc1474fa73be4a5b93f5e588056c8d3
+root_digest in header      : ef5e49b8b0c2faa7545bd60ada413730fcc1474fa73be4a5b93f5e588056c8d3
 ```
+
+The `--hash sha256` container is checkable the same way with nothing but the
+Python standard library, which is why CI does both.
 
 ## 6 Objects
 
 ```console
 $ omni ls toy.omni
 DIGEST               TYPE                   OFFSET        BYTES  FLAGS
-8e02117540106e18a8   Manifest                 4256          211  critical,safe-to-copy
-cbd309456924112801   Metadata                 4472          269  critical,safe-to-copy
-b80ef4aa2725a41f76   Model                    4744           66  critical,safe-to-copy
-79a283a39da3d3234a   TensorTable              4816         1228  critical,safe-to-copy
-3ed8c98d646a7ece49   TensorDesc               6048          228  critical,safe-to-copy
+ef5e49b8b0c2faa754   Manifest                 4256          211  critical,safe-to-copy
+95484fe5f12f3daa08   Metadata                 4472          269  critical,safe-to-copy
+9ecac5aba4b4a38f2f   Model                    4744           66  critical,safe-to-copy
+020d6b6f0f20a8ed52   TensorTable              4816         1228  critical,safe-to-copy
+17a7c710ff924215d5   TensorDesc               6048          220  critical,safe-to-copy
 …
 ```
 
@@ -191,13 +204,13 @@ b80ef4aa2725a41f76   Model                    4744           66  critical,safe-t
 ### Manifest (211 bytes)
 
 ```console
-$ omni dump toy.omni --object 8e0211
+$ omni dump toy.omni --object ef5e49
 ```
 ```cbor-diag
 {"t": "omni.core/manifest", "v": 1, "kind": "model",
- "meta": [2, h'cbd3094569241128017692517b88283e951ab96cc6e7636284a6884e4e2b196c'],
+ "meta": [2, h'95484fe5f12f3daa08c51f55383638f11d31c1ab55c27bc8635a04e874aa9237'],
  "entry": "model",
- "assets": {"model": [3, h'b80ef4aa2725a41f762c554dded845e883757be0bbedbe4abff82e3739cf2d8d']},
+ "assets": {"model": [3, h'9ecac5aba4b4a38f2fa6c0797364e3571814a9e3b89f5e70bb98e0b4b3521fbe']},
  "created": 0,
  "features": {"optional": [], "required": ["omni.core/1.0", "omni.tensor/expr.1"]}}
 ```
@@ -224,19 +237,37 @@ implementations.
 `rope.interleaved` is present and explicit — §06.3's answer to the most common
 silent-corruption bug in format conversion.
 
-### TensorDesc (228 bytes)
+### Two TensorDescs, one value
+
+These are `model.embed_tokens.weight` and `lm_head.weight`. Read them side by
+side:
 
 ```cbor-diag
 {"t": "omni.tensor/desc", "v": 1,
- "axes": ["out_features", "in_features"],
+ "axes": ["vocab", "hidden"],
  "dtype": {"e": 8, "k": "float", "m": 7, "w": 16, "alias": "bf16"},
- "shape": [32, 64],
+ "shape": [256, 64],
  "value": {"op": "literal",
-           "chunks": [6, h'c596356305a152261b716d2ca4c0ee2dacbe52c7e2cf6a2e02e2403145812376']},
+           "chunks": [6, h'656ab9597b092cc71a6aa02cfebb0f306aae9fb1307a7205721ad20a15f1dcad']},
+ "layout": {"k": "strided", "order": "row-major"},
+ "semantic": "embedding",
+ "materialize": "lazy"}
+
+{"t": "omni.tensor/desc", "v": 1,
+ "axes": ["vocab", "hidden"],
+ "dtype": {"e": 8, "k": "float", "m": 7, "w": 16, "alias": "bf16"},
+ "shape": [256, 64],
+ "value": {"op": "literal",
+           "chunks": [6, h'656ab9597b092cc71a6aa02cfebb0f306aae9fb1307a7205721ad20a15f1dcad']},
  "layout": {"k": "strided", "order": "row-major"},
  "semantic": "weight",
  "materialize": "lazy"}
 ```
+
+They differ in exactly one field — `semantic` — and point at the same
+`ChunkList`. Two names, two descriptors, two roles in the graph, one copy of the
+32 KiB payload. Nothing in the writer special-cased tied embeddings; identity is
+a hash, so equal values are the same object and that is the end of it.
 
 Note the dtype: `alias: "bf16"` **and** the structural expansion
 `{k: float, w: 16, e: 8, m: 7}`. Five extra bytes buy total forward
@@ -254,19 +285,22 @@ $ omni cat toy.omni --tensor model.layers.0.norm.weight --limit 64
 ; model.layers.0.norm.weight
 ; {"t": "omni.tensor/desc", "v": 1, "axes": ["hidden"],
 ;  "dtype": {"e": 8, "k": "float", "m": 23, "w": 32, "alias": "f32"},
-;  "shape": [64], "value": {"op": "literal", "chunks": [6, h'd5078e2e…']},
+;  "shape": [64], "value": {"op": "literal", "chunks": [6, h'105a7bc6…']},
 ;  "layout": {"k": "strided", "order": "row-major"}, "semantic": "scale",
 ;  "materialize": "lazy"}
-; chunk sha2:c16d36af535539a2… @ file offset 77824
-00013000  8b af 94 67 72 b7 57 06 45 d1 a1 1b 25 a9 54 8d  |...gr.W.E...%.T.|
-00013010  62 b8 4e 29 c0 99 b3 e2 04 0d 58 c7 7a 9c 9d c7  |b.N)......X.z...|
-00013020  8a 09 72 9e 92 06 5e 78 8b e6 aa 18 4b 3b 1b ab  |..r...^x....K;..|
-00013030  53 95 e0 7f 7b d4 8e 51 fd c9 55 ea a2 0e d7 30  |S...{..Q..U....0|
+; chunk b3:dbdd7c1947b46931… @ file offset 94208
+00017000  8b af 94 67 72 b7 57 06 45 d1 a1 1b 25 a9 54 8d  |...gr.W.E...%.T.|
+00017010  62 b8 4e 29 c0 99 b3 e2 04 0d 58 c7 7a 9c 9d c7  |b.N)......X.z...|
+00017020  8a 09 72 9e 92 06 5e 78 8b e6 aa 18 4b 3b 1b ab  |..r...^x....K;..|
+00017030  53 95 e0 7f 7b d4 8e 51 fd c9 55 ea a2 0e d7 30  |S...{..Q..U....0|
 … 192 more bytes
 ```
 
-File offset `0x13000` = 77 824, which is `19 × 4096` — page-aligned, so this
-tensor can be handed to a consumer directly from an `mmap` with no copy (R-C08).
+The payload bytes are the same as they were before the container switched hash
+algorithms — only the chunk's *name* changed. Its file offset moved, from
+`19 × 4096` to `23 × 4096`, because blobs are laid out in digest order; it is
+still page-aligned, so this tensor can be handed to a consumer directly from an
+`mmap` with no copy (R-C08).
 
 ## 9 What these examples do *not* show
 
