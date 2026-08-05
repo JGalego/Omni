@@ -17,7 +17,7 @@ $ ./target/release/omni verify  model.omni
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, model builder | §01–§04, §13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, quantization schemes, model builder | §01–§05, §13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · pack · unpack · fsck · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
@@ -62,13 +62,16 @@ implemented:
   dtype inference (R-T01), normalization and expression identity (§04.7.5),
   evaluation, declared determinism (§04.7.6), plugin fallbacks, and range
   pushdown so partial loading is automatic (§04.7.4)
+- §05 quantization: the closed formula set, per-block and per-tensor schemes,
+  codebooks with reproducible construction recipes, double quantization, and the
+  R-T04 consistency check; the catalogue of §05.2 is covered by tests built only
+  from core nodes
 - §15.1 validation levels V0–V4
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §04.6 sparsity schemes and §05 quantization schemes: the `sparse`,
-  `dequantize` and `quantize` nodes parse, type-check and push ranges down, but
-  evaluating them reports *indeterminate*
+- §04.6 sparsity schemes: the `sparse` node parses, type-checks and pushes
+  ranges down, but evaluating it reports *indeterminate*
 - §07 OMNI-IR · §08 adapters and deltas · §09 training state
 - §10 capability negotiation · §11 WASM plugins · §12.5 signatures
 - §03.7 compression codecs (only `raw`) · §13 HTTP/OCI transport
@@ -78,7 +81,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-95 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+113 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -100,12 +103,17 @@ implementation, the documented maxima of every OCP microscaling type, all four
 directed rounding modes on a tie, element placement under each layout kind, a
 round-trip case for every core expression node, that equivalent expression
 trees normalize to one identity, that a range request through a structural
-chain reads only the bytes it needs, and that ChaCha20 matches RFC 8439. Every
+chain reads only the bytes it needs, and that ChaCha20 matches RFC 8439; and,
+for quantization, that GPTQ's permutation applied inline agrees with the
+equivalent `gather`, that GGUF's `Q8_0`/`Q4_0`/`Q4_1` blocks dequantize
+correctly, that MX microscaling is exact, that the NF4 codebook is reproduced
+from its recipe to within 1e-6 of the published quantiles, and that a symmetric
+scheme carrying a zero point is refused rather than guessed at. Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 95 passed; 0 failed
+test result: ok. 113 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

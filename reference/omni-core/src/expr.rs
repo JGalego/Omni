@@ -2365,6 +2365,22 @@ impl Tensor {
         Ok(out)
     }
 
+    /// Reads one element by multi-index, or `None` when out of range.
+    pub fn get(&self, index: &[u64]) -> Option<f64> {
+        if index.len() != self.shape.len() {
+            return None;
+        }
+        let s = self.strides();
+        let mut lin = 0u64;
+        for ((i, st), d) in index.iter().zip(&s).zip(&self.shape) {
+            if i >= d {
+                return None;
+            }
+            lin += i * st;
+        }
+        self.data.get(lin as usize).copied()
+    }
+
     fn at(&self, index: &[u64]) -> f64 {
         let s = self.strides();
         let mut lin = 0u64;
@@ -2834,16 +2850,14 @@ impl Expr {
                     t.data.iter().map(|v| v.clamp(lo, hi)).collect(),
                 )
             }
-            // The scheme catalogue of §05 is data consumed by these two nodes,
-            // and it is not implemented in this build: parsing, typing, range
-            // pushdown and identity all work, evaluation reports
-            // *indeterminate*.
-            Expr::Dequantize { scheme, .. } | Expr::Quantize { scheme, .. } => {
-                return Err(Error::Unsupported(format!(
-                    "{} scheme `{}` (§05) is not implemented",
-                    self.op(),
-                    scheme.get("scheme").and_then(|x| x.as_str()).unwrap_or("?")
-                )))
+            // The scheme catalogue of §05 is data consumed by these two nodes.
+            Expr::Dequantize { x, scheme } => {
+                let t = x.eval_child(ctx)?;
+                crate::quant::dequantize(ctx, &t, scheme, dtype)?
+            }
+            Expr::Quantize { x, scheme, round } => {
+                let t = x.eval_child(ctx)?;
+                crate::quant::quantize(ctx, &t, scheme, dtype, *round)?
             }
             // As above for the sparsity schemes of §04.6.
             Expr::Sparse { scheme, .. } => {

@@ -3,7 +3,8 @@
 //! A dependency-free implementation of the OMNI/1.0 container (§02), canonical
 //! CBOR encoding (§03), object model (§01) and the tensor layer (§04): the
 //! numeric type algebra, layouts, and the tensor expression algebra with its
-//! typing, identity, evaluation and range pushdown.
+//! typing, identity, evaluation and range pushdown, plus the quantization
+//! scheme catalogue of §05.
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
 //!
@@ -17,11 +18,11 @@
 //!
 //! ## Not implemented here
 //!
-//! Sparsity schemes (§04.6), quantization schemes (§05), OMNI-IR (§07),
-//! adapters (§08), capability negotiation (§10), the WASM plugin host (§11),
-//! signatures (§12.5), compression codecs (§03.7) and every transport beyond
-//! the local filesystem. Bao trees (§13.3) are implemented, but nothing yet
-//! fetches over a network to use them.
+//! Sparsity schemes (§04.6), OMNI-IR (§07), adapters (§08), capability
+//! negotiation (§10), the WASM plugin host (§11), signatures (§12.5),
+//! compression codecs (§03.7) and every transport beyond the local filesystem.
+//! Bao trees (§13.3) are implemented, but nothing yet fetches over a network to
+//! use them.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -36,6 +37,7 @@ pub mod dtype;
 pub mod expr;
 pub mod layout;
 pub mod model;
+pub mod quant;
 pub mod recover;
 pub mod sha256;
 pub mod store;
