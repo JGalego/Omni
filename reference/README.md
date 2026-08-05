@@ -16,7 +16,7 @@ $ ./target/release/omni verify  model.omni
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, SHA-256, CRC-32C, dtype algebra, model builder | §01–§04 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, dtype algebra, model builder | §01–§04 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · example` | design/cli.md |
 
 ## Deliberate constraints
@@ -28,10 +28,11 @@ $ ./target/release/omni verify  model.omni
 - **`#![forbid(unsafe_code)]`.** This code parses untrusted binary input; §12.4
   requires memory safety, bounds checks on every length and offset, bounded
   nesting depth, and no allocation driven by an unvalidated declared size.
-- **SHA-256, not BLAKE3.** Both are mandatory in §03.5.1. SHA-256 is used here
-  so the crate stays dependency-free and every digest is checkable with
-  `sha256sum`. Production implementations should default to BLAKE3-256 for its
-  parallelism and Bao verified-streaming tree (§13.3).
+- **Both mandatory hashes, from scratch.** §03.5.1 requires BLAKE3-256 and
+  SHA-256. Both are implemented here, BLAKE3 including the tree internals
+  (chunk and parent chaining values) that Bao verified streaming (§13.3) is
+  built on. The BLAKE3 code is single-threaded and SIMD-free — auditability
+  over throughput; production implementations should use the upstream crate.
 - **Reproducible packing.** `pack()` is deterministic: same inputs, same bytes,
   regardless of input ordering (§01.10, writer rule W1). Enforced by a test.
 
@@ -61,16 +62,18 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-19 tests covering: SHA-256 against FIPS 180-4 vectors; CRC-32C against standard
-check values; CBOR against RFC 8949 Appendix A vectors; canonical-form rejection
-(each of D1–D8); depth and length-overflow bounds; pack/open/verify round-trip;
-reproducibility including input-order independence; data-object page alignment;
-tamper detection; truncation detection; header CRC checking; and the
-dangling-ref-is-incomplete-not-invalid rule.
+25 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+official test vectors (all three keying modes, 131 bytes of XOF output each)
+plus tree-reconstruction and domain-separation properties; CRC-32C against
+standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
+rejection (each of D1–D8); depth and length-overflow bounds; pack/open/verify
+round-trip; reproducibility including input-order independence; data-object
+page alignment; tamper detection; truncation detection; header CRC checking; and
+the dangling-ref-is-incomplete-not-invalid rule.
 
 ```console
 $ cargo test
-test result: ok. 19 passed; 0 failed
+test result: ok. 25 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

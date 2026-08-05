@@ -10,10 +10,9 @@
 //! * **No dependencies.** The C0 reader budget (`docs/design/sdk.md` §5) claims
 //!   a conforming reader needs nothing beyond a hash function. This crate is
 //!   the evidence.
-//! * **SHA-256, not BLAKE3.** Both are mandatory in §03.5.1; SHA-256 is used
-//!   here so every digest is checkable with `sha256sum` and the crate stays
-//!   dependency-free. A production implementation defaults to BLAKE3-256 for
-//!   its parallelism and Bao verified-streaming tree.
+//! * **Both mandatory hashes, from scratch.** §03.5.1 requires BLAKE3-256 and
+//!   SHA-256; both are implemented here, the former including the tree
+//!   internals that Bao verified streaming (§13.3) is built on.
 //!
 //! ## Not implemented here
 //!
@@ -25,12 +24,14 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod blake3;
 pub mod cbor;
 pub mod container;
 pub mod crc32c;
 pub mod model;
 pub mod sha256;
 
+pub use blake3::blake3 as blake3_256;
 pub use cbor::Value;
 pub use container::{otype, pack, seg, verify, Container, Digest, Object, PackOptions, Report};
 pub use model::{DType, ModelBuilder, TensorSpec};
