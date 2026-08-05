@@ -196,6 +196,33 @@ jobs:
           "$OMNI" tokenize /tmp/plain.omni --text hi; test $? = 5
           echo "the tokenizer reproduces its own vectors, and refuses when it cannot"
 
+      # §06.9: a chat template is the last place arbitrary code still runs in a
+      # model artifact. OMNI-CT renders without a sandbox because there is
+      # nothing to sandbox.
+      - name: The chat template is total, and checked
+        run: |
+          OMNI=reference/target/release/omni
+          "$OMNI" example --chat-template /tmp/ct.omni
+          "$OMNI" verify /tmp/ct.omni --template --level 6 | tee /tmp/ctv.txt
+          grep -q '3/3 vectors pass' /tmp/ctv.txt
+          # The cached `compiled` AST is derived, so V6 recomputes it.
+          grep -q '2 derived object(s) recomputed, 0 mismatched' /tmp/ctv.txt
+          # The required inputs are computable without rendering — that is what
+          # a total language buys.
+          [ "$("$OMNI" render /tmp/ct.omni --inputs | tail -n +2 | tr '\n' ' ')" \
+            = "add_generation_prompt messages " ]
+          out=$("$OMNI" render /tmp/ct.omni --message system:Hi --message user:Yo \
+                  --var add_generation_prompt=true)
+          [ "$out" = "$(printf '<|system|>\nHi<|end|>\n<|user|>\nYo<|end|>\n<|assistant|>')" ] \
+            || { echo "rendered: $out"; exit 1; }
+          # A missing input is refused with the list of what was wanted, not
+          # rendered as the empty string.
+          "$OMNI" render /tmp/ct.omni --message user:hi; test $? = 2
+          "$OMNI" render /tmp/plain.omni --message user:hi; test $? = 5
+          "$OMNI" verify /tmp/plain.omni --template; test $? = 3
+          "$OMNI" inspect /tmp/ct.omni | grep -q 'chat template omni-ct/1'
+          echo "the template renders identically, or says why not"
+
       # §10: resolution is a function of the model and the capability set, so a
       # CI job can answer "will this run on our fleet?" without the fleet.
       - name: Capability negotiation and planning

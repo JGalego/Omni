@@ -55,9 +55,10 @@ USAGE:
 
 VERBS:
     inspect <file>            Summarize a container without reading tensor payloads
-    verify  <file> [--level N] [--tokenizer]
+    verify  <file> [--level N] [--tokenizer] [--template]
                               Validate (V0-V6); exit 1 invalid, 3 indeterminate;
-                              --tokenizer also runs its conformance vectors
+                              --tokenizer and --template also run their
+                              conformance vectors
     ls      <file>            List objects in the index
     dump    <file> --header   Annotated hexdump of the 128-byte file header
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
@@ -69,6 +70,9 @@ VERBS:
                               What a (partial) read of that tensor must fetch
     tokenize <file> --text <string> | --ids <a,b,c>
                               Encode or decode with the container's tokenizer
+    render  <file> [--message role:content]… [--var name=value]… [--inputs]
+                              Render the OMNI-CT chat template (§06.9);
+                              --inputs lists the variables it reads
     pack    <dir.omnid> -o <file.omni> [--align N]
                               Build a container from a directory store
     unpack  <file.omni> -o <dir.omnid>
@@ -92,14 +96,15 @@ VERBS:
     adapter check <base.omni> <adapter.omni>
                               Validate attachment before loading weights (§08.3)
     example <out.omni> [--hash blake3|sha256] [--quantized] [--tune N]
-                              [--tokenizer]
+                              [--tokenizer] [--chat-template]
                               Build a small but complete example container;
                               --quantized exercises the value layer (int4 +
                               per-group scales + a LoRA, all as expressions);
                               --tune N fills the weights with plausible values
                               and, for N > 0, applies a seeded rank-1 update —
                               two containers that differ by a fine-tune;
-                              --tokenizer attaches a byte-level tokenizer with
+                              --tokenizer attaches a byte-level tokenizer and
+                              --chat-template an OMNI-CT template, both with
                               conformance vectors
 
 EXIT CODES (docs/design/cli.md §10):
@@ -120,6 +125,7 @@ fn main() -> ExitCode {
         "cat" => run(&args, cmd_cat),
         "deps" => run(&args, cmd_deps),
         "tokenize" => run(&args, cmd_tokenize),
+        "render" => run(&args, cmd_render),
         "pack" => cmd_pack(&args),
         "unpack" => cmd_unpack(&args),
         // fsck must work on files that do not open, so it does not go through
@@ -569,6 +575,19 @@ fn cmd_inspect(c: &Container, _args: &[String]) -> R {
             Err(e) => pr!("tokenizer     ⚠ present but unreadable: {e}"),
         }
     }
+    match chat_template_of(c) {
+        Ok(Some(t)) => pr!(
+            "chat template {} · inputs: {}",
+            t.lang,
+            t.template
+                .free_vars()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Ok(None) => pr!("chat template none"),
+        Err(e) => pr!("chat template ⚠ present but unreadable: {e}"),
+    }
     let sigs = c
         .index
         .iter()
@@ -666,10 +685,25 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         "V1 index       ✓ {} entries, sorted, complete",
         c.index.len()
     );
-    pr!(
-        "V2 structure   ✓ canonical CBOR, schemas present on {} objects",
-        c.index.iter().filter(|e| e.otype != otype::BLOB).count()
-    );
+    if r.mistyped.is_empty() {
+        pr!(
+            "V2 structure   ✓ canonical CBOR, schemas present and agreeing on {} objects (R-O02)",
+            c.index.iter().filter(|e| e.otype != otype::BLOB).count()
+        );
+    } else {
+        pr!(
+            "V2 structure   ✗ {} object(s) whose `t` contradicts the index's otype (R-O02):",
+            r.mistyped.len()
+        );
+        for (d, ot, got) in &r.mistyped {
+            pr!(
+                "     {} indexed as {} but carries `{}`",
+                short(c.header.hash, d),
+                otype::name(*ot),
+                if got.is_empty() { "(no `t`)" } else { got }
+            );
+        }
+    }
     pr!(
         "V3 integrity   ✓ {} objects, {} verified (R-O01)",
         r.objects_verified,
@@ -692,7 +726,7 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         pr!("\nincomplete: valid container, objects missing from all stores");
         return Ok(5);
     }
-    if !r.padding_ok || !r.alignment_ok {
+    if !r.padding_ok || !r.alignment_ok || !r.mistyped.is_empty() {
         return Ok(1);
     }
 
@@ -793,6 +827,22 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
                 Err(_) => indeterminate += 1,
             }
         }
+        // §06.9's `compiled` is a cached parse of `source`. A cache that
+        // disagrees with its input is worse than no cache, so it is recomputed
+        // here rather than trusted.
+        if let Ok(Some(t)) = chat_template_of(c) {
+            if t.compiled.is_some() {
+                let store = Borrowed(c);
+                let ctx = Ctx::new(&store);
+                checked += 1;
+                let bad = t
+                    .check(&ctx)
+                    .into_iter()
+                    .filter(|f| f.contains("compiled"))
+                    .count();
+                wrong += bad;
+            }
+        }
         invalid += wrong;
         pr!(
             "V6 derived     {} {checked} derived object(s) recomputed, {wrong} mismatched",
@@ -882,6 +932,54 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
         }
     }
 
+    // --template: run the §06.9 vectors and check the template's claims about
+    // itself. A chat template that drifted during conversion changes every
+    // prompt the model ever sees.
+    if args.iter().any(|a| a == "--template") {
+        let store = Borrowed(c);
+        let ctx = Ctx::new(&store);
+        match chat_template_of(c)? {
+            None => {
+                pr!("template       ⚠ this container has no `chat_template` asset");
+                indeterminate += 1;
+            }
+            Some(t) => {
+                let findings = t.check(&ctx);
+                let report = t.check_vectors(&ctx)?;
+                if report.total == 0 {
+                    pr!("template       ⚠ no conformance vectors (§06.9)");
+                    indeterminate += 1;
+                } else {
+                    pr!(
+                        "template       {} {report}",
+                        if report.ok() { "✓" } else { "✗" }
+                    );
+                    for f in &report.failures {
+                        pr!("     {f}");
+                    }
+                    if !report.ok() {
+                        invalid += 1;
+                    }
+                }
+                if findings.is_empty() {
+                    pr!(
+                        "template       ✓ omni-ct/1, inputs: {}",
+                        t.template
+                            .free_vars()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                } else {
+                    for f in &findings {
+                        pr!("template       ✗ {f}");
+                    }
+                    invalid += findings.len();
+                }
+            }
+        }
+    }
+
     if level >= 7 {
         // V7 lives in `omni sign --verify`, which needs a trust policy; a
         // verifier with no keys cannot decide authenticity, and saying "valid"
@@ -918,6 +1016,110 @@ fn tokenizer_of(
     };
     let r = omni_core::expr::parse_ref_value(&r)?;
     Ok(Some(omni_core::tokenizer::Tokenizer::load(ctx, &r)?))
+}
+
+/// Finds the `chat_template` asset, if the manifest declares one.
+fn chat_template_of(
+    c: &Container,
+) -> Result<Option<omni_core::ct::ChatTemplate>, Box<dyn std::error::Error>> {
+    let Some(r) = c
+        .root()?
+        .get("assets")
+        .and_then(|a| a.get("chat_template"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let d = omni_core::expr::parse_ref_value(&r)?.1;
+    Ok(Some(omni_core::ct::ChatTemplate::from_value(
+        &c.get_value(&d)?,
+    )?))
+}
+
+/// `omni render` — render the container's chat template (§06.9).
+///
+/// Messages come in as `--message role:content`, repeatable, and other inputs
+/// as `--var name=value`. There is no JSON on the command line because the
+/// template's required inputs are computable: `--inputs` prints them.
+fn cmd_render(c: &Container, args: &[String]) -> R {
+    let Some(t) = chat_template_of(c)? else {
+        prr!("omni: this container has no `chat_template` asset\n");
+        return Ok(5);
+    };
+    let free: Vec<String> = t.template.free_vars().into_iter().collect();
+    if args.iter().any(|a| a == "--inputs") {
+        pr!("; {} · inputs computed statically", t.lang);
+        for v in &free {
+            pr!("{v}");
+        }
+        return Ok(0);
+    }
+    let mut messages = Vec::new();
+    let mut vars: Vec<(String, Value)> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--message" => {
+                let Some(spec) = args.get(i + 1) else {
+                    prr!("omni: --message needs `role:content`\n");
+                    return Ok(2);
+                };
+                let Some((role, content)) = spec.split_once(':') else {
+                    prr!("omni: --message wants `role:content`, got `{spec}`\n");
+                    return Ok(2);
+                };
+                messages.push(Value::map(vec![
+                    ("role", Value::text(role)),
+                    ("content", Value::text(content)),
+                ]));
+                i += 2;
+            }
+            "--var" => {
+                let Some(spec) = args.get(i + 1) else {
+                    prr!("omni: --var needs `name=value`\n");
+                    return Ok(2);
+                };
+                let Some((name, value)) = spec.split_once('=') else {
+                    prr!("omni: --var wants `name=value`, got `{spec}`\n");
+                    return Ok(2);
+                };
+                // `true`/`false` and integers are given their own types; the
+                // value domain is small enough to infer unambiguously.
+                let v = match value {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    "null" | "none" => Value::Null,
+                    other => match other.parse::<u64>() {
+                        Ok(n) => Value::U(n),
+                        Err(_) => Value::text(other),
+                    },
+                };
+                vars.push((name.to_string(), v));
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let mut pairs: Vec<(Value, Value)> = vec![(Value::text("messages"), Value::Array(messages))];
+    for (k, v) in vars {
+        pairs.push((Value::text(k), v));
+    }
+    match t.template.render(&Value::Map(pairs)) {
+        Ok(out) => {
+            prr!("{out}");
+            Ok(0)
+        }
+        Err(omni_core::ct::Error::Undefined(m)) => {
+            // The inputs are knowable in advance, so say which ones.
+            prr!("omni: {m}\n");
+            prr!("omni: this template's inputs are: {}\n", free.join(", "));
+            Ok(2)
+        }
+        Err(e) => {
+            prr!("omni: {e}\n");
+            Ok(1)
+        }
+    }
 }
 
 /// `omni tokenize` — encode text, or decode ids, with the container's own
@@ -1557,7 +1759,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn cmd_example(args: &[String]) -> R {
     // Options come in two shapes: valueless switches, and `--name value`
     // pairs whose value must not be mistaken for the positional output path.
-    const SWITCHES: &[&str] = &["--quantized", "--tokenizer"];
+    const SWITCHES: &[&str] = &["--quantized", "--tokenizer", "--chat-template"];
     let tune: Option<u64> = flag(args, "--tune").and_then(|s| s.parse().ok());
     let mut positional = Vec::new();
     let mut i = 1;
@@ -1688,6 +1890,9 @@ fn cmd_example(args: &[String]) -> R {
     if args.iter().any(|a| a == "--tokenizer") {
         b = add_tokenizer(b, vocab);
     }
+    if args.iter().any(|a| a == "--chat-template") {
+        b = add_chat_template(b);
+    }
     let (objs, root) = b.build();
     let opts = PackOptions {
         hash: algo,
@@ -1780,6 +1985,92 @@ fn add_tokenizer(mut b: ModelBuilder, vocab: u64) -> ModelBuilder {
         ),
     ]);
     b.asset("tokenizer", otype::TOKENIZER, tok)
+}
+
+/// Attaches an OMNI-CT chat template to the example (§06.9).
+///
+/// The same template a Jinja2 artifact would carry, in a language that cannot
+/// execute anything. The `compiled` AST and the conformance vectors are both
+/// stored, so `omni verify --level 6 --template` has something to recompute and
+/// something to compare against.
+fn add_chat_template(mut b: ModelBuilder) -> ModelBuilder {
+    use omni_core::ct::{encode_vectors, Template};
+
+    const SOURCE: &str = "\
+{%- for m in messages -%}
+<|{{ m.role }}|>
+{{ m.content }}<|end|>
+{% endfor -%}
+{%- if add_generation_prompt -%}
+<|assistant|>
+{%- endif -%}";
+
+    let t = Template::parse(SOURCE).expect("the example template must parse");
+
+    // §06.9 stores the cached AST as a Blob — it is the CBOR encoding of an
+    // AST, not an object with a schema of its own, and giving it the
+    // ChatTemplate otype would make it contradict its own `t` (R-O02).
+    let ast = omni_core::container::Object::blob(t.to_value().encode());
+    let ast_digest = ast.digest(b.hash);
+    b.extra_objects.push(ast);
+
+    // Vectors: an input and the string it must render to. Written out by hand
+    // rather than captured from the renderer — a vector produced by the code it
+    // tests cannot fail.
+    let msg = |role: &str, content: &str| {
+        Value::map(vec![
+            ("role", Value::text(role)),
+            ("content", Value::text(content)),
+        ])
+    };
+    let cases = vec![
+        (
+            Value::map(vec![
+                ("messages", Value::Array(vec![msg("user", "Hi")])),
+                ("add_generation_prompt", Value::Bool(false)),
+            ]),
+            "<|user|>\nHi<|end|>\n".to_string(),
+        ),
+        (
+            Value::map(vec![
+                (
+                    "messages",
+                    Value::Array(vec![msg("system", "Be brief."), msg("user", "Hi")]),
+                ),
+                ("add_generation_prompt", Value::Bool(true)),
+            ]),
+            "<|system|>\nBe brief.<|end|>\n<|user|>\nHi<|end|>\n<|assistant|>".to_string(),
+        ),
+        (
+            // No messages at all still renders — the loop is over a finite
+            // structure, and an empty one is not a special case.
+            Value::map(vec![
+                ("messages", Value::Array(vec![])),
+                ("add_generation_prompt", Value::Bool(true)),
+            ]),
+            "<|assistant|>".to_string(),
+        ),
+    ];
+    let vec_blob = omni_core::container::Object::blob(encode_vectors(&cases));
+    let vec_digest = vec_blob.digest(b.hash);
+    b.extra_objects.push(vec_blob);
+
+    let obj = Value::map(vec![
+        ("t", Value::text("omni.tok/chat-template")),
+        ("v", Value::U(1)),
+        ("lang", Value::text(omni_core::ct::LANG)),
+        ("source", Value::text(SOURCE)),
+        (
+            "compiled",
+            Value::Array(vec![Value::U(0), Value::Bytes(ast_digest.to_vec())]),
+        ),
+        ("capabilities", Value::Array(vec![Value::text("system")])),
+        (
+            "vectors",
+            Value::Array(vec![Value::U(0), Value::Bytes(vec_digest.to_vec())]),
+        ),
+    ]);
+    b.asset("chat_template", otype::CHAT_TEMPLATE, obj)
 }
 
 /// Adds the worked example of §04.8: one set of stored bytes, four tensors.

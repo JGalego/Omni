@@ -204,8 +204,8 @@ pub mod otype {
             CHUNK_LIST => "omni.tensor/chunklist",
             CODEBOOK => "omni.tensor/codebook",
             GRAPH_MODULE => "omni.ir/module",
-            TOKENIZER => "omni.meta/tokenizer",
-            CHAT_TEMPLATE => "omni.meta/chat-template",
+            TOKENIZER => "omni.tok/tokenizer",
+            CHAT_TEMPLATE => "omni.tok/chat-template",
             ADAPTER => "omni.adapt/adapter",
             TRAINING_STATE => "omni.train/state",
             SHARD_MAP => "omni.train/shardmap",
@@ -1245,6 +1245,9 @@ pub struct Report {
     pub alignment_ok: bool,
     pub reachable: usize,
     pub dangling: Vec<Digest>,
+    /// R-O02 violations: the index says one object type, the object's own `t`
+    /// says another. `(digest, index otype, the `t` it carries)`.
+    pub mistyped: Vec<(Digest, u16, String)>,
 }
 
 pub fn verify(c: &Container) -> Res<Report> {
@@ -1303,6 +1306,26 @@ pub fn verify(c: &Container) -> Res<Report> {
         bytes_verified += e.stored_len;
     }
 
+    // R-O02: the index's `otype` and the object's own `t` must agree. An
+    // object that lies about what it is defeats every type-directed decision a
+    // reader makes before fetching it — which, in a format where refs carry the
+    // type, is all of them.
+    let mut mistyped = Vec::new();
+    for e in &c.index {
+        if e.otype == otype::BLOB || e.oflags & oflags::EXTERNAL != 0 {
+            continue;
+        }
+        let Some(want) = otype::schema_uri(e.otype) else {
+            continue;
+        };
+        let v = c.get_value(&e.digest)?;
+        match v.get("t").and_then(|x| x.as_str()) {
+            Some(got) if got == want => {}
+            Some(got) => mistyped.push((e.digest, e.otype, got.to_string())),
+            None => mistyped.push((e.digest, e.otype, String::new())),
+        }
+    }
+
     // V4: reachability from the root.
     let mut seen: std::collections::BTreeSet<Digest> = Default::default();
     let mut dangling = Vec::new();
@@ -1330,6 +1353,7 @@ pub fn verify(c: &Container) -> Res<Report> {
         alignment_ok,
         reachable: seen.len(),
         dangling,
+        mistyped,
     })
 }
 
@@ -1760,5 +1784,43 @@ mod tests {
         let c = Container::open(bytes).unwrap();
         let r = verify(&c).unwrap();
         assert_eq!(r.dangling.len(), 1);
+    }
+
+    #[test]
+    fn an_object_that_lies_about_its_type_is_caught() {
+        // R-O02: refs carry the object type, so a reader decides what to do with
+        // an object *before* fetching it. An object whose own `t` contradicts
+        // the index defeats every one of those decisions.
+        let algo = HashAlgo::default();
+        let (mut objs, root) = tiny_model(algo);
+        objs.push(Object::structure(
+            otype::TOKENIZER,
+            &Value::map(vec![
+                ("t", Value::text("omni.tensor/table")),
+                ("v", Value::U(1)),
+            ]),
+        ));
+        // And one with no `t` at all.
+        objs.push(Object::structure(
+            otype::CHAT_TEMPLATE,
+            &Value::map(vec![("v", Value::U(1))]),
+        ));
+        let bytes = pack(&objs, &root, &opts(algo)).unwrap();
+        let c = Container::open(bytes).unwrap();
+        let r = verify(&c).unwrap();
+        assert_eq!(r.mistyped.len(), 2, "{:?}", r.mistyped);
+        assert!(r
+            .mistyped
+            .iter()
+            .any(|(_, ot, got)| *ot == otype::TOKENIZER && got == "omni.tensor/table"));
+        assert!(r
+            .mistyped
+            .iter()
+            .any(|(_, ot, got)| *ot == otype::CHAT_TEMPLATE && got.is_empty()));
+        // Every object in the honest container agrees with its index entry, so
+        // the registry is exercised in both directions.
+        let (objs, root) = tiny_model(algo);
+        let c = Container::open(pack(&objs, &root, &opts(algo)).unwrap()).unwrap();
+        assert!(verify(&c).unwrap().mistyped.is_empty());
     }
 }

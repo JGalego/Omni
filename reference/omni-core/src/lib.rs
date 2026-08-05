@@ -34,6 +34,7 @@ pub mod cbor;
 pub mod codec;
 pub mod container;
 pub mod crc32c;
+pub mod ct;
 pub mod delta;
 pub mod dtype;
 pub mod ed25519;

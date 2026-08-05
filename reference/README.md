@@ -22,14 +22,17 @@ $ ./target/release/omni adapter check base.omni lora.omni
 $ ./target/release/omni example --tokenizer tok.omni
 $ ./target/release/omni verify tok.omni --tokenizer     # runs its §06.7.1 vectors
 $ ./target/release/omni tokenize tok.omni --text "hello"
+$ ./target/release/omni example --chat-template ct.omni
+$ ./target/release/omni verify ct.omni --template         # runs its §06.9 vectors
+$ ./target/release/omni render ct.omni --message user:"Hi" --var add_generation_prompt=true
 ```
 
 ## What is here
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, model builder | §01–§06, §13 |
-| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · pack · unpack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, model builder | §01–§06, §13 |
+| `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · tokenize · render · pack · unpack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -104,12 +107,23 @@ implemented:
   a plugin kind (§06.7.2), NFC composition, or a `regex-split` pattern needing
   Unicode property classes — makes encoding *indeterminate* rather than
   silently producing different token ids
+- §06.9 OMNI-CT: a *total* template language, so a chat template renders with
+  no sandbox because there is nothing to sandbox. No `while`, no recursion, no
+  macro, no include, no import, no attribute access into host objects, no method
+  call on a value — `{% for %}` iterates a finite structure already in memory,
+  and the closed standard library is pure. Because it is total, a template's
+  required inputs are computable statically (`omni render --inputs`), the
+  optional `compiled` AST is a derived object that V6 recomputes, and the §06.9
+  vectors are run by `omni verify --template`
+- §01.5 R-O02 in `verify`: an object whose own `t` contradicts the index's
+  `otype` is invalid. Refs carry the type, so a reader decides what to do with
+  an object before fetching it; one that lies defeats all of those decisions
 - §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
   reached through `omni sign --verify`
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §06.9 chat templates · §07 OMNI-IR · §09 training state
+- §07 OMNI-IR · §09 training state
 - §11 WASM plugins
 - §03.7's `zstd` (a MUST) and the other optional codecs: reported as
   unsupported rather than half-decoded · §13 HTTP/OCI transport
@@ -119,7 +133,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-250 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+271 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -187,13 +201,27 @@ vector which disagrees is a failure rather than a warning, and that an
 unimplemented pre-tokenizer step refuses to encode instead of guessing; and that
 an unimplemented regex escape — `\p{L}` above all — is a parse error rather
 than the literal letter, because reading `\p` as `p` matches a different
-language without saying so.
+language without saying so. For OMNI-CT: that a realistic chat
+template renders exactly, that its required inputs are computed without
+rendering it, that a missing input is an error rather than the empty string,
+that `while`, `macro`, `include`, `import` and `raw` are each a syntax error
+naming the closed statement set, that a `set` inside a loop cannot feed back
+into the loop's own bound, that there is no method call and no name outside the
+closed library, that whitespace-control dashes are not subtraction and `%}` is
+not a remainder, that a float or byte string in the input is refused rather than
+coerced, that `strftime` cannot ask for the current time and agrees with known
+dates on both sides of the epoch, that a runaway product of template and input
+size hits the budget instead of running, that a cached AST disagreeing with its
+source is reported, that a capability declared but never read is reported, and
+that a container claiming Jinja2 as its template *language* is refused —
+executing one is the problem §06.9 exists to fix. And that an object whose `t`
+contradicts the index's otype is invalid (R-O02).
 Every
 container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 250 passed; 0 failed
+test result: ok. 271 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
