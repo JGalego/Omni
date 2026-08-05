@@ -27,11 +27,31 @@ not later.*
 met by construction (§02.7), measured at 41 ms for a 10⁶-object index, dominated
 by materialising the entry array rather than by I/O. Fuzzing: the in-CI mutation
 fuzzer is clean over millions of iterations; the 72-hour libFuzzer run is a
-release activity and has not been performed. **Index latency: not met** —
-p99 ≈ 590 ns against a 500 ns target, after a 6.5× improvement from implementing
-the bucket table §02.6.1 already specified. The measurement and what it implies
-are in [`performance.md`](performance.md) §11. The gate has done its job: it
-found the gap while the format is still a draft.
+release activity and has not been performed. **Index latency: not met, and now
+understood.** The first pass measured p99 ≈ 590 ns against a 500 ns target after a
+6.5× improvement from implementing the bucket table §02.6.1 already specified. The
+second pass found something more useful: that p99 is not reproducible on the test
+machine — the same binary measures 640, 781 and 822 ns across three runs — so
+every recorded improvement smaller than ~200 ns was unfalsifiable. `omni bench`
+now reports rounds and their spread, and reports **entries compared per lookup**,
+which is the part of the cost this code decides and is the same on every machine.
+It is **2.20**, down from 8.62, from interpolating inside the bucket — digests are
+cryptographic hashes, so where an entry sits in its bucket is predictable. That
+change touches 3.9× less index per lookup and does *not* move the p99 on this
+hardware, and both halves of that are recorded.
+
+A lookup is now one L2-resident bucket read plus about one DRAM access and a page
+walk over a 61 MiB working set, which is the floor for a 64-byte index entry. The
+remaining gap is attributable to hardware and to the reference implementation's
+no-`unsafe` rule — huge pages would remove most of the tail and need `mmap` — and
+not to the index format, so the format does *not* change on the strength of this
+gate. What replaces the deferred decision is a criterion that can be measured
+without a quiet machine: any proposal to change the index must beat 2.20 entries
+compared per lookup at 10⁶ objects. The reasoning and the two experiments, one
+accepted and one rejected, are in [`performance.md`](performance.md) §11.
+
+The gate has still done its job: it found the gap while the format is a draft, and
+then it found that the ruler was bent.
 
 ## Phase 1 — Prove the value layer (months 3–7)
 

@@ -4504,26 +4504,66 @@ fn cmd_bench(args: &[String]) -> R {
     clock.sort_unstable();
     let clock_overhead = clock[clock.len() / 2];
 
-    let mut times: Vec<u64> = Vec::with_capacity(lookups);
-    for p in &probes {
-        let t = std::time::Instant::now();
-        let hit = c.find(p);
-        times.push(t.elapsed().as_nanos() as u64);
-        assert!(hit.is_some(), "every probe is an object that exists");
+    // Rounds, not one pass. The p99 of a single pass on a shared machine moves
+    // by 30 % between runs of the same binary, which is enough to hide any
+    // change worth making — so the spread across rounds is reported and the
+    // headline figure is the median round rather than the luckiest one.
+    let rounds: usize = flag(args, "--rounds")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let mut per_round: Vec<Vec<u64>> = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let mut times: Vec<u64> = Vec::with_capacity(lookups);
+        for p in &probes {
+            let t = std::time::Instant::now();
+            let hit = c.find(p);
+            times.push(t.elapsed().as_nanos() as u64);
+            assert!(hit.is_some(), "every probe is an object that exists");
+        }
+        times.sort_unstable();
+        per_round.push(times);
     }
-    times.sort_unstable();
+    let pct_of =
+        |times: &[u64], q: f64| times[((times.len() as f64 * q) as usize).min(times.len() - 1)];
+    // The reported percentile is the median across rounds of that percentile.
+    let across = |q: f64| {
+        let mut v: Vec<u64> = per_round.iter().map(|t| pct_of(t, q)).collect();
+        v.sort_unstable();
+        (v[v.len() / 2], v[0], v[v.len() - 1])
+    };
 
-    let pct = |q: f64| times[((times.len() as f64 * q) as usize).min(times.len() - 1)];
     pr!();
-    pr!("index lookup over {} probes", commas(lookups as u64));
-    pr!("  p50            {} ns", pct(0.50));
-    pr!("  p90            {} ns", pct(0.90));
-    pr!("  p99            {} ns", pct(0.99));
-    pr!("  p99.9          {} ns", pct(0.999));
-    pr!("  max            {} ns", times[times.len() - 1]);
+    pr!(
+        "index lookup over {} probes x {rounds} round(s)",
+        commas(lookups as u64)
+    );
+    for (label, q) in [
+        ("p50", 0.50),
+        ("p90", 0.90),
+        ("p99", 0.99),
+        ("p99.9", 0.999),
+    ] {
+        let (med, lo, hi) = across(q);
+        pr!("  {label:<14} {med} ns   (rounds: {lo}–{hi})");
+    }
+    pr!(
+        "  max            {} ns",
+        per_round.iter().map(|t| t[t.len() - 1]).max().unwrap_or(0)
+    );
     pr!("  (clock overhead {clock_overhead} ns, included in the figures above)");
 
-    let p99 = pct(0.99);
+    // The part of the cost this code decides, which is the same on every
+    // machine: how many index entries a lookup compares. A wall-clock p99 that
+    // swings 30 % between runs cannot tell you whether a change helped; this
+    // can.
+    let total: usize = probes.iter().map(|p| c.probe_cost(p)).sum();
+    let worst = probes.iter().map(|p| c.probe_cost(p)).max().unwrap_or(0);
+    pr!(
+        "  entries compared  {:.2} per lookup (worst {worst}) — machine-independent",
+        total as f64 / probes.len() as f64
+    );
+
+    let (p99, _, _) = across(0.99);
     pr!();
     if n >= 1_000_000 {
         pr!("Gate 0: p99 < 500 ns at 10^6 objects");

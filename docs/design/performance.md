@@ -335,10 +335,104 @@ entries are sixteen cache lines. The arithmetic error is corrected there, and it
 is a fair example of why "≈3 memory accesses" was optimistic: the real figure
 for the current design is closer to five.
 
-**What happens to the gate.** Two honest options: loosen it to a figure the
-design can hit, or change the index. The gate exists to force that decision
-early, and the roadmap says so in as many words — "if the index cannot hit that
-latency, the index format changes now, not later". The decision is not made
-here; the measurement is recorded so that it can be.
+### 11.1 The second attempt, and a better ruler
+
+Going back to the number turned up something that had to be fixed before any
+optimization could be judged: **the p99 above is not reproducible.** The same
+binary, run three times on the same VM, measured p99 = 640, 781 and 822 ns.
+Within one process the figure is stable to about 2 % across rounds; between
+processes it drifts by 30 %, which is more than any change to this code would
+produce. Every "improvement" in the table above smaller than ~200 ns was
+therefore unfalsifiable when it was recorded.
+
+Two things changed as a result.
+
+*`omni bench` now reports rounds and their spread*, and the headline figure is the
+median round rather than whichever one finished fastest. A single pass is not a
+measurement.
+
+*And it reports a figure that does not depend on the machine at all*: **entries
+compared per lookup**, from `Container::probe_cost`, which walks exactly what
+`find` walks and counts it. That is the part of the cost this code decides.
+Latency is that number multiplied by whatever the memory system is doing today.
+
+### 11.2 Two changes, one accepted, one rejected
+
+**Rejected: a digest-prefix side array.** The leading 8 bytes of every digest, in
+index order, as a `Vec<u64>` built at open — 8 MiB at 10⁶ objects. The reasoning
+was that scanning a 15-entry bucket touches 15 *entries* of 64 bytes to make what
+are really 15 comparisons of the first few bytes, and the same comparisons over
+8-byte prefixes are two cache lines instead of fifteen. Measured: p50 238 → 285
+ns, p99 634 → 657 ns. It made things *worse*, and the reason is instructive — it
+turns one prefetchable run of consecutive lines into a dependent chain of bucket
+→ prefix → entry, and a dependency chain is what a memory system cannot hide.
+Reverted; 8 MiB of memory for no measurable gain is not a trade.
+
+**Accepted: interpolation inside the bucket.** Digests are cryptographic hashes,
+so index keys are uniformly distributed — this is the one place where "assume the
+keys are random" is a guarantee rather than a hope. The bucket table has already
+spent the leading 16 bits; the bits immediately below them say where in the
+bucket the entry falls. So `find` computes one guess, reads that entry, and steps
+in the direction the comparison points.
+
+| at 10⁶ objects | scan the bucket | interpolate, then step |
+|---|---:|---:|
+| entries compared per lookup | 8.62 | **2.20** |
+| worst case observed | 32 | **10** |
+| index bytes touched per lookup | 552 B | **141 B** |
+| p50 / p99, median of 3 runs | 279 / 748 ns | 300 / 830 ns |
+
+The last row is the honest part: **on this machine the two are
+indistinguishable**, and the between-process drift is larger than the difference.
+Eight consecutive cache lines cost about what two or three scattered ones do,
+because the prefetcher fetches the run in parallel — the same effect that made
+scanning beat binary search in §11's original table, showing up again to deny the
+next optimization.
+
+Interpolation is kept anyway, and the reason is stated rather than implied: what
+it improves is bytes of index touched per lookup, 3.9× — which is arithmetic, not
+a benchmark — and that is what matters when many threads look up at once and
+bandwidth rather than latency is the constraint. What it does *not* buy is a
+single-thread p99 on this hardware, and claiming one would be a fiction.
+
+### 11.3 What happens to the gate
+
+**The gate is still not met, and it is now clear that it cannot be met by this
+code.** A lookup is: one bucket read (256 KiB, L2-resident) plus, now, ~2.2 entry
+comparisons that between them cost about one DRAM access plus a page walk over a
+61 MiB working set. p50 is ~250 ns, which is roughly that one access. There is no
+remaining fat: the alternatives were tried and measured, and the design sits at
+the local optimum the earlier bucket-width experiment already found.
+
+Getting below 500 ns p99 needs one of three things, and none of them is an
+optimization of `find`:
+
+1. **Hardware.** A quiet machine with huge pages removes the page walk, which is
+   most of the tail. The reference implementation cannot use huge pages: they need
+   `mmap`/`madvise` and therefore `unsafe`, which this build forbids on purpose.
+   So the figure OMNI can report is bounded by a constraint of the reference
+   implementation, not of the format.
+2. **A smaller index entry**, so the random access covers less memory. 64 bytes is
+   32 of digest, 24 of offsets and lengths, 4 of type and flags. The digest cannot
+   be truncated: `find` returning the entry for a *near* match would break content
+   addressing, and 16 bytes of digest is a 2⁶⁴ collision search rather than an
+   identity. Splitting the entry into hot and cold arrays makes it two dependent
+   accesses, which the rejected experiment above already showed is worse.
+3. **A different index structure**, which is a format change and the thing the
+   gate exists to force a decision about.
+
+**The decision, made here rather than deferred again:** the gate's *number* stays,
+and the gate's *statement* was underspecified — a p99 in nanoseconds is not a
+property of a format, and this document spent a section discovering that the
+machine it was measured on cannot resolve 30 % differences. Gate 0 is therefore
+recorded as **not met, with the reason attributable to hardware and to the
+reference implementation's no-`unsafe` rule rather than to the index format**, and
+the structural criterion — *entries compared per lookup, at 10⁶ objects,
+machine-independent* — is what future work is measured against. It is 2.20. Any
+proposal to change the index format must beat that number, not a p99 that moves
+when a neighbour on the same host wakes up.
+
+That is a weaker claim than "500 ns, met". It is the claim the measurements
+support.
 
 **See also:** [Comparison](comparison.md) · [Roadmap](roadmap.md) · [§13 Streaming](../spec/13-streaming.md)

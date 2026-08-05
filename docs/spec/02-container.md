@@ -228,17 +228,25 @@ binary search.
 
 **Lookup cost.** With a 16-bit bucket table (65 536 × `u32` = 256 KiB), locating
 an object is one bucket read followed by a search among the entries sharing that
-digest prefix. For a 1 M-object store that is ~15 entries, which at a 64-byte
-stride is ~15 cache lines — so a *scan* of them, which the hardware prefetcher
-handles, beats a binary search's random probes. Zero syscalls, zero allocation,
-zero parsing. The index for that store is 61 MiB; it need not be resident, since
-only touched pages fault in.
+digest prefix. For a 1 M-object store that is ~15 entries at a 64-byte stride.
+A reader MAY scan them — the hardware prefetcher handles a run of consecutive
+lines better than a binary search's random probes — but it can do better than
+either: digests are cryptographic hashes, so the entries in a bucket are
+*uniformly distributed*, and the digest bits immediately below the bucket prefix
+say where in the bucket an entry falls. One interpolated guess and a step or two
+finds it, which the reference implementation measures at 2.2 entries compared per
+lookup against 8.6 for a scan. Zero syscalls, zero allocation, zero parsing. The
+index for that store is 61 MiB; it need not be resident, since only touched pages
+fault in.
 
-**Measured, not modelled.** `omni bench` reports p50 ≈ 200 ns and p99 ≈ 590 ns
-at 10⁶ objects on a cloud VM. That is above the roadmap's Gate 0 target of
-500 ns p99, and the gap is discussed in
-[`docs/design/performance.md`](../design/performance.md) §11 rather than
-rounded away here.
+**Measured, not modelled.** `omni bench` reports p50 ≈ 250 ns and p99 ≈ 690 ns at
+10⁶ objects on a cloud VM — above the roadmap's Gate 0 target of 500 ns p99. It
+also reports that the same binary's p99 moves by 30 % between runs on that host,
+which is why the reference implementation now reports entries compared per lookup
+as well: a latency in nanoseconds is not a property of a format. Both figures and
+what they imply for the gate are in
+[`docs/design/performance.md`](../design/performance.md) §11 rather than rounded
+away here.
 
 `bucket_bits` MAY be 0, 8, 16, 20 or 24. Wider is not automatically better: a
 20-bit table gives about one entry per bucket, but its 4 MiB no longer fits in

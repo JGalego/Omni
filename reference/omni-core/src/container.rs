@@ -1152,6 +1152,38 @@ impl Container {
     /// is roughly an order of magnitude, because a 20-probe search over 61 MiB
     /// is 20 cache misses and nothing else.
     pub fn find(&self, d: &Digest) -> Option<&IndexEntry> {
+        let mut probes = 0;
+        self.locate::<false>(d, &mut probes).map(|i| &self.index[i])
+    }
+
+    /// How many index entries a lookup for `d` compares — the same walk as
+    /// [`Container::find`], counted.
+    ///
+    /// This exists because a wall-clock p99 on a shared machine is not a
+    /// measurement of the index. `docs/design/performance.md` §11 records a
+    /// p99 that moves by 30 % between runs of the *same binary*, which is
+    /// enough noise to hide any change worth making. Entries compared is the
+    /// part of the cost this code decides, and it is the same on every machine.
+    ///
+    /// It is a separate entry point rather than an out-parameter on `find`
+    /// because a counter in the hot path is a store per probe; `COUNT` is a
+    /// const generic so the counting compiles away where it is not wanted.
+    pub fn probe_cost(&self, d: &Digest) -> usize {
+        let mut probes = 0;
+        self.locate::<true>(d, &mut probes);
+        probes
+    }
+
+    #[inline(always)]
+    fn locate<const COUNT: bool>(&self, d: &Digest, probes: &mut usize) -> Option<usize> {
+        macro_rules! probe {
+            ($i:expr) => {{
+                if COUNT {
+                    *probes += 1;
+                }
+                &self.index[$i]
+            }};
+        }
         let (lo, hi) = if self.bucket_bits > 0 && !self.buckets.is_empty() {
             let b = bucket_of(d, self.bucket_bits);
             let lo = self.buckets[b] as usize;
@@ -1167,19 +1199,80 @@ impl Container {
         if lo >= hi {
             return None;
         }
-        // A bucket holds a handful of entries occupying consecutive cache
-        // lines, which the hardware prefetcher handles far better than the
-        // random probe pattern of a binary search. Binary search wins only
-        // once the span is large enough for its logarithmic probe count to
-        // beat sequential bandwidth.
+        // An `IndexEntry` is one cache line and the digest is at the front of
+        // it, so the line that confirms a candidate is also the line that
+        // answers the query. What is left to minimize is how many of those lines
+        // get touched, and the way to touch one is to guess which.
+        //
+        // Digests are cryptographic hashes, so they are uniform — this is the
+        // one place where "the keys are random" is a guarantee rather than a
+        // hope. The bucket table has already spent the leading `bucket_bits`;
+        // the bits immediately below them say where in that bucket the entry
+        // falls, to within an entry or two. So: one guess, then a step in the
+        // direction the comparison points.
+        //
+        // What this buys, measured: 2.20 entries compared per lookup against
+        // 8.62 for scanning the bucket, at 10^6 objects — 141 bytes of index
+        // touched instead of 552. What it does *not* buy, also measured: any
+        // single-thread latency on the machine in `performance.md` §11, where
+        // the scan's eight consecutive lines cost the same as these two or three
+        // scattered ones because the prefetcher fetches them in parallel. The
+        // claim here is bandwidth per lookup, which is arithmetic, and not a p99,
+        // which would be a fiction on that hardware.
+        //
+        // The scan below is the fallback: it is what runs for a container with
+        // no bucket table, where the range is the whole index and there is
+        // nothing to interpolate within.
         const LINEAR_SCAN_LIMIT: usize = 64;
-        if hi - lo <= LINEAR_SCAN_LIMIT {
-            return self.index[lo..hi].iter().find(|e| e.digest == *d);
+        let span = hi - lo;
+        if self.bucket_bits > 0 && span > 1 {
+            let p = u64::from_be_bytes(d[..8].try_into().unwrap());
+            // What is left of the digest once the bucket has consumed its
+            // prefix, as a 32-bit fraction of the bucket's own range.
+            let frac = (p << self.bucket_bits) >> 32;
+            let guess = lo + (((frac * span as u64) >> 32) as usize).min(span - 1);
+            // Sorted, so the first comparison decides the direction and the walk
+            // is monotone from there: it stops at the answer, or at the first
+            // entry past where the answer would have been.
+            return match probe!(guess).digest.cmp(d) {
+                std::cmp::Ordering::Equal => Some(guess),
+                std::cmp::Ordering::Less => {
+                    for i in guess + 1..hi {
+                        match probe!(i).digest.cmp(d) {
+                            std::cmp::Ordering::Equal => return Some(i),
+                            std::cmp::Ordering::Less => continue,
+                            std::cmp::Ordering::Greater => return None,
+                        }
+                    }
+                    None
+                }
+                std::cmp::Ordering::Greater => {
+                    for i in (lo..guess).rev() {
+                        match probe!(i).digest.cmp(d) {
+                            std::cmp::Ordering::Equal => return Some(i),
+                            std::cmp::Ordering::Greater => continue,
+                            std::cmp::Ordering::Less => return None,
+                        }
+                    }
+                    None
+                }
+            };
         }
-        self.index[lo..hi]
-            .binary_search_by(|e| e.digest.as_slice().cmp(d.as_slice()))
-            .ok()
-            .map(|i| &self.index[lo + i])
+
+        if span <= LINEAR_SCAN_LIMIT {
+            return (lo..hi).find(|i| probe!(*i).digest == *d);
+        }
+        let mut a = lo;
+        let mut b = hi;
+        while a < b {
+            let mid = a + (b - a) / 2;
+            match probe!(mid).digest.cmp(d) {
+                std::cmp::Ordering::Equal => return Some(mid),
+                std::cmp::Ordering::Less => a = mid + 1,
+                std::cmp::Ordering::Greater => b = mid,
+            }
+        }
+        None
     }
 
     /// Returns an object's bytes, verifying its digest (verification level L1).
@@ -2312,5 +2405,58 @@ mod tests {
         let (objs, root) = tiny_model(algo);
         let c = Container::open(pack(&objs, &root, &opts(algo)).unwrap()).unwrap();
         assert!(verify(&c).unwrap().mistyped.is_empty());
+    }
+    #[test]
+    fn every_object_is_found_however_the_lookup_guesses() {
+        // The bucket table turns on at 1024 entries, and above it `find`
+        // *guesses* where in a bucket the entry is. A guess that is wrong must
+        // still find the entry — otherwise the container has objects it says are
+        // not there, which is the worst failure this index can have. So: every
+        // object, looked up, at a size where the guessing path is live.
+        let algo = HashAlgo::default();
+        let objects: Vec<Object> = (0..4000u64)
+            .map(|i| {
+                Object::structure(
+                    otype::METADATA,
+                    &Value::map(vec![
+                        ("t", Value::text("omni.bench/filler")),
+                        ("v", Value::U(1)),
+                        ("i", Value::U(i)),
+                    ]),
+                )
+            })
+            .collect();
+        let root = objects[0].digest(algo);
+        let c = Container::open(pack(&objects, &root, &opts(algo)).unwrap()).unwrap();
+        assert!(c.bucket_bits > 0, "the guessing path needs a bucket table");
+
+        let mut probes = 0usize;
+        for o in &objects {
+            let d = o.digest(algo);
+            let e = c
+                .find(&d)
+                .unwrap_or_else(|| panic!("{} is missing", hex(&d)));
+            assert_eq!(e.digest, d);
+            probes += c.probe_cost(&d);
+        }
+        // And the count is the same walk: a lookup that finds something compared
+        // at least one entry.
+        assert!(
+            probes >= objects.len(),
+            "{probes} probes for {} objects",
+            objects.len()
+        );
+
+        // Absence is absence, not a neighbour. Flipping one bit of a real digest
+        // lands in the same bucket as it, which is exactly where a guess-then-walk
+        // could wander into the wrong answer.
+        for o in objects.iter().take(200) {
+            let mut d = o.digest(algo);
+            d[31] ^= 1;
+            if objects.iter().any(|x| x.digest(algo) == d) {
+                continue;
+            }
+            assert!(c.find(&d).is_none(), "{} should not be found", hex(&d));
+        }
     }
 }
