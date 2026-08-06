@@ -239,12 +239,12 @@ lookup against 8.6 for a scan. Zero syscalls, zero allocation, zero parsing. The
 index for that store is 61 MiB; it need not be resident, since only touched pages
 fault in.
 
-**Measured, not modelled.** `omni bench` reports p50 ≈ 250 ns and p99 ≈ 690 ns at
-10⁶ objects on a cloud VM — above the roadmap's Gate 0 target of 500 ns p99. It
-also reports that the same binary's p99 moves by 30 % between runs on that host,
-which is why the reference implementation now reports entries compared per lookup
-as well: a latency in nanoseconds is not a property of a format. Both figures and
-what they imply for the gate are in
+**Measured, not modelled.** `omni bench` reports 2.20 entries compared per lookup
+at 10⁶ objects, with p50 ≈ 250 ns and p99 ≈ 690 ns on a cloud VM. The entry count
+is the figure to compare implementations by: the same binary's p99 moves 30 %
+between runs on that host, so a latency in nanoseconds measures the machine and
+not the format. Both figures, the two optimizations that did *not* help, and the
+roadmap gate that was restated because of them are in
 [`docs/design/performance.md`](../design/performance.md) §11 rather than rounded
 away here.
 
