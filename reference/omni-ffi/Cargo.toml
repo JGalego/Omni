@@ -1,0 +1,17 @@
+[package]
+name = "omni-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The OMNI C ABI: the substrate every non-Rust binding is built on."
+
+[lib]
+name = "omni"
+# `cdylib` for dlopen and for language runtimes that load shared objects;
+# `staticlib` for embedding without a runtime dependency; `rlib` so the crate's
+# own tests can call the entry points the way C does.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+omni-core = { path = "../omni-core" }

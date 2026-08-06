@@ -12,7 +12,9 @@
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
 //!
-//! * **No `unsafe`.** Untrusted binary input is parsed here; see §12.4.
+//! * **No `unsafe`.** Untrusted binary input is parsed here; see §12.4. The C
+//!   ABI in `omni-ffi` is the one crate that needs it, and it needs it for the
+//!   boundary rather than for the parse.
 //! * **No dependencies.** The C0 reader budget (`docs/design/sdk.md` §5) claims
 //!   a conforming reader needs nothing beyond a hash function. This crate is
 //!   the evidence.
@@ -33,8 +35,7 @@
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
 //! in `docs/design/import-export.md` §3, four are implemented — [`safetensors`],
 //! [`peft`], and GPTQ and AWQ in [`hfquant`] — and a request to import another is
-//! refused by name. Only safetensors exports, so a GPTQ import can be
-//! dequantized out but not written back as GPTQ.
+//! refused by name. All four export as well as import.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]

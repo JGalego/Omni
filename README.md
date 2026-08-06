@@ -11,7 +11,7 @@
 [![Spec](https://img.shields.io/badge/spec-OMNI%2F1.0--draft-6366f1)](docs/spec/00-overview.md)
 [![Reference](https://img.shields.io/badge/reference-Rust-22d3ee?logo=rust&logoColor=white)](reference)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](reference/omni-core/Cargo.toml)
-[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success)](reference/omni-core/src/lib.rs)
+[![Unsafe](https://img.shields.io/badge/unsafe-forbidden%20in%20the%20parser-success)](reference/omni-core/src/lib.rs)
 [![Spec license](https://img.shields.io/badge/spec-CC--BY--4.0-blue)](#license)
 [![Code license](https://img.shields.io/badge/code-Apache--2.0%20OR%20MIT-blue)](#license)
 
@@ -193,12 +193,13 @@ and deltas, OMNI-IR with its dialects and rewrites and an interpreter that runs
 it, capability negotiation,
 signatures, training state, a WebAssembly host for plugins, HTTP range transport
 with the detached index sidecar, an object server and the OCI mapping, and
-lossless safetensors import and export, and PEFT LoRA, GPTQ and AWQ import — the
-last two as expressions over the packed words rather than as a conversion of them,
+lossless safetensors, PEFT LoRA, GPTQ and AWQ import *and* export — the quantized
+two as expressions over the packed words rather than as a conversion of them,
 checked by dequantizing every layer and comparing against arithmetic done in
-Python. What is *not* implemented is stated in
+Python — and a [C ABI](reference/omni-ffi/include/omni.h) that a C program drives
+end to end, DLPack included. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
-it — every importer but those four and every exporter but safetensors, `https://` (TLS
+it — every importer but those four, the writer side of the C ABI, `https://` (TLS
 needs a dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
 plugin host, and the MAY-level codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See
@@ -212,6 +213,13 @@ dependencies beyond a hash function — so
 Python with BLAKE3 written out because Python does not ship it, and CI checks that
 it and the Rust implementation agree on every digest and every tensor byte of the
 same file. A format is only as portable as its second implementation.
+
+Above that floor, [`reference/omni-ffi`](reference/omni-ffi) is the C ABI every
+other language binds through — opaque handles, no panic ever crossing the
+boundary, status codes identical to the CLI's exit codes, and DLPack out to
+PyTorch, JAX and NumPy without a copy. It is the one crate here that uses
+`unsafe`, because a C ABI cannot be written without it; the parser stays
+`#![forbid(unsafe_code)]`, which is the half of the codebase where it matters.
 
 ## File extension and media types
 

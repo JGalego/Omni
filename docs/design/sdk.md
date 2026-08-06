@@ -149,6 +149,42 @@ Design rules:
 - **DLPack** (`omni_tensor_dlpack`) is the interop lingua franca: PyTorch, JAX,
   CuPy, TensorFlow, MLX and NumPy all consume it with zero copy.
 
+### 3.1 What is built
+
+This one exists: [`reference/omni-ffi`](../../reference/omni-ffi) and
+[`omni.h`](../../reference/omni-ffi/include/omni.h), built as both a `cdylib` and
+a `staticlib`, with [`examples/read.c`](../../reference/omni-ffi/examples/read.c)
+driving the whole path in C and CI compiling it at `-Wall -Wextra -Werror`.
+
+Four things about the build differ from the sketch above, and each is a decision
+rather than a shortfall:
+
+- **`unsafe` lives here and nowhere else.** `omni-core` stays
+  `#![forbid(unsafe_code)]` because it parses untrusted input; a C ABI cannot be
+  written without `unsafe`, so it is confined to a crate that does no parsing.
+  The `unsafe` blocks are three kinds only: dereference a handle the caller
+  handed back, read a caller's NUL-terminated string, hand out a pointer an
+  `Arc` keeps alive.
+- **No `omni_inst`.** Instantiation as a separate object buys nothing while
+  every store is a single container: `omni_model_tensor` takes a tensor
+  directly, and the plan is still there to negotiate with. The handle appears
+  when there is more than one store behind it.
+- **Handles are reference-counted, so `omni_store_close` is order-free.** A
+  tensor outliving its store is the *supported* case — §2.1's "the FFI layer
+  never exposes a borrow", enforced rather than documented. A DLPack tensor
+  outlives every OMNI handle, which is what a Python consumer will actually do.
+- **`omni_tensor_values` beside `omni_tensor_bytes`.** Stored bytes are the C0
+  path and are handed over without a copy when the tensor is one raw object;
+  a computed value — a `dequantize`, a `cast` — has no stored bytes at all and
+  says `OMNI_INDETERMINATE` rather than handing back its operand, which would be
+  the wrong array with the right length.
+
+DLPack refuses what it cannot spell. It describes whole-byte lanes, and §04.3's
+`i4`, ternary, fixed-point and codebook dtypes are not that, so
+`omni_tensor_dlpack` returns `OMNI_INDETERMINATE` naming the dtype instead of
+passing a 4-bit weight off as `uint8`. Same for a non-dense layout, because
+`strides == NULL` in DLPack means dense row-major and nothing else.
+
 ## 4 Language bindings
 
 ### 4.1 Python (`omni-py`, PyO3)
@@ -179,13 +215,17 @@ with omni.writer("out.omni", reproducible=True) as wr:
   code migrates by changing one import.
 - Type stubs shipped; `mypy`-clean.
 
-**What exists today is not this.** PyO3 needs a dependency and `unsafe`, and the
-reference implementation forbids both on purpose, so the binding above is a design
-and not a build. What is built is [`bindings/python/omni.py`](../../bindings/python/omni.py):
-a **C0 reader in pure Python, no dependencies**, which reads a container, verifies
-every digest, and hands back a literal tensor's bytes. No DLPack, no zero copy,
-no writer — those need the C ABI of §3 first. Its purpose is different anyway, and
-§5.1 is where that purpose is.
+**What exists today is not this.** PyO3 needs a dependency, and the reference
+implementation has none on purpose, so the binding above is a design and not a
+build. Two things that are built stand where it will:
+
+- [`reference/omni-ffi`](../../reference/omni-ffi), the C ABI of §3, which is
+  what a PyO3 — or `ctypes`, or `cffi` — binding would call. It already returns
+  DLPack, so `torch.from_dlpack` works today from any language that can call C.
+- [`bindings/python/omni.py`](../../bindings/python/omni.py): a **C0 reader in
+  pure Python, no dependencies**, which reads a container, verifies every digest,
+  and hands back a literal tensor's bytes. No DLPack, no zero copy, no writer.
+  Its purpose is different from a fast binding's, and §5.1 is that purpose.
 
 ### 4.2 C++ (`omni.hpp`)
 

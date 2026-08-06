@@ -57,8 +57,9 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PEFT, GPTQ and AWQ import, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PEFT, GPTQ and AWQ import and export, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
+| `omni-ffi` | the C ABI (`omni.h`): opaque handles, panic-proof entry points, CLI-matching status codes, DLPack export. Built as `cdylib` + `staticlib`. The only crate here that uses `unsafe` | design/sdk.md §3 |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -69,9 +70,14 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
   the evidence rather than the assertion — BLAKE3, SHA-256, SHA-512, CRC-32C,
   Ed25519, ChaCha20, deflate, Zstandard, XXH64 and a strict canonical CBOR codec
   are all implemented here.
-- **`#![forbid(unsafe_code)]`.** This code parses untrusted binary input; §12.4
-  requires memory safety, bounds checks on every length and offset, bounded
-  nesting depth, and no allocation driven by an unvalidated declared size.
+- **`#![forbid(unsafe_code)]`** in every crate that parses. This code reads
+  untrusted binary input; §12.4 requires memory safety, bounds checks on every
+  length and offset, bounded nesting depth, and no allocation driven by an
+  unvalidated declared size. The single exception is `omni-ffi`, where the C ABI
+  makes `unsafe` unavoidable — turning a caller's `const char *` into a `&str` is
+  exactly the operation the compiler cannot check. It is confined there on
+  purpose: that crate does no parsing, and its `unsafe` blocks are three kinds
+  only (dereference a handle, read a C string, hand out an `Arc`-backed pointer).
 - **Both mandatory hashes, from scratch.** §03.5.1 requires BLAKE3-256 and
   SHA-256. Both are implemented here, BLAKE3 including the tree internals
   (chunk and parent chaining values) that Bao verified streaming (§13.3) is
@@ -366,9 +372,11 @@ What is **not** implemented, and is reported as such rather than faked:
   capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
   build implements four of them; GGUF, PyTorch, ONNX and EXL2 do not exist, and a
   request for one is refused by name rather than half-attempted. Export covers
-  safetensors, GPTQ and AWQ — not PEFT, so an imported adapter can be inspected
-  and attached but not written back out. 3-bit GPTQ and AWQ's `gemv`/`marlin`
+  safetensors, PEFT, GPTQ and AWQ. 3-bit GPTQ and AWQ's `gemv`/`marlin`
   versions are refused for the reasons named above
+- The **writer** side of the C ABI. `omni-ffi` reads: open, verify, walk, bytes,
+  values, plan, DLPack. A C caller cannot yet *build* a container, so
+  `ModelBuilder` is Rust-only
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
@@ -380,7 +388,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-453 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+466 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -624,9 +632,21 @@ contradicts the index's otype is invalid (R-O02).
 Every
 container-level test runs under both mandatory digest algorithms.
 
+And, for the C ABI, the tests that a C caller would find out the hard way: that a
+null handle is a usage error rather than a segfault and freeing null does
+nothing; that 512 zero bytes are *invalid* rather than a panic crossing the
+boundary; that a tensor handle survives its store being closed, which is the
+guarantee that makes a zero-copy binding possible at all; that a DLPack tensor
+survives every OMNI handle being freed and then frees itself; that `bf16` goes
+over DLPack as `kDLBfloat` with null strides while `i4` is refused by name rather
+than passed off as `uint8`; that the C0 baseline reports this model infeasible
+and names the feature it lacks instead of quietly planning less; and that the
+status codes are the CLI's exit codes, checked value by value, because a C caller
+and `omni` disagreeing about what happened is the failure mode that matters.
+
 ```console
 $ cargo test
-test result: ok. 453 passed; 0 failed
+test result: ok. 466 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

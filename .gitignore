@@ -5,3 +5,9 @@ Cargo.lock
 # Python bytecode from bindings/python.
 __pycache__/
 *.pyc
+
+# Containers written by running the CLI from the repository root. Anchored to
+# the root on purpose: the conformance corpus under conformance/ is checked in,
+# and a recursive rule would hide a new corpus file instead of adding it.
+/*.omni
+/*.omni.idx

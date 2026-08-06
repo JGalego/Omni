@@ -868,6 +868,115 @@ jobs:
           # the vocabulary and logits at position 0 that no later token can move.
           echo "the synthesized graph runs, is bounded, and says when its weights are not a model"
 
+      # `docs/design/sdk.md` §3: the C ABI is "the binding substrate", and the
+      # thing worth testing about a substrate is not that its header compiles.
+      # It is that a C program with no Rust in it can drive the whole read path
+      # and that the honest answers survive the boundary — a computed tensor has
+      # no stored bytes, a u4 weight has no DLPack spelling, and both come back
+      # as OMNI_INDETERMINATE rather than as a plausible wrong array.
+      - name: A C program drives the whole read path through the C ABI
+        run: |
+          cargo build --release -p omni-ffi --manifest-path reference/Cargo.toml
+          test -f reference/target/release/libomni.a
+          test -f reference/target/release/libomni.so
+
+          # The header and the library must agree about every symbol, in both
+          # directions. A header that declares something the library does not
+          # export is a link error for somebody else, later.
+          python3 - <<'PY_SYM'
+          import re, subprocess
+          h = open("reference/omni-ffi/include/omni.h").read()
+          decl = {d[:-1].strip() for d in re.findall(r'\bomni_[a-z0-9_]+\s*\(', h)}
+          decl -= {"omni_status", "omni_objective"}   # typedef'd parameter types
+          src = open("reference/omni-ffi/src/lib.rs").read()
+          exported = set(re.findall(r'extern "C" fn (omni_[a-z0-9_]+)', src))
+          nm = subprocess.run(["nm", "-D", "--defined-only",
+                               "reference/target/release/libomni.so"],
+                              capture_output=True, text=True).stdout
+          syms = {l.split()[-1] for l in nm.splitlines() if " omni_" in l}
+          assert not decl - exported, f"declared but not implemented: {sorted(decl - exported)}"
+          assert not exported - decl, f"exported but not declared: {sorted(exported - decl)}"
+          assert not decl - syms, f"not in the shared object: {sorted(decl - syms)}"
+          print(f"{len(decl)} entry points, header and library agree")
+          PY_SYM
+
+          # Built the way a consumer would, with the warnings a consumer turns
+          # on. `-Werror` is the point: a header that needs a cast to use is a
+          # header that will be used wrongly.
+          cc -Wall -Wextra -Werror -std=c11 -pedantic \
+            reference/omni-ffi/examples/read.c \
+            -I reference/omni-ffi/include \
+            reference/target/release/libomni.a -lpthread -ldl -lm -o /tmp/omni-read
+
+          OMNI=reference/target/release/omni
+          "$OMNI" example --quantized /tmp/ffi.omni >/dev/null
+          /tmp/omni-read /tmp/ffi.omni | tee /tmp/ffi.txt
+
+          grep -q 'the C ABI read a container end to end' /tmp/ffi.txt
+          # Zero copy actually happened: at least one tensor's bytes were a
+          # pointer into the container rather than a copy of it.
+          grep -q 'mapped=1' /tmp/ffi.txt
+          # A `dequantize` said so instead of handing back its operand.
+          grep -q 'computed=1' /tmp/ffi.txt
+          grep -q 'is a `dequantize` expression, not stored bytes' /tmp/ffi.txt
+          # DLPack both ways: bf16 goes over as kDLBfloat, u4 is refused by name.
+          grep -q 'code 4, 16 bits' /tmp/ffi.txt
+          grep -q "DLPack has no encoding for .u4." /tmp/ffi.txt
+          if grep -q 'dlpack_ok=0' /tmp/ffi.txt; then
+            echo "::error::no tensor made it over DLPack"; exit 1
+          fi
+
+          # A container the ABI must not accept, and a truncated one, are
+          # statuses rather than crashes. This is the whole reason the boundary
+          # catches panics.
+          cat > /tmp/abuse.c <<'PY_ABUSE'
+          #include <stdio.h>
+          #include <string.h>
+          #include "omni.h"
+          int main(void) {
+              omni_store *s = NULL;
+              unsigned char junk[512];
+              memset(junk, 0, sizeof junk);
+              if (omni_store_open_bytes(junk, sizeof junk, &s) != OMNI_EINVALID) {
+                  fprintf(stderr, "zeros were accepted as a container\n"); return 1;
+              }
+              printf("zeros: %s\n", omni_last_error());
+              if (omni_store_open("/nonexistent.omni", &s) != OMNI_EINCOMPLETE) {
+                  fprintf(stderr, "a missing file was not incomplete\n"); return 1;
+              }
+              printf("missing: %s\n", omni_last_error());
+              if (omni_store_open(NULL, &s) != OMNI_EUSAGE) {
+                  fprintf(stderr, "a null path was not a usage error\n"); return 1;
+              }
+              /* Freeing null is defined. */
+              omni_store_close(NULL); omni_model_free(NULL);
+              omni_plan_free(NULL); omni_tensor_release(NULL);
+              printf("the boundary returns statuses, never crashes\n");
+              return 0;
+          }
+          PY_ABUSE
+          cc -Wall -Wextra -Werror -std=c11 /tmp/abuse.c \
+            -I reference/omni-ffi/include \
+            reference/target/release/libomni.a -lpthread -ldl -lm -o /tmp/omni-abuse
+          /tmp/omni-abuse
+
+          # Truncating a real container at every quarter must never crash the
+          # ABI either. Any status is acceptable; a signal is not.
+          python3 - <<'PY_TRUNC'
+          import pathlib, subprocess
+          raw = pathlib.Path("/tmp/ffi.omni").read_bytes()
+          for frac in (1, 2, 3):
+              cut = len(raw) * frac // 4
+              pathlib.Path("/tmp/cut.omni").write_bytes(raw[:cut])
+              r = subprocess.run(["/tmp/omni-read", "/tmp/cut.omni"],
+                                 capture_output=True, text=True)
+              assert r.returncode >= 0, f"killed by signal {-r.returncode} at {cut}"
+              assert r.returncode in (0, 1, 2), f"unexpected rc {r.returncode} at {cut}"
+          print("truncated containers produce statuses, not signals")
+          PY_TRUNC
+
+          echo "a C program read a container end to end through the C ABI"
+
       # `docs/design/sdk.md` §5 claims a conforming C0 reader needs only a header
       # parse, an index lookup, canonical CBOR, BLAKE3 and literal tensors. The
       # Rust implementation is evidence for that, but it also *wrote* these

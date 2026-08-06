@@ -230,6 +230,12 @@ registry *client* and no `mount`, and nothing has been pushed anywhere, so the
 ## Phase 4 — Ecosystem (months 18–30)
 
 - Bindings: Python, C, C++, Go (pure-Go C0 reader), Java, Swift, JS/WASM.
+  **The C ABI this phase depends on is built** (`reference/omni-ffi`,
+  `omni.h`): opaque handles, no panic across the boundary, CLI-matching status
+  codes, and DLPack out to PyTorch/JAX/NumPy without a copy, with a C program
+  in CI driving open → verify → walk → bytes → plan → DLPack. It reads only;
+  writing a container from C is still Rust-side. Every binding in this list is
+  now a layer over an existing ABI rather than a new parser.
 - Upstream integrations: PyTorch, JAX/Orbax, vLLM, SGLang, llama.cpp, MLX,
   Ollama, Transformers, PEFT, TensorRT-LLM.
 - Training-side: DCP/DeepSpeed/Megatron/NeMo import and export; parallel writer.
