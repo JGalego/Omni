@@ -247,6 +247,13 @@ implemented:
   be a half and `0.1` a double; and D7 is "registered tags only" rather than "no
   tags", so refusing every tag refuses a valid container, because §04.3's exact
   rationals are one
+- **Three synthesizable architecture families**, not one: `transformer.decoder`,
+  `cnn.classifier` and `mlp`. Each is *executed* in the tests over known weights
+  and compared against arithmetic done in the test — the mlp against its own
+  affine stack element by element, the CNN through the `conv` and `pool` ops for
+  every intermediate shape. Gate 2 asks for ten, so this is three tenths of one
+  criterion, and the honest framing is that the machinery for adding a family is
+  now cheap while the families themselves are not
 - **A reference interpreter for OMNI-IR** (`omni graph run`), which is where §07's
   claim gets tested rather than asserted: a model that describes its own
   computation can be executed by something that was never told its architecture.
@@ -349,7 +356,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-437 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+440 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -595,7 +602,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 437 passed; 0 failed
+test result: ok. 440 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

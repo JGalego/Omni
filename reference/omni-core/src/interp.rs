@@ -4357,4 +4357,145 @@ mod tests {
         assert!(m.contains("does not define"), "{m}");
         assert!(m.contains("discretization"), "{m}");
     }
+    // ------------------------------------------- the other synthesizers --
+
+    /// Weights for a family, deterministic so a failure is reproducible.
+    fn weights_for(names: &[(&str, Vec<u64>)]) -> Vec<(String, Tensor)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(k, (name, shape))| {
+                let n = numel(shape);
+                let data: Vec<f64> = (0..n)
+                    .map(|i| ((i as f64 + 1.0) * (k as f64 + 1.7)).sin() * 0.5)
+                    .collect();
+                (
+                    (*name).to_string(),
+                    Tensor::new(shape.clone(), DType::F32, data),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_synthesized_mlp_runs_and_computes_the_affine_stack() {
+        let w = weights_for(&[
+            ("mlp.layers.0.weight", vec![3, 2]),
+            ("mlp.layers.0.bias", vec![3]),
+            ("mlp.layers.1.weight", vec![2, 3]),
+        ]);
+        let names: Vec<String> = w.iter().map(|(n, _)| n.clone()).collect();
+        let params = Value::map(vec![
+            (
+                "hidden_sizes",
+                Value::Array(vec![Value::U(2), Value::U(3), Value::U(2)]),
+            ),
+            ("activation", Value::text("relu")),
+        ]);
+        let m = crate::ir::synthesize("mlp", &params, &names).expect("should synthesize");
+        let x = f32t(&[1, 2], &[1.0, -1.0]);
+        let out = run(&m, std::slice::from_ref(&x), &w, &Limits::default())
+            .unwrap_or_else(|e| panic!("the synthesized mlp did not run: {e}"));
+        assert_eq!(out.returned[0].shape, vec![1, 2]);
+
+        // The same arithmetic, done here: relu(x·W0ᵀ + b0)·W1ᵀ.
+        let get = |n: &str| w.iter().find(|(k, _)| k == n).unwrap().1.clone();
+        let (w0, b0, w1) = (
+            get("mlp.layers.0.weight"),
+            get("mlp.layers.0.bias"),
+            get("mlp.layers.1.weight"),
+        );
+        let mut hidden = Vec::new();
+        for j in 0..3u64 {
+            let mut acc = b0.get(&[j]).unwrap();
+            for i in 0..2u64 {
+                acc += x.get(&[0, i]).unwrap() * w0.get(&[j, i]).unwrap();
+            }
+            hidden.push(acc.max(0.0));
+        }
+        for j in 0..2u64 {
+            let want: f64 = (0..3)
+                .map(|i| hidden[i as usize] * w1.get(&[j, i]).unwrap())
+                .sum();
+            let got = out.returned[0].get(&[0, j]).unwrap();
+            assert!((got - want).abs() < 1e-6, "logit {j}: {got} vs {want}");
+        }
+
+        // A missing weight is named before anything is written.
+        let e =
+            crate::ir::synthesize("mlp", &params, &names[..1]).expect_err("a weight is missing");
+        assert!(e.contains("mlp.layers.1.weight"), "{e}");
+    }
+
+    #[test]
+    fn a_synthesized_cnn_runs_over_the_conv_and_pool_ops() {
+        // Two blocks over 8x8 inputs: conv -> relu -> 2x2 max pool, twice, then a
+        // global average pool and a linear head.
+        let w = weights_for(&[
+            ("cnn.blocks.0.conv.weight", vec![4, 1, 3, 3]),
+            ("cnn.blocks.0.conv.bias", vec![4]),
+            ("cnn.blocks.1.conv.weight", vec![8, 4, 3, 3]),
+            ("cnn.head.weight", vec![3, 8]),
+            ("cnn.head.bias", vec![3]),
+        ]);
+        let names: Vec<String> = w.iter().map(|(n, _)| n.clone()).collect();
+        let params = Value::map(vec![
+            (
+                "channels",
+                Value::Array(vec![Value::U(1), Value::U(4), Value::U(8)]),
+            ),
+            ("kernel", Value::U(3)),
+            ("num_classes", Value::U(3)),
+            ("height", Value::U(8)),
+            ("width", Value::U(8)),
+            ("pool", Value::U(2)),
+            ("activation", Value::text("relu")),
+        ]);
+        let m =
+            crate::ir::synthesize("cnn.classifier", &params, &names).expect("should synthesize");
+        let img = Tensor::new(
+            vec![1, 1, 8, 8],
+            DType::F32,
+            (0..64).map(|i| (i as f64 * 0.37).sin()).collect(),
+        );
+        let out = run(&m, std::slice::from_ref(&img), &w, &Limits::default())
+            .unwrap_or_else(|e| panic!("the synthesized cnn did not run: {e}"));
+        assert_eq!(out.returned[0].shape, vec![1, 3], "one logit per class");
+        assert!(
+            out.returned[0].data.iter().all(|v| v.is_finite()),
+            "{:?}",
+            out.returned[0].data
+        );
+
+        // Every intermediate shape held: 8x8 -> conv same -> pool 4x4 -> conv
+        // same -> pool 2x2 -> global avg -> [1, 8]. If any of that were wrong the
+        // graph would not have run, because each op declares its result type and
+        // the interpreter checks it.
+        assert!(out.ops > 10, "{} ops", out.ops);
+
+        // A concrete input extent is required rather than assumed: without it the
+        // head's feature count is unknowable.
+        let mut bad: Vec<(&str, Value)> = vec![
+            (
+                "channels",
+                Value::Array(vec![Value::U(1), Value::U(4), Value::U(8)]),
+            ),
+            ("kernel", Value::U(3)),
+            ("num_classes", Value::U(3)),
+        ];
+        bad.push(("width", Value::U(8)));
+        let e = crate::ir::synthesize("cnn.classifier", &Value::map(bad), &names)
+            .expect_err("no height");
+        assert!(e.contains("height"), "{e}");
+    }
+
+    #[test]
+    fn an_unregistered_family_is_refused_with_the_list() {
+        let e =
+            crate::ir::synthesize("mamba", &Value::map(vec![]), &[]).expect_err("no such family");
+        assert!(e.contains("mamba"), "{e}");
+        for known in crate::ir::FAMILIES {
+            assert!(e.contains(known), "the refusal should list {known}: {e}");
+        }
+    }
 }

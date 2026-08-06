@@ -4379,12 +4379,45 @@ pub mod binary {
 /// `available` is the model's tensor names. Every weight the family needs is
 /// looked up there, so a synthesized graph is checked against the weights that
 /// exist before it is written, not after.
+/// The families this build can synthesize a graph for.
+///
+/// Gate 2 wants ten. Each one added here has to be *executable* — `omni graph
+/// run` over real weights — because a synthesizer that emits a well-typed graph
+/// nobody has run is how `transformer.decoder` came to attend across heads
+/// instead of positions and pass verification while doing it.
+pub const FAMILIES: &[&str] = &["transformer.decoder", "cnn.classifier", "mlp"];
+
 pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<Module, String> {
-    if family != "transformer.decoder" {
+    match family {
+        "transformer.decoder" => synthesize_decoder(params, available),
+        "cnn.classifier" => synthesize_cnn(params, available),
+        "mlp" => synthesize_mlp(params, available),
+        other => Err(format!(
+            "no synthesizer for family `{other}`; this build knows {}",
+            FAMILIES.join(", ")
+        )),
+    }
+}
+
+/// Looks up every weight a family needs, collecting the misses so the caller is
+/// told all of them at once rather than one per attempt.
+fn require(available: &[String], names: Vec<String>) -> Result<Vec<String>, String> {
+    let missing: Vec<&String> = names.iter().filter(|n| !available.contains(n)).collect();
+    if !missing.is_empty() {
         return Err(format!(
-            "no synthesizer for family `{family}`; this build knows transformer.decoder"
+            "the model does not carry {} weight(s) this family needs: {}",
+            missing.len(),
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>()
+                .join(", ")
         ));
     }
+    Ok(names)
+}
+
+fn synthesize_decoder(params: &Value, available: &[String]) -> Result<Module, String> {
     let get = |k: &str| -> Option<u64> { params.get(k).and_then(|v| v.as_u64()) };
     let hidden = get("hidden_size").ok_or("arch.params has no `hidden_size`")?;
     let layers = get("n_layers").ok_or("arch.params has no `n_layers`")?;
@@ -4813,11 +4846,441 @@ pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<
         },
     ];
     m.attrs = vec![
-        ("family".into(), Value::text(family)),
+        ("family".into(), Value::text("transformer.decoder")),
         ("synthesized".into(), Value::Bool(true)),
     ];
     m.functions = vec![("forward".into(), f)];
     Ok(m)
+}
+
+/// `mlp` — a stack of affine layers with an activation between them.
+///
+/// The simplest family that is still a model, and the one worth having first:
+/// every mechanism a bigger graph uses (a weight named as a constant, a
+/// transpose, a matmul, a bias, an activation) appears exactly once, so when a
+/// bigger family goes wrong this is the graph that isolates which mechanism.
+///
+/// Weights are `mlp.layers.{i}.weight` (`[out, in]`, the orientation every
+/// framework stores) and an optional `mlp.layers.{i}.bias`.
+fn synthesize_mlp(params: &Value, available: &[String]) -> Result<Module, String> {
+    let sizes: Vec<u64> = match params.get("hidden_sizes") {
+        Some(Value::Array(xs)) => xs
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .ok_or("a non-integer in `hidden_sizes`".to_string())
+            })
+            .collect::<Result<Vec<u64>, String>>()?,
+        _ => return Err("arch.params has no `hidden_sizes`".into()),
+    };
+    if sizes.len() < 2 {
+        return Err("`hidden_sizes` needs at least an input and an output".into());
+    }
+    let activation = params
+        .get("activation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("relu")
+        .to_string();
+    let n = sizes.len() - 1;
+    let weights = require(
+        available,
+        (0..n).map(|i| format!("mlp.layers.{i}.weight")).collect(),
+    )?;
+    // Biases are optional, and absent is a real answer: a layer without one is a
+    // linear map, and inventing a zero bias would be inventing a tensor.
+    let biases: Vec<Option<String>> = (0..n)
+        .map(|i| {
+            let name = format!("mlp.layers.{i}.bias");
+            available.contains(&name).then_some(name)
+        })
+        .collect();
+
+    let dt = DType::F32;
+    let b = Dim::Sym("B".into());
+    let mut next = 1u32;
+    let mut fresh = || {
+        let id = next;
+        next += 1;
+        id
+    };
+    let mut ops: Vec<Op> = Vec::new();
+    let mut h = 0u32;
+    for i in 0..n {
+        let (fan_in, fan_out) = (sizes[i], sizes[i + 1]);
+        let w = fresh();
+        ops.push(
+            Op::new("omni.core", "constant", 1)
+                .with_attr("tensor", Value::text(weights[i].clone()))
+                .with_output(
+                    w,
+                    Type::tensor(vec![Dim::N(fan_out), Dim::N(fan_in)], dt.clone()),
+                ),
+        );
+        let wt = fresh();
+        ops.push(
+            Op::new("omni.tensor", "transpose", 1)
+                .with_inputs(&[w])
+                .with_attr("perm", Value::Array(vec![Value::U(1), Value::U(0)]))
+                .with_output(
+                    wt,
+                    Type::tensor(vec![Dim::N(fan_in), Dim::N(fan_out)], dt.clone()),
+                ),
+        );
+        let y = fresh();
+        ops.push(
+            Op::new("omni.tensor", "matmul", 1)
+                .with_inputs(&[h, wt])
+                .with_output(
+                    y,
+                    Type::tensor(vec![b.clone(), Dim::N(fan_out)], dt.clone()),
+                ),
+        );
+        h = y;
+        if let Some(name) = &biases[i] {
+            let bw = fresh();
+            ops.push(
+                Op::new("omni.core", "constant", 1)
+                    .with_attr("tensor", Value::text(name.clone()))
+                    .with_output(bw, Type::tensor(vec![Dim::N(fan_out)], dt.clone())),
+            );
+            let sum = fresh();
+            ops.push(
+                Op::new("omni.tensor", "add", 1)
+                    .with_inputs(&[h, bw])
+                    .with_output(
+                        sum,
+                        Type::tensor(vec![b.clone(), Dim::N(fan_out)], dt.clone()),
+                    ),
+            );
+            h = sum;
+        }
+        // No activation on the output layer: the last layer's values are logits
+        // or regression targets, and squashing them would be a different model.
+        if i + 1 < n {
+            let act = fresh();
+            ops.push(
+                Op::new("omni.nn", "activation", 1)
+                    .with_inputs(&[h])
+                    .with_attr("kind", Value::text(activation.clone()))
+                    .with_output(
+                        act,
+                        Type::tensor(vec![b.clone(), Dim::N(fan_out)], dt.clone()),
+                    ),
+            );
+            h = act;
+        }
+    }
+    ops.push(Op::new("omni.core", "return", 1).with_inputs(&[h]));
+
+    let out = Type::tensor(vec![b.clone(), Dim::N(sizes[n])], dt.clone());
+    let f = Function {
+        params: vec![("x".into(), Type::tensor(vec![b, Dim::N(sizes[0])], dt))],
+        results: vec![out],
+        attrs: vec![
+            ("kind".into(), Value::text("forward")),
+            ("activation".into(), Value::text(activation)),
+        ],
+        body: Region {
+            blocks: vec![Block {
+                args: Vec::new(),
+                ops,
+            }],
+        },
+        constraints: vec![Constraint {
+            dim: "B".into(),
+            rel: Rel::Ge,
+            bound: 1,
+        }],
+    };
+    Ok(finish_module(
+        "mlp",
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
+/// `cnn.classifier` — a 2-D convolutional stack over `[N, C, H, W]`, then a
+/// linear head over the globally pooled features.
+///
+/// Weights are `cnn.blocks.{i}.conv.weight` (`[out_c, in_c, kh, kw]`) with an
+/// optional `.bias`, and `cnn.head.weight` (`[classes, features]`) with an
+/// optional `cnn.head.bias`.
+fn synthesize_cnn(params: &Value, available: &[String]) -> Result<Module, String> {
+    let channels: Vec<u64> = match params.get("channels") {
+        Some(Value::Array(xs)) => xs
+            .iter()
+            .map(|v| v.as_u64().ok_or("a non-integer in `channels`".to_string()))
+            .collect::<Result<Vec<u64>, String>>()?,
+        _ => return Err("arch.params has no `channels`".into()),
+    };
+    if channels.len() < 2 {
+        return Err("`channels` needs an input channel count and at least one block".into());
+    }
+    let kernel = params
+        .get("kernel")
+        .and_then(|v| v.as_u64())
+        .ok_or("arch.params has no `kernel`")?;
+    if kernel == 0 {
+        return Err("`kernel` is 0".into());
+    }
+    let classes = params
+        .get("num_classes")
+        .and_then(|v| v.as_u64())
+        .ok_or("arch.params has no `num_classes`")?;
+    let activation = params
+        .get("activation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("relu")
+        .to_string();
+    let pool = params
+        .get("pool")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2)
+        .max(1);
+    // Input spatial extent has to be concrete: every block halves it, and the
+    // head's feature count depends on what is left. A symbolic H would make the
+    // head's shape unknowable, which is exactly the kind of graph that verifies
+    // and cannot run.
+    let (h0, w0) = (
+        params
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .ok_or("arch.params has no `height`; a classifier head needs a concrete one")?,
+        params
+            .get("width")
+            .and_then(|v| v.as_u64())
+            .ok_or("arch.params has no `width`; a classifier head needs a concrete one")?,
+    );
+
+    let n = channels.len() - 1;
+    let mut names: Vec<String> = (0..n)
+        .map(|i| format!("cnn.blocks.{i}.conv.weight"))
+        .collect();
+    names.push("cnn.head.weight".into());
+    let names = require(available, names)?;
+    let head_w = names[n].clone();
+
+    let dt = DType::F32;
+    let bdim = Dim::Sym("B".into());
+    let mut next = 1u32;
+    let mut fresh = || {
+        let id = next;
+        next += 1;
+        id
+    };
+    let mut ops: Vec<Op> = Vec::new();
+    let mut x = 0u32;
+    let pad = (kernel - 1) / 2;
+    let (mut cur_h, mut cur_w) = (h0, w0);
+    for i in 0..n {
+        let (cin, cout) = (channels[i], channels[i + 1]);
+        let wt = fresh();
+        ops.push(
+            Op::new("omni.core", "constant", 1)
+                .with_attr("tensor", Value::text(names[i].clone()))
+                .with_output(
+                    wt,
+                    Type::tensor(
+                        vec![Dim::N(cout), Dim::N(cin), Dim::N(kernel), Dim::N(kernel)],
+                        dt.clone(),
+                    ),
+                ),
+        );
+        // "Same" padding when the kernel is odd, which is the only case where
+        // symmetric padding preserves the extent exactly.
+        let conv_h = cur_h + 2 * pad - (kernel - 1);
+        let conv_w = cur_w + 2 * pad - (kernel - 1);
+        let c = fresh();
+        let bias_name = format!("cnn.blocks.{i}.conv.bias");
+        let mut conv_in = vec![x, wt];
+        if available.contains(&bias_name) {
+            let bw = fresh();
+            ops.push(
+                Op::new("omni.core", "constant", 1)
+                    .with_attr("tensor", Value::text(bias_name))
+                    .with_output(bw, Type::tensor(vec![Dim::N(cout)], dt.clone())),
+            );
+            conv_in.push(bw);
+        }
+        ops.push(
+            Op::new("omni.nn", "conv", 1)
+                .with_inputs(&conv_in)
+                .with_attr("padding", Value::Array(vec![Value::U(pad), Value::U(pad)]))
+                .with_output(
+                    c,
+                    Type::tensor(
+                        vec![bdim.clone(), Dim::N(cout), Dim::N(conv_h), Dim::N(conv_w)],
+                        dt.clone(),
+                    ),
+                ),
+        );
+        let act = fresh();
+        ops.push(
+            Op::new("omni.nn", "activation", 1)
+                .with_inputs(&[c])
+                .with_attr("kind", Value::text(activation.clone()))
+                .with_output(
+                    act,
+                    Type::tensor(
+                        vec![bdim.clone(), Dim::N(cout), Dim::N(conv_h), Dim::N(conv_w)],
+                        dt.clone(),
+                    ),
+                ),
+        );
+        let (ph, pw) = (conv_h / pool, conv_w / pool);
+        if ph == 0 || pw == 0 {
+            return Err(format!(
+                "block {i} pools {conv_h}x{conv_w} by {pool}, which leaves nothing"
+            ));
+        }
+        let p = fresh();
+        ops.push(
+            Op::new("omni.nn", "pool", 1)
+                .with_inputs(&[act])
+                .with_attr("kind", Value::text("max"))
+                .with_attr("window", Value::Array(vec![Value::U(pool), Value::U(pool)]))
+                .with_output(
+                    p,
+                    Type::tensor(
+                        vec![bdim.clone(), Dim::N(cout), Dim::N(ph), Dim::N(pw)],
+                        dt.clone(),
+                    ),
+                ),
+        );
+        x = p;
+        cur_h = ph;
+        cur_w = pw;
+    }
+
+    // Global average pool, written as a pool whose window is whatever is left,
+    // so the head sees one feature per channel however deep the stack got.
+    let last_c = channels[n];
+    let gp = fresh();
+    ops.push(
+        Op::new("omni.nn", "pool", 1)
+            .with_inputs(&[x])
+            .with_attr("kind", Value::text("avg"))
+            .with_attr(
+                "window",
+                Value::Array(vec![Value::U(cur_h), Value::U(cur_w)]),
+            )
+            .with_output(
+                gp,
+                Type::tensor(
+                    vec![bdim.clone(), Dim::N(last_c), Dim::N(1), Dim::N(1)],
+                    dt.clone(),
+                ),
+            ),
+    );
+    let flat = fresh();
+    ops.push(
+        Op::new("omni.tensor", "reshape", 1)
+            .with_inputs(&[gp])
+            .with_attr("shape", Value::Array(vec![Value::I(-1), Value::U(last_c)]))
+            .with_output(
+                flat,
+                Type::tensor(vec![Dim::Dynamic, Dim::N(last_c)], dt.clone()),
+            ),
+    );
+    let hw = fresh();
+    ops.push(
+        Op::new("omni.core", "constant", 1)
+            .with_attr("tensor", Value::text(head_w))
+            .with_output(
+                hw,
+                Type::tensor(vec![Dim::N(classes), Dim::N(last_c)], dt.clone()),
+            ),
+    );
+    let hwt = fresh();
+    ops.push(
+        Op::new("omni.tensor", "transpose", 1)
+            .with_inputs(&[hw])
+            .with_attr("perm", Value::Array(vec![Value::U(1), Value::U(0)]))
+            .with_output(
+                hwt,
+                Type::tensor(vec![Dim::N(last_c), Dim::N(classes)], dt.clone()),
+            ),
+    );
+    let mut logits = fresh();
+    ops.push(
+        Op::new("omni.tensor", "matmul", 1)
+            .with_inputs(&[flat, hwt])
+            .with_output(
+                logits,
+                Type::tensor(vec![bdim.clone(), Dim::N(classes)], dt.clone()),
+            ),
+    );
+    if available.contains(&"cnn.head.bias".to_string()) {
+        let hb = fresh();
+        ops.push(
+            Op::new("omni.core", "constant", 1)
+                .with_attr("tensor", Value::text("cnn.head.bias"))
+                .with_output(hb, Type::tensor(vec![Dim::N(classes)], dt.clone())),
+        );
+        let sum = fresh();
+        ops.push(
+            Op::new("omni.tensor", "add", 1)
+                .with_inputs(&[logits, hb])
+                .with_output(
+                    sum,
+                    Type::tensor(vec![bdim.clone(), Dim::N(classes)], dt.clone()),
+                ),
+        );
+        logits = sum;
+    }
+    ops.push(Op::new("omni.core", "return", 1).with_inputs(&[logits]));
+
+    let f = Function {
+        params: vec![(
+            "images".into(),
+            Type::tensor(
+                vec![bdim.clone(), Dim::N(channels[0]), Dim::N(h0), Dim::N(w0)],
+                dt.clone(),
+            ),
+        )],
+        results: vec![Type::tensor(vec![bdim, Dim::N(classes)], dt)],
+        attrs: vec![
+            ("kind".into(), Value::text("forward")),
+            ("activation".into(), Value::text(activation)),
+        ],
+        body: Region {
+            blocks: vec![Block {
+                args: Vec::new(),
+                ops,
+            }],
+        },
+        constraints: vec![Constraint {
+            dim: "B".into(),
+            rel: Rel::Ge,
+            bound: 1,
+        }],
+    };
+    Ok(finish_module(
+        "cnn.classifier",
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
+/// The module wrapper every synthesizer ends with: one `forward` function, the
+/// dialects it used, and the family it came from recorded so a reader can tell a
+/// synthesized graph from an authored one (§07.5).
+fn finish_module(family: &str, f: Function, dialects: &[&str]) -> Module {
+    let mut m = Module::new(Level::Semantic, "forward");
+    m.dialects = dialects
+        .iter()
+        .map(|ns| DialectUse {
+            ns: (*ns).to_string(),
+            version: 1,
+            reference: None,
+        })
+        .collect();
+    m.attrs = vec![
+        ("family".into(), Value::text(family)),
+        ("synthesized".into(), Value::Bool(true)),
+    ];
+    m.functions = vec![("forward".into(), f)];
+    m
 }
 
 #[cfg(test)]

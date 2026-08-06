@@ -168,7 +168,10 @@ found it. Fixed, along with a `B == 1` constraint the graph had been missing:
 collapses batch and sequence, and a batch of two would have attended across the
 boundary between sequences.
 
-**Still not met:** one architecture family is synthesizable rather than ten, the
+**Still not met:** three architecture families are synthesizable rather than ten
+— `transformer.decoder`, `cnn.classifier` and `mlp`, each of which CI *executes*
+rather than merely emits, because a graph nobody has run is how the decoder came
+to attend across heads instead of positions and verify while doing it. The
 tokenizer vectors are this repository's rather than 200 real ones, and no
 Jinja2 → OMNI-CT translator exists, so the 95 % figure is untested. The coverage
 numbers in this gate are the point of it, and only the interpreter half of the

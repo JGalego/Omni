@@ -87,7 +87,8 @@ VERBS:
                               §07.9 binary encoding
     graph   synthesize <file.omni> -o <out.omni>
                               Build a graph from `arch.params` for a registered
-                              family, upgrading a weights-only model (§07.5)
+                              family, upgrading a weights-only model (§07.5).
+                              Families: transformer.decoder, cnn.classifier, mlp
     graph   lower <file.omni> -o <out.omni> [--allow-approximate]
                               Apply the shipped lowerings; the result is a
                               derived, droppable module (§07.2)
@@ -2866,7 +2867,10 @@ fn cmd_graph(args: &[String]) -> R {
 
     let Some(module) = graph_of(&c)? else {
         prr!("omni: {path} is weights-only; there is no graph to work with (§07.5)\n");
-        prr!("      `omni graph synthesize` can build one for a registered family\n");
+        prr!(
+            "      `omni graph synthesize` can build one for: {}\n",
+            omni_core::ir::FAMILIES.join(", ")
+        );
         return Ok(3);
     };
     if mode == "run" {
