@@ -120,10 +120,15 @@ VERBS:
     index   <file.omni.idx> --show
                               Read a sidecar and report the framing it promises
     fetch   <http://host/model.omni> [--sidecar <f.idx>] [--all [--gap N]]
-                              [-o <out.omni>]
+                              [-o <out.omni>] [--first-tensor [NAME]]
                               Read a container over HTTP by range (§13.4.2),
                               coalescing requests and verifying every object;
-                              https is refused rather than downgraded
+                              https is refused rather than downgraded.
+                              --first-tensor measures the bytes and the time to
+                              reach one tensor two ways — by range, and by
+                              fetching the whole file the way a format with no
+                              index has to — which over a throttled link is the
+                              I/O half of time-to-first-token
     import  safetensors <in.safetensors> -o <out.omni> [--name N]
                               [--license SPDX] [--arch FAMILY] [--codec C]
                               Absorb another format and report the fidelity:
@@ -272,9 +277,12 @@ VERBS:
                               Reassemble a layout, verifying every blob against
                               the digest that named it
     serve   <file.omni> [--port N] [--addr A] [--requests N]
+                              [--throttle BYTES/s]
                               Serve the pack, its index sidecar and every object
                               at its own digest (§13.4.3), read-only, with the
-                              requests counted
+                              requests counted. --throttle rate-limits the writes,
+                              which is what makes a layout's cost measurable: on
+                              a loopback socket every layout is instantaneous
     bench   [--objects N] [--lookups N]
                               Measure index lookup latency against Gate 0
 
@@ -4137,12 +4145,135 @@ fn cmd_idx(args: &[String]) -> R {
 /// The point of the verb is the counters: how many round trips an operation
 /// costs, and how many bytes moved for them. A transport claim that nothing
 /// counts is not a claim.
+/// `omni fetch --first-tensor` — what a layout costs before the first number
+/// comes out.
+///
+/// Gate 3 asks for "TTFT over a throttled link demonstrably better than the
+/// incumbent", and the honest version of that measurement is narrower than the
+/// phrase: the compute half of time-to-first-token is the same whatever the file
+/// looks like, so what a *format* decides is the I/O half — how many bytes have
+/// to cross the wire before the first tensor can be read.
+///
+/// So this measures exactly that, twice, over the same socket:
+///
+/// * **By range**, which is what §13.4 is for: the framing, the index, then the
+///   chunks of one tensor.
+/// * **The whole file**, which is what a reader of a format with no index has to
+///   do — and what `huggingface_hub` in fact does today, for safetensors and
+///   GGUF alike, because the tooling downloads an artifact before it opens one.
+///
+/// The second number is a *model of* the incumbent rather than a measurement of
+/// llama.cpp, and it is stated that way in the output. What it is not is a
+/// strawman: fetching the whole file is what the incumbent tooling does, and a
+/// reader that range-reads a safetensors file would be doing what this is
+/// measuring rather than what it is being compared against.
+fn cmd_fetch_first_tensor(url: &str, want: Option<&str>) -> R {
+    use omni_core::transport::{Http, HttpStore};
+    use std::time::Instant;
+
+    // The ranged path, timed from nothing: open, find, fetch.
+    let t0 = Instant::now();
+    let store = HttpStore::open(url)?;
+    let root = store.root;
+    let ctx = Ctx::new(&store);
+    let manifest = ctx.value(&root)?;
+    let model_ref = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+        .ok_or("the container names no model asset")?;
+    let model = ctx.value(&model_ref)?;
+    let table_ref = model
+        .get("tensors")
+        .and_then(as_ref_digest)
+        .ok_or("the model names no tensor table")?;
+    let table = omni_core::tensor::TensorTable::from_value(&ctx.value(&table_ref)?)?;
+    let name = match want {
+        Some(n) => n.to_string(),
+        None => table
+            .order
+            .first()
+            .cloned()
+            .or_else(|| table.tensors.keys().next().cloned())
+            .ok_or("the container holds no tensors")?,
+    };
+    let r = table
+        .tensors
+        .get(&name)
+        .ok_or_else(|| format!("no tensor `{name}` in this container"))?;
+    let desc = omni_core::tensor::TensorDesc::load(&ctx, r)?;
+    // Evaluating is what a runtime would do with it, and it is what forces the
+    // chunks to actually cross the wire.
+    let value = desc.value.eval(&ctx)?;
+    let ranged = t0.elapsed();
+    let (requests, ranged_bytes, _) = store.io();
+    let payload = desc
+        .layout
+        .stored_bytes(
+            &omni_core::expr::concrete(&desc.shape).unwrap_or_default(),
+            &desc.dtype,
+        )
+        .unwrap_or_else(|| desc.dtype.packed_bytes(value.data.len() as u64));
+
+    // The whole file, over the same socket, timed the same way.
+    let t1 = Instant::now();
+    let http = Http::new(url)?;
+    let whole = http.get()?;
+    let full = t1.elapsed();
+
+    pr!("{url}");
+    pr!("  tensor       `{name}`  {} of payload", human(payload));
+    pr!("  file         {}", human(whole.len() as u64));
+    pr!(
+        "  by range     {} in {} request(s), {:.0} ms",
+        human(ranged_bytes),
+        commas(requests),
+        ranged.as_secs_f64() * 1e3
+    );
+    pr!(
+        "  whole file   {} in 1 request, {:.0} ms",
+        human(whole.len() as u64),
+        full.as_secs_f64() * 1e3
+    );
+    // The two ratios say different things and both are worth printing: bytes is
+    // what the format decides, time is what a link makes of it.
+    pr!(
+        "  ratio        {:.1}× fewer bytes, {:.1}× less time",
+        whole.len() as f64 / ranged_bytes.max(1) as f64,
+        full.as_secs_f64() / ranged.as_secs_f64().max(1e-9)
+    );
+    // The ratio above is a property of *this model* — one tensor's share of one
+    // file — and the number below is the property of the *format*: what it costs
+    // to reach any tensor at all, whatever the file's size. On a real model the
+    // first is large because the second is nearly constant, so the second is the
+    // one worth quoting.
+    pr!(
+        "  overhead     {} of framing and index to reach any tensor in a {} file",
+        human(ranged_bytes.saturating_sub(payload)),
+        human(whole.len() as u64)
+    );
+    pr!(
+        "  note         the whole-file row is *modelled*: it is what a reader with \
+no index has to do, which is what the hub tooling does today, and not a \
+measurement of any particular runtime"
+    );
+    Ok(0)
+}
+
 fn cmd_fetch(args: &[String]) -> R {
     use omni_core::transport::{HttpStore, Sidecar};
     let Some(url) = args.get(1) else {
         eprint!("{USAGE}");
         return Ok(2);
     };
+    if let Some(pos) = args.iter().position(|a| a == "--first-tensor") {
+        // The named tensor, or the first one the model lists.
+        let want = args
+            .get(pos + 1)
+            .filter(|a| !a.starts_with('-'))
+            .map(|s| s.as_str());
+        return cmd_fetch_first_tensor(url, want);
+    }
 
     let store = match flag(args, "--sidecar") {
         Some(p) => {
@@ -5515,10 +5646,21 @@ fn cmd_serve(args: &[String]) -> R {
     let objects = c.index.len();
     let size = c.bytes.len() as u64;
     let root = short(c.header.hash, &c.header.root_digest);
-    let server = std::sync::Arc::new(Server::bind(&format!("{addr}:{port}"), c, &name)?);
+    // A throttle is a measuring instrument rather than a feature: on a loopback
+    // socket every layout is instantaneous, which hides the exact difference
+    // §13 is about.
+    let throttle: u64 = match flag(args, "--throttle") {
+        Some(s) => parse_size(s)?,
+        None => 0,
+    };
+    let server =
+        std::sync::Arc::new(Server::bind(&format!("{addr}:{port}"), c, &name)?.throttled(throttle));
 
     pr!("serving {path}  {}", human(size));
     pr!("  listening    http://{addr}:{}", server.port());
+    if throttle > 0 {
+        pr!("  throttle     {}/s", human(throttle));
+    }
     pr!(
         "  pack         /{name}   ({} objects, range-readable)",
         commas(objects as u64)

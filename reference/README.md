@@ -206,6 +206,17 @@ implemented:
   describes every object, holds no weights, and is *incomplete* rather than
   invalid — `omni fetch`, `omni index` and `omni strip --weights`, with the round
   trips counted so the claim is checkable
+- **What a layout costs before the first number comes out.** `omni serve
+  --throttle` rate-limits the server and `omni fetch --first-tensor` reads one
+  tensor two ways over that link: by range, and by fetching the whole file the
+  way a reader with no index has to. The throttle is the point — on a loopback
+  socket every layout is instantaneous, which hides the difference exactly where
+  §13 claims it matters. On the worked example over 200 KiB/s: 37.7 KiB and
+  178 ms by range against 111.2 KiB and 552 ms for the file. The ratio belongs to
+  the *model*; the number that belongs to the *format* is underneath it — 5.7 KiB
+  of framing and index to reach any tensor at all, which is §02.7's two-read open
+  measured over a socket. The whole-file row is marked *modelled* in the output,
+  because it is what the hub tooling does rather than a measurement of a runtime
 - §13.4.3 `omni serve`: the other half of the transport, read-only. The pack with
   range support, the sidecar generated from it, and every object at
   `/objects/<digest>` with the `immutable` cache header §13.4.2 says is always

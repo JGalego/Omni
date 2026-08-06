@@ -317,10 +317,30 @@ container** (§08.6) uploads **20 %** of what the full model costs. That figure 
 *modelled*, not measured at scale — these are toy containers, and what is being
 demonstrated is the mechanism rather than a ratio that generalises.
 
+**The TTFT comparison now exists, in the narrower form that is honest.** The
+compute half of time-to-first-token is the same whatever the file looks like, so
+what a *format* decides is the I/O half: how many bytes cross the wire before the
+first tensor can be read. `omni serve --throttle` rate-limits the server, because
+on a loopback socket every layout is instantaneous and the difference hides
+exactly where it is supposed to matter, and `omni fetch --first-tensor` reads one
+tensor two ways over that link — by range, and by fetching the whole file, which
+is what a reader with no index has to do and what the hub tooling in fact does
+today. On the worked example over a 200 KiB/s link: **37.7 KiB and 178 ms by
+range against 111.2 KiB and 552 ms for the file**.
+
+That ratio is a property of the *model* — one tensor's share of one small file —
+and the number underneath it is the property of the *format*: **5.7 KiB of
+framing and index to reach any tensor at all**, which is §02.7's two-read open
+measured over a socket rather than asserted. On a real model the ratio is large
+because that cost is nearly constant, so it is the second number that
+generalises. The whole-file row is marked *modelled* in the output itself: it is
+what the incumbent tooling does, not a measurement of any particular runtime, and
+the gate's "demonstrably better than the incumbent" needs the incumbent, on a
+real model, over a real link.
+
 What the gate actually asks for is still untouched: there is no mirror of 10 000
-models, no dedup or delta-size or load-time figures over real ones, and no TTFT
-comparison over a throttled link. There is no `mount`, no referrers API and no
-`by-novelty` partitioning. The signature stack of §12.5 is implemented (Ed25519,
+models, and no dedup, delta-size, load-time or TTFT figures over real ones. There
+is no `mount`, no referrers API and no `by-novelty` partitioning. The signature stack of §12.5 is implemented (Ed25519,
 COSE_Sign1, trust policies) and has had no third-party review. The distribution
 *mechanisms* are now demonstrated rather than claimed; the distribution
 *measurements* are what remains, and they need a corpus rather than more code.

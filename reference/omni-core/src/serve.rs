@@ -122,6 +122,17 @@ pub struct Server {
     /// derived from.
     name: String,
     listener: std::net::TcpListener,
+    /// Bytes per second this server will write, or `0` for as fast as the
+    /// socket takes them.
+    ///
+    /// A throttle is not a feature of a model server; it is a *measuring
+    /// instrument*. §13's claim is that a container's layout makes the first
+    /// tensor cheap to reach, and on a loopback socket every layout is
+    /// instantaneous — so the difference between reading three ranges and
+    /// reading a whole file is invisible exactly where it is supposed to
+    /// matter. Rate-limiting the writes restores the only variable the claim is
+    /// about: bytes.
+    throttle: u64,
     pub stats: Stats,
 }
 
@@ -136,8 +147,20 @@ impl Server {
             container,
             name: name.to_string(),
             listener,
+            throttle: 0,
             stats: Stats::default(),
         })
+    }
+
+    /// Limits the server to `bytes_per_second`, for the measurement described on
+    /// [`Server::throttle`]. Zero removes the limit.
+    pub fn throttled(mut self, bytes_per_second: u64) -> Server {
+        self.throttle = bytes_per_second;
+        self
+    }
+
+    pub fn rate(&self) -> u64 {
+        self.throttle
     }
 
     pub fn port(&self) -> u16 {
@@ -372,9 +395,36 @@ impl Server {
         out.write_all(head.as_bytes())
             .map_err(|e| Error::Io(e.to_string()))?;
         if !head_only {
-            out.write_all(slice).map_err(|e| Error::Io(e.to_string()))?;
+            self.write_paced(out, slice)?;
         }
         out.flush().map_err(|e| Error::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Writes a response body, at the configured rate.
+    ///
+    /// The pacing is deliberately crude — a fixed slice per tick, and a sleep
+    /// for whatever is left of the tick — because a precise shaper would be
+    /// measuring its own scheduler. What it has to be is *the same* for every
+    /// response, so that two ways of reading the same container differ only in
+    /// how many bytes they ask for.
+    fn write_paced(&self, out: &mut dyn std::io::Write, body: &[u8]) -> Res<()> {
+        if self.throttle == 0 {
+            return out.write_all(body).map_err(|e| Error::Io(e.to_string()));
+        }
+        // A twentieth of a second's worth per tick: small enough that a short
+        // response is still paced, large enough that a long one is not a syscall
+        // storm.
+        let slice = (self.throttle / 20).max(1) as usize;
+        for part in body.chunks(slice) {
+            let t0 = std::time::Instant::now();
+            out.write_all(part).map_err(|e| Error::Io(e.to_string()))?;
+            out.flush().map_err(|e| Error::Io(e.to_string()))?;
+            let owed = std::time::Duration::from_secs_f64(part.len() as f64 / self.throttle as f64);
+            if let Some(left) = owed.checked_sub(t0.elapsed()) {
+                std::thread::sleep(left);
+            }
+        }
         Ok(())
     }
 }

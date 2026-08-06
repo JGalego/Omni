@@ -1090,6 +1090,52 @@ jobs:
           "$OMNI" oci push /tmp/reg-base.omni "https://$REG/m:1" 2>&1 | grep -q 'TLS'
           echo "a model pushes, pulls, deduplicates and keeps its signature"
 
+      # Gate 3's second ask, in the only honest form this repository can put it:
+      # the compute half of time-to-first-token is the same whatever the file
+      # looks like, so what a *format* decides is the I/O half — how many bytes
+      # have to cross the wire before the first tensor can be read. On a loopback
+      # socket that difference is invisible, which is why the server can be
+      # throttled: the rate limit restores the only variable the claim is about.
+      - name: What a layout costs before the first number comes out
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          "$OMNI" example --tune 4 /tmp/ttft.omni >/dev/null
+          "$OMNI" serve /tmp/ttft.omni --port 8099 --throttle 200K >/tmp/ttftserve.txt 2>&1 &
+          SERVER=$!
+          for i in $(seq 1 50); do
+            grep -q listening /tmp/ttftserve.txt && break
+            sleep 0.1
+          done
+          grep -q 'throttle     195.31 KiB/s' /tmp/ttftserve.txt
+
+          "$OMNI" fetch http://127.0.0.1:8099/ttft.omni --first-tensor \
+            | tee /tmp/ttft.txt
+          kill $SERVER 2>/dev/null || true
+
+          python3 - <<'PY_TTFT'
+          import re
+          t = open('/tmp/ttft.txt').read()
+          def kib(label):
+              m = re.search(label + r'\s+([\d.]+) (B|KiB|MiB)', t)
+              return float(m.group(1)) * {'B': 1/1024, 'KiB': 1, 'MiB': 1024}[m.group(2)]
+          def ms(label):
+              return float(re.search(label + r'.*?([\d.]+) ms', t).group(1))
+          ranged, whole = kib('by range'), kib('whole file')
+          assert ranged < whole, f"{ranged} KiB by range vs {whole} KiB whole"
+          # The time has to follow the bytes, or the throttle is not throttling
+          # and the measurement is of a loopback socket rather than of a link.
+          assert ms('by range') < ms('whole file'), t
+          # And the number that is a property of the *format* rather than of this
+          # toy model: what it costs to reach any tensor at all. §02.7 says an
+          # open is two reads of framing plus the index, and this is that, in
+          # bytes, over a real socket.
+          over = kib('overhead')
+          assert over < whole / 2, f"framing cost {over} KiB of a {whole} KiB file"
+          print(f"first tensor: {ranged:.1f} KiB by range vs {whole:.1f} KiB whole file, "
+                f"{over:.1f} KiB of that is framing")
+          PY_TTFT
+          echo "reaching one tensor costs its bytes plus the framing, not the file"
+
       # §13.4.3: the other half of the transport. A hub SHOULD serve both a
       # pack and per-object URLs, and having both here means each is tested
       # against a real implementation of the other rather than against a mock.
