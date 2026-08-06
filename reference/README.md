@@ -256,13 +256,15 @@ implemented:
   rationals are one
 - **A Jinja2 → OMNI-CT translator** (`omni jinja`), because §06.9 replaces an
   executed Jinja string with a total language and whether that trade is
-  affordable is an empirical question. It converts 10 of a 15-template corpus of
+  affordable is an empirical question. It converts 14 of a 15-template corpus of
   real families, and the refusals carry the construct, the reason and the byte
-  offset — a maintainer can act on `` `loop.*` at byte 284 `` and cannot act on
-  "translation failed". Three of the four blockers turned out to be gaps in
-  §06.9 itself (no loop variable, no slice form, two missing standard-library
-  entries); the fourth wants deliberate failure, mutable loop state, recursion or
-  the clock, which are the four things the section exists to remove. Whitespace
+  offset — a maintainer can act on `` `loop.cycle(…)` at byte 284 `` and cannot
+  act on "translation failed". It converted 10 when it was written: three of the
+  four blockers were gaps in §06.9 itself — no loop variable, no slice form, two
+  missing standard-library entries — and closing all three is what the other four
+  templates were waiting for. The one that remains is `raise_exception`, and it
+  should: a total language has no failure form, so a template asserting something
+  about its input has to say so differently. Whitespace
   control is carried across, because `{%- … -%}` decides whether a prompt has a
   leading newline and a tokenizer notices
 - **Three synthesizable architecture families**, not one: `transformer.decoder`,

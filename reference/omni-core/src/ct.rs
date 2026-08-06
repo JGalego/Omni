@@ -15,6 +15,16 @@
 //! output budgets below exist only as a backstop against a pathological
 //! product of the two — never as a way to truncate output.
 //!
+//! Two of the language's forms are there because measuring the translator
+//! (§06.9's own note, and `jinja`'s corpus) found templates that needed them and
+//! nothing about totality that objected. `loop` is bound inside `{% for %}` to
+//! seven values computed from the sequence's length and the current position —
+//! and to nothing that remembers a previous iteration, which is the line
+//! between a loop variable and loop state. `a[b:c]` slices lists and strings
+//! with bounds clamped and negative bounds counted from the end, so a slice
+//! cannot fail where an index can. Both are total for the same reason the rest
+//! is: they are functions of data already in memory.
+//!
 //! Two consequences worth having beyond safety:
 //!
 //! - **The required inputs are computable.** [`Template::free_vars`] returns
@@ -142,6 +152,16 @@ pub enum Expr {
     Field(Box<Expr>, String),
     /// `a[b]`
     Index(Box<Expr>, Box<Expr>),
+    /// `a[b:c]`, with either bound optional. A slice of a list or a string,
+    /// with the out-of-range and negative-index behaviour every language that
+    /// has slices agrees on: bounds are clamped, a reversed range is empty, and
+    /// a negative bound counts from the end. It cannot fail, which is why it can
+    /// be in a total language at all.
+    Slice {
+        base: Box<Expr>,
+        from: Option<Box<Expr>>,
+        to: Option<Box<Expr>>,
+    },
     Not(Box<Expr>),
     Neg(Box<Expr>),
     Bin {
@@ -234,6 +254,14 @@ impl BinOp {
 pub const STDLIB: &[(&str, &str)] = &[
     ("upper", "upper(s)"),
     ("lower", "lower(s)"),
+    (
+        "capitalize",
+        "capitalize(s) — first character upper, the rest lower",
+    ),
+    (
+        "title",
+        "title(s) — first character of each word upper, the rest lower",
+    ),
     ("trim", "trim(s)"),
     ("join", "join(list, sep)"),
     ("default", "default(v, fallback) — fallback when v is null"),
@@ -803,11 +831,40 @@ impl Parser<'_> {
                 let name = self.ident()?;
                 e = Expr::Field(Box::new(e), name);
             } else if self.eat("[") {
-                let idx = self.expr()?;
-                if !self.eat("]") {
-                    return syn(self.line(), "expected `]`");
+                // `[a]`, `[a:b]`, `[a:]`, `[:b]` and `[:]` — the index form and
+                // the slice form share their opening bracket, so which one this
+                // is is only known after the first expression (or its absence).
+                self.ws();
+                let lo = if self.starts(":") {
+                    None
+                } else {
+                    Some(Box::new(self.expr()?))
+                };
+                self.ws();
+                if self.eat(":") {
+                    self.ws();
+                    let hi = if self.starts("]") {
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    if !self.eat("]") {
+                        return syn(self.line(), "expected `]`");
+                    }
+                    e = Expr::Slice {
+                        base: Box::new(e),
+                        from: lo,
+                        to: hi,
+                    };
+                } else {
+                    let Some(idx) = lo else {
+                        return syn(self.line(), "expected an index or a slice");
+                    };
+                    if !self.eat("]") {
+                        return syn(self.line(), "expected `]`");
+                    }
+                    e = Expr::Index(Box::new(e), idx);
                 }
-                e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.starts("|") && self.s.get(self.i + 1) != Some(&'|') {
                 self.i += 1;
                 let name = self.ident()?;
@@ -1040,6 +1097,12 @@ fn free_in_expr(e: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String>) 
             free_in_expr(a, bound, out);
             free_in_expr(b, bound, out);
         }
+        Expr::Slice { base, from, to } => {
+            free_in_expr(base, bound, out);
+            for e in [from, to].into_iter().flatten() {
+                free_in_expr(e, bound, out);
+            }
+        }
         Expr::Not(a) | Expr::Neg(a) => free_in_expr(a, bound, out),
         Expr::Bin { l, r, .. } => {
             free_in_expr(l, bound, out);
@@ -1134,6 +1197,7 @@ impl Render<'_> {
                                 ("index", Value::U(i as u64 + 1)),
                                 ("index0", Value::U(i as u64)),
                                 ("revindex", Value::U((n - i) as u64)),
+                                ("revindex0", Value::U((n - i - 1) as u64)),
                                 ("first", Value::Bool(i == 0)),
                                 ("last", Value::Bool(i + 1 == n)),
                                 ("length", Value::U(n as u64)),
@@ -1193,6 +1257,18 @@ impl Render<'_> {
                 let base = self.eval(a)?;
                 let key = self.eval(b)?;
                 index(&base, &key)?
+            }
+            Expr::Slice { base, from, to } => {
+                let b = self.eval(base)?;
+                let lo = match from {
+                    Some(e) => Some(as_int(&self.eval(e)?)?),
+                    None => None,
+                };
+                let hi = match to {
+                    Some(e) => Some(as_int(&self.eval(e)?)?),
+                    None => None,
+                };
+                slice(&b, lo, hi)?
             }
             Expr::Not(a) => Value::Bool(!truthy(&self.eval(a)?)),
             Expr::Neg(a) => {
@@ -1380,6 +1456,35 @@ fn index(base: &Value, key: &Value) -> Res<Value> {
     }
 }
 
+/// `base[from:to]` over a list or a string.
+///
+/// Total by construction: bounds are clamped into range after negative ones are
+/// counted from the end, and a range that runs backwards is empty. There is no
+/// input for which this fails, which is what lets §06.9 have it — indexing can
+/// fail and does, but a slice of the wrong end of a short list is a shorter
+/// list, not an error.
+fn slice(base: &Value, from: Option<i64>, to: Option<i64>) -> Res<Value> {
+    let n = match base {
+        Value::Array(a) => a.len(),
+        Value::Text(s) => s.chars().count(),
+        other => {
+            return Err(Error::Type(format!("{} cannot be sliced", kind_of(other))));
+        }
+    } as i64;
+    let clamp = |i: i64| -> usize {
+        let at = if i < 0 { n + i } else { i };
+        at.clamp(0, n) as usize
+    };
+    let lo = clamp(from.unwrap_or(0));
+    let hi = clamp(to.unwrap_or(n));
+    let hi = hi.max(lo);
+    Ok(match base {
+        Value::Array(a) => Value::Array(a[lo..hi].to_vec()),
+        Value::Text(s) => Value::text(s.chars().skip(lo).take(hi - lo).collect::<String>()),
+        _ => unreachable!("checked above"),
+    })
+}
+
 fn binop(op: BinOp, a: &Value, b: &Value) -> Res<Value> {
     use BinOp::*;
     Ok(match op {
@@ -1515,6 +1620,41 @@ fn call(name: &str, args: &[Value]) -> Res<Value> {
         "trim" => {
             arity(name, args, 1..=1)?;
             Ok(Value::text(text_arg(name, &args[0])?.trim().to_string()))
+        }
+        // `capitalize` and `title` lower-case what they do not upper-case,
+        // which is what Jinja's filters of the same name do and is the
+        // behaviour a translated template depends on.
+        "capitalize" => {
+            arity(name, args, 1..=1)?;
+            let s = text_arg(name, &args[0])?;
+            let mut out = String::with_capacity(s.len());
+            for (i, c) in s.chars().enumerate() {
+                if i == 0 {
+                    out.extend(c.to_uppercase());
+                } else {
+                    out.extend(c.to_lowercase());
+                }
+            }
+            Ok(Value::text(out))
+        }
+        "title" => {
+            arity(name, args, 1..=1)?;
+            let s = text_arg(name, &args[0])?;
+            let mut out = String::with_capacity(s.len());
+            // A word starts at the beginning and after any of the characters
+            // Jinja's `title` treats as a boundary. Stating the set is the
+            // point: "which characters start a word" is exactly the kind of
+            // question a template must not have two answers to.
+            let mut at_start = true;
+            for c in s.chars() {
+                if at_start {
+                    out.extend(c.to_uppercase());
+                } else {
+                    out.extend(c.to_lowercase());
+                }
+                at_start = c.is_whitespace() || matches!(c, '-' | '(' | '{' | '[' | '<');
+            }
+            Ok(Value::text(out))
         }
         "join" => {
             arity(name, args, 1..=2)?;
@@ -1899,6 +2039,16 @@ fn expr_to_value(e: &Expr) -> Value {
             ("base", expr_to_value(a)),
             ("key", expr_to_value(b)),
         ]),
+        Expr::Slice { base, from, to } => {
+            let mut f = vec![("k", Value::text("slice")), ("base", expr_to_value(base))];
+            if let Some(e) = from {
+                f.push(("from", expr_to_value(e)));
+            }
+            if let Some(e) = to {
+                f.push(("to", expr_to_value(e)));
+            }
+            Value::map(f)
+        }
         Expr::Not(a) => Value::map(vec![("k", Value::text("not")), ("a", expr_to_value(a))]),
         Expr::Neg(a) => Value::map(vec![("k", Value::text("neg")), ("a", expr_to_value(a))]),
         Expr::Bin { op, l, r } => Value::map(vec![

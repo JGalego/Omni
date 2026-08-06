@@ -1133,8 +1133,24 @@ jobs:
           # The figure is a percentage of a small corpus, and the verb has to say
           # so rather than let it be read as the hub number Gate 2 asks for.
           grep -q 'not of the hub' /tmp/cov.txt
-          # The single biggest blocker is a gap in §06.9's own grammar.
-          grep -q 'loop\.\*' /tmp/cov.txt
+          # The three blockers that were gaps in §06.9's own grammar have been
+          # closed, so what is left is the class the section exists to refuse.
+          test "$(grep -c '^  ✗' /tmp/cov.txt)" = 1
+          grep -q 'raise_exception' /tmp/cov.txt
+          if grep -qE 'loop\.\*|a\[b:c\]|\| capitalize' /tmp/cov.txt; then
+            echo "::error::a construct §06.9 now has a form for was refused"; exit 1
+          fi
+
+          # The forms that closed them, each rendering what Jinja renders.
+          cat > /tmp/grown.jinja <<'JINJA'
+          {% for m in messages[1:] %}{{ loop.index }}. {{ m.role | capitalize }}
+          {%- if not loop.last %}, {% endif %}{% endfor %}
+          JINJA
+          "$OMNI" jinja /tmp/grown.jinja > /tmp/grown.ct 2>&1
+          cat /tmp/grown.ct
+          grep -q 'messages\[1:\]' /tmp/grown.ct
+          grep -q 'loop.index' /tmp/grown.ct
+          grep -q 'capitalize(' /tmp/grown.ct
 
           # A real template translates, and the result is OMNI-CT rather than the
           # Jinja it came from: the filter became a call.

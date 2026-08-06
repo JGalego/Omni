@@ -32,13 +32,29 @@
 //!   are Python methods on a host object. The first two have exact OMNI-CT
 //!   equivalents (`trim`, `split`) and are rewritten; anything else is refused
 //!   rather than approximated.
-//! * **`loop.index0` / `loop.first` / `loop.last`.** OMNI-CT's `for` has no loop
-//!   variable. These are translated by binding the loop over an index range —
-//!   which OMNI-CT cannot express either — so they are **refused**, and that is
-//!   a genuine gap in §06.9 rather than in this translator. It is the single
-//!   most common refusal, and §06.9 should grow a loop variable.
+//! * **`loop.*`.** §06.9 grew a loop variable, because this was the most common
+//!   refusal by a wide margin and the gap was in the grammar rather than in the
+//!   templates. `index`, `index0`, `revindex`, `revindex0`, `first`, `last` and
+//!   `length` translate as themselves. `cycle()`, `previtem`, `nextitem`,
+//!   `changed()` and `depth` do not and should not: each needs the loop to
+//!   remember where it has been, which is the state that makes a loop able to
+//!   depend on its own history. They are refused one field at a time, so a
+//!   template is told which use blocks it.
 
 use crate::ct::{BinOp, Expr, Node, Template};
+
+/// The fields §06.9's loop variable binds. Jinja binds more, and the extras are
+/// refused one at a time rather than as a class, because which ones a template
+/// uses is what decides whether it can ship.
+const LOOP_FIELDS: [&str; 7] = [
+    "index",
+    "index0",
+    "revindex",
+    "revindex0",
+    "first",
+    "last",
+    "length",
+];
 
 /// Why a template could not be translated.
 #[derive(Clone, Debug, PartialEq)]
@@ -652,33 +668,75 @@ impl E<'_> {
                 self.i += 1;
                 let name = self.ident()?;
                 self.ws();
+                let on_loop = matches!(&e, Expr::Var(v) if v == "loop");
                 // A `.name(` is a Python method call, not a field.
                 if self.i < self.s.len() && self.s[self.i] == b'(' {
                     let args = self.args()?;
+                    if on_loop {
+                        return Err(unsupported(
+                            &format!("loop.{name}(…)"),
+                            "§06.9's loop variable is six values; `cycle`, \
+                             `changed` and friends are state that outlives an \
+                             iteration, which is what makes a loop able to \
+                             depend on its own history",
+                            self.at,
+                        ));
+                    }
                     e = self.method(e, &name, args)?;
                 } else {
+                    if on_loop && !LOOP_FIELDS.contains(&name.as_str()) {
+                        return Err(unsupported(
+                            &format!("loop.{name}"),
+                            "§06.9's loop variable binds index, index0, revindex, \
+                             revindex0, first, last and length; anything else \
+                             would have to remember where the loop has been",
+                            self.at,
+                        ));
+                    }
                     e = Expr::Field(Box::new(e), name);
                 }
                 continue;
             }
             if self.i < self.s.len() && self.s[self.i] == b'[' {
                 self.i += 1;
-                let idx = self.ternary()?;
                 self.ws();
-                if self.i >= self.s.len() || self.s[self.i] != b']' {
-                    // A slice: `messages[1:]` is common and OMNI-CT has no
-                    // slicing form.
-                    if self.i < self.s.len() && self.s[self.i] == b':' {
-                        return Err(unsupported(
-                            "a[b:c]",
-                            "slicing a list needs a slice form §06.9 does not have",
-                            self.at,
-                        ));
+                // `messages[1:]` — splitting a system message off the front is
+                // the standard idiom, and it is the same slice form on both
+                // sides now that §06.9 has one.
+                let lo = if self.i < self.s.len() && self.s[self.i] == b':' {
+                    None
+                } else {
+                    Some(Box::new(self.ternary()?))
+                };
+                self.ws();
+                if self.i < self.s.len() && self.s[self.i] == b':' {
+                    self.i += 1;
+                    self.ws();
+                    let hi = if self.i < self.s.len() && self.s[self.i] == b']' {
+                        None
+                    } else {
+                        Some(Box::new(self.ternary()?))
+                    };
+                    self.ws();
+                    if self.i >= self.s.len() || self.s[self.i] != b']' {
+                        return self.err("expected `]`");
                     }
+                    self.i += 1;
+                    e = Expr::Slice {
+                        base: Box::new(e),
+                        from: lo,
+                        to: hi,
+                    };
+                    continue;
+                }
+                let Some(idx) = lo else {
+                    return self.err("expected an index or a slice");
+                };
+                if self.i >= self.s.len() || self.s[self.i] != b']' {
                     return self.err("expected `]`");
                 }
                 self.i += 1;
-                e = Expr::Index(Box::new(e), Box::new(idx));
+                e = Expr::Index(Box::new(e), idx);
                 continue;
             }
             if self.i < self.s.len() && self.s[self.i] == b'|' {
@@ -723,9 +781,13 @@ impl E<'_> {
                 args,
             },
             "list" => args.into_iter().next().unwrap_or(Expr::Null),
-            "capitalize" | "title" | "sort" | "reverse" | "unique" | "map" | "select"
-            | "reject" | "selectattr" | "rejectattr" | "groupby" | "batch" | "slice" | "round"
-            | "sum" | "min" | "max" | "indent" | "wordwrap" | "truncate" => {
+            "capitalize" | "title" => Expr::Call {
+                name: name.to_string(),
+                args,
+            },
+            "sort" | "reverse" | "unique" | "map" | "select" | "reject" | "selectattr"
+            | "rejectattr" | "groupby" | "batch" | "slice" | "round" | "sum" | "min" | "max"
+            | "indent" | "wordwrap" | "truncate" => {
                 return Err(unsupported(
                     &format!("| {name}"),
                     "no OMNI-CT equivalent; §06.9's standard library is closed and \
@@ -963,18 +1025,14 @@ impl E<'_> {
             "true" | "True" => Expr::Bool(true),
             "false" | "False" => Expr::Bool(false),
             "none" | "None" => Expr::Null,
-            // `loop` is the loop variable Jinja binds inside `{% for %}`.
-            // OMNI-CT's `for` binds none, so every use of it is a refusal — and
-            // this is the most common one by a wide margin.
-            "loop" => {
-                return Err(unsupported(
-                    "loop.*",
-                    "OMNI-CT's `for` has no loop variable, so `loop.index0`, \
-                     `loop.first` and `loop.last` have nothing to translate to. \
-                     This is a gap in §06.9's grammar rather than in the template",
-                    self.at,
-                ))
-            }
+            // `loop` is the loop variable Jinja binds inside `{% for %}`, and
+            // §06.9 now binds one too. Which *fields* it binds is the whole
+            // difference: the six below are values, and the rest of Jinja's
+            // `loop` — `cycle()`, `previtem`, `nextitem`, `changed()`, `depth`
+            // — needs the loop to remember where it has been, which is the
+            // state a total language does not have. Those stay refused, by
+            // name, at the field rather than at the variable.
+            "loop" => Expr::Var("loop".into()),
             _ => Expr::Var(name),
         })
     }
@@ -1184,6 +1242,18 @@ fn print_expr(e: &Expr, out: &mut String) {
             print_expr(b, out);
             out.push('[');
             print_expr(i, out);
+            out.push(']');
+        }
+        Expr::Slice { base, from, to } => {
+            print_expr(base, out);
+            out.push('[');
+            if let Some(e) = from {
+                print_expr(e, out);
+            }
+            out.push(':');
+            if let Some(e) = to {
+                print_expr(e, out);
+            }
             out.push(']');
         }
         // Parenthesized without exception: the printed form has to reparse to
@@ -1552,11 +1622,12 @@ mod tests {
             ("{{ range(5) }}", "range(…)"),
             ("{{ raise_exception('no') }}", "raise_exception(…)"),
             ("{{ namespace(x=1) }}", "namespace(…)"),
-            ("{{ messages[1:] }}", "a[b:c]"),
-            ("{{ x | capitalize }}", "| capitalize"),
             ("{{ x.startswith('a') }}", ".startswith()"),
             ("{% for k, v in m.items() %}{% endfor %}", "for x, y in …"),
-            ("{{ loop.index0 }}", "loop.*"),
+            // The loop variable exists now; what does not, and should not, is
+            // the part of it that remembers previous iterations.
+            ("{{ loop.cycle('a', 'b') }}", "loop.cycle(…)"),
+            ("{{ loop.previtem }}", "loop.previtem"),
             ("{{ 1.5 }}", "a float literal"),
             ("{{ a / b }}", "a / b"),
             ("{{ x is string }}", "is string"),
@@ -1567,6 +1638,54 @@ mod tests {
                 Error::Unsupported(r) => assert_eq!(r.construct, construct, "for `{src}`"),
                 other => panic!("`{src}` gave a syntax error rather than a refusal: {other}"),
             }
+        }
+    }
+
+    #[test]
+    fn the_three_named_gaps_in_the_grammar_are_closed() {
+        // §06.9 recorded three refusals as gaps in itself rather than in the
+        // templates, each with a named fix. These are those fixes, checked the
+        // way the gap was measured: the construct translates, and the
+        // translation renders to what Jinja renders.
+        let cases: [(&str, &str); 5] = [
+            (
+                "{% for m in messages %}{{ loop.index }}{% if not loop.last %},{% endif %}\
+                 {% endfor %}",
+                "1,2,3",
+            ),
+            (
+                "{% for m in messages[1:] %}{{ m.role }}{% endfor %}",
+                "userassistant",
+            ),
+            (
+                "{% for m in messages[:1] %}{{ m.role }}{% endfor %}",
+                "system",
+            ),
+            ("{{ messages[0].role | capitalize }}", "System"),
+            ("{{ 'gpt4 correct user' | title }}", "Gpt4 Correct User"),
+        ];
+        let input = crate::cbor::Value::map(vec![(
+            "messages",
+            crate::cbor::Value::Array(
+                ["system", "user", "assistant"]
+                    .iter()
+                    .map(|r| crate::cbor::Value::map(vec![("role", crate::cbor::Value::text(*r))]))
+                    .collect(),
+            ),
+        )]);
+        for (src, want) in cases {
+            let t = translate(src).unwrap_or_else(|e| panic!("`{src}`: {e}"));
+            let got = t
+                .template
+                .render(&input)
+                .unwrap_or_else(|e| panic!("`{src}`: {e}"));
+            assert_eq!(got, want, "for `{src}`");
+            // And the printed OMNI-CT reparses to something that renders the
+            // same, which is what makes the new forms round-trip.
+            let printed = print(&t.template.nodes);
+            let again =
+                crate::ct::Template::parse(&printed).unwrap_or_else(|e| panic!("`{printed}`: {e}"));
+            assert_eq!(again.render(&input).unwrap(), want, "reparsed `{printed}`");
         }
     }
 
@@ -1631,7 +1750,7 @@ mod tests {
         // it is not that, so the assertion here is a floor that catches a
         // regression rather than a claim about the hub.
         assert!(
-            c.rate() >= 0.6,
+            c.rate() >= 0.9,
             "coverage fell to {:.0}%: {:?}",
             c.rate() * 100.0,
             c.refused

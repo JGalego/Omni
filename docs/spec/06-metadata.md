@@ -287,9 +287,18 @@ OMNI-CT semantics:
 - Values: strings, integers, booleans, lists, maps. No arbitrary objects.
 - Constructs: `{{ expr }}`, `{% if %}`, `{% for x in list %}` (bounded by the
   input's size), `{% set %}` (local, no recursion), whitespace control.
-- Functions: a fixed, pure standard library (`upper`, `lower`, `trim`, `join`,
-  `default`, `tojson`, `strftime` on explicit inputs). No imports, no eval, no
-  attribute access into host objects, no method calls on arbitrary types.
+- Inside `{% for %}`, `loop` is bound to `{index, index0, revindex, revindex0,
+  first, last, length}` — values computed from the sequence's length and the
+  current position, and nothing that remembers previous iterations. `loop.cycle`
+  and `loop.previtem` are deliberately absent: they are state that outlives an
+  iteration, which is what would let a loop depend on its own history.
+- Slices: `list[a:b]`, either bound optional, on lists and strings. Bounds are
+  clamped, negative bounds count from the end, and a reversed range is empty, so
+  a slice is total where an index is not.
+- Functions: a fixed, pure standard library (`upper`, `lower`, `capitalize`,
+  `title`, `trim`, `join`, `default`, `tojson`, `strftime` on explicit inputs).
+  No imports, no eval, no attribute access into host objects, no method calls on
+  arbitrary types.
 - Guaranteed termination: loops iterate over finite input structures only; no
   `while`, no recursion. Rendering cost is O(input size × template size).
 
@@ -298,27 +307,27 @@ automatically in the overwhelming majority of cases; the `jinja_compat` field
 carries a Jinja2 rendering for runtimes that still want it, clearly marked as the
 *derived* form.
 
-> **Measured, and "the overwhelming majority" is not yet earned.** A translator
-> exists (`omni jinja`, `omni_core::jinja`), and over a 15-template corpus of real
-> model families it converts **10**. That is a percentage of a small corpus rather
-> than of a hub snapshot, but the *blockers* it names are the ones a hub snapshot
-> would name too, and three of the four are gaps in this section rather than in
-> the templates:
+> **Measured, and the gaps this measurement found have been closed.** A
+> translator exists (`omni jinja`, `omni_core::jinja`), and over a 15-template
+> corpus of real model families it converts **14**. It converted **10** when it
+> was first written, and the difference is the point of having measured: three of
+> its four blockers were gaps in *this section* rather than in the templates, and
+> each named its own fix.
 >
-> | blocked by | families | what would close it |
-> |---|---:|---|
-> | `loop.index0`, `loop.first`, `loop.last` | 2 | a loop variable in `{% for %}`. OMNI-CT binds none, and a template that separates the last message from the rest has nothing to translate to. This is the single most common refusal and the clearest candidate for the grammar to grow |
-> | `messages[1:]` | 1 | a slice form. Splitting a system message off the front is the standard idiom, and there is no total-language reason to withhold it |
-> | `\| capitalize`, `\| title` | 2 | two entries in the standard library. Both are pure and total, so the only thing keeping them out is that nobody added them |
+> | blocked by | families | fix | state |
+> |---|---:|---|---|
+> | `loop.index0`, `loop.first`, `loop.last` | 2 | a loop variable in `{% for %}` | closed: seven fields, none of which remembers a previous iteration |
+> | `messages[1:]` | 1 | a slice form | closed: `a[b:c]` on lists and strings, total by clamping |
+> | `\| capitalize`, `\| title` | 2 | two standard-library entries | closed: both pure, both total |
+> | `raise_exception`, `namespace`, `{% macro %}`, `strftime_now` | 1 | — | **kept refused**: deliberate failure, mutable state that outlives a loop, recursion, and the clock are the four capabilities this section exists to remove |
 >
-> The fourth kind of refusal is *not* a gap and should stay: `raise_exception`,
-> `namespace`, `{% macro %}` and `strftime_now` each want a capability §06.9
-> exists to remove — deliberate failure, mutable state that outlives a loop,
-> recursion, and the clock. A template using one of those has to change, and the
-> translator names which.
+> The one template still refused is the one that raises. A template that asserts
+> something about its input has to say so in a way a total language can express,
+> and rewriting it is the right outcome rather than growing the grammar again.
 >
 > The roadmap's Gate 2 asks for 95 % of a public hub snapshot with the failures
-> analysed and published. The analysis machinery is here; the snapshot is not.
+> analysed and published. The analysis machinery is here and it has now been
+> acted on twice; the snapshot is still not.
 
 `vectors` (message list → expected prompt string) make template regressions
 detectable by `omni verify --template`.

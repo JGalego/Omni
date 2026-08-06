@@ -1405,9 +1405,11 @@ mod tests {
     #[test]
     fn a_jinja_template_it_cannot_translate_is_left_out_and_named() {
         let mut f = files();
-        // `loop.index` is one of §06.9's known gaps.
+        // `raise_exception` is a refusal §06.9 intends to keep: a total
+        // language has no failure form, so the assertion would be dropped.
         f.tokenizer_config = Some(
-            br#"{"chat_template":"{% for m in messages %}{{ loop.index }}{% endfor %}"}"#.to_vec(),
+            br#"{"chat_template":"{% if not messages %}{{ raise_exception('none') }}{% endif %}"}"#
+                .to_vec(),
         );
         let out = import(&f, &ImportOpts::default()).expect("imports anyway");
         assert!(!out
@@ -1419,7 +1421,7 @@ mod tests {
             out.report
                 .unrepresented
                 .iter()
-                .any(|n| n.item == "chat_template" && n.reason.contains("loop")),
+                .any(|n| n.item == "chat_template" && n.reason.contains("raise_exception")),
             "{:?}",
             out.report.unrepresented
         );
