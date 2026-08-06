@@ -220,11 +220,27 @@ implemented:
   layer, and the annotations a registry UI can show without pulling anything.
   Concatenating the layers reproduces the container byte for byte, and importing
   verifies every blob against the digest that named it before anything becomes a
-  file. Not a registry *client*: pushing needs the token dance and chunked blob
-  uploads, which `oras cp --from-oci-layout` already does. And the dedup claim is
-  stated precisely rather than optimistically — see the module docs for why it
-  comes from delta containers rather than from two independently packed files
-  happening to slice the same way
+  file
+- §13.5 **the registry client**, which was the missing half: `omni oci push` and
+  `omni oci pull` over the distribution API, tested in CI against a real
+  `registry:2` rather than a mock — because the argument for the OCI mapping is
+  parasitic adoption, and adoption is not a property this repository can assert
+  about itself. A model goes up, comes back down byte-identical, verifies at V6
+  and can be pulled by digest instead of by tag; a signed container makes the
+  same trip with its §12.5 attestation still valid on the far side. Every blob is
+  `HEAD`ed first, so what is uploaded is what the registry does not already
+  have — and that turns the dedup claim into a measurement made by the party that
+  would know. It measures three things, and the middle one is the interesting
+  one: the same container under a second tag uploads **nothing**; a *modified*
+  model shares **no** blobs with the original, because objects are placed in
+  digest order and one changed tensor moves everything after it; and the same
+  fine-tune published as a delta container uploads **20 %** of the full model.
+  The module docs said all three before anything had been pushed anywhere, and CI
+  now measures them instead of repeating them. `https://` is still refused — TLS
+  needs a dependency this crate does not have — so what this reaches is a
+  plaintext registry: a local one, a mirror, or anything behind a terminator. A
+  `401` is told apart from a `404` and the bearer realm it names is reported
+  rather than guessed at
 - **ONNX, both directions**, which is the row of the capability matrix that tests
   §07 rather than §04: a safetensors file is tensors, a GGUF file is tensors plus
   an architecture enum, and an ONNX file is a computation. The protobuf wire
@@ -431,9 +447,17 @@ What is **not** implemented, and is reported as such rather than faked:
   socket, but TLS needs a cryptographic transport stack and this crate has no
   dependencies to provide one. An `https://` URL is refused with that reason
   rather than silently downgraded
-- A registry *client*: §13.5's mapping is implemented and writes a pushable
-  layout, but the push itself needs bearer-token auth and chunked blob uploads
-  against a live registry, which is a client rather than a format concern
+- Registry *authentication*, and chunked blob uploads. `omni oci push` and
+  `omni oci pull` speak the distribution API and CI pushes to a real
+  `registry:2`, but a registry that answers `401` wants a token from a realm that
+  is https on every registry this could reach — so the challenge is parsed and
+  reported with the URL it would have fetched, and no anonymous retry is
+  attempted, because an endpoint this build cannot reach is not made reachable by
+  trying twice. Uploads are monolithic `PUT`s, which the specification allows at
+  any size; chunking is a resumption story for a 5 GB layer over a bad link, and
+  it is named here rather than half-implemented. The OCI referrers API, which is
+  how an adapter or a signature would be linked to the model it belongs to, is
+  also not here
 - `omni convert --requantize`. `--cast` is here — it converts, measures the
   error it introduced, records the recipe as provenance and can re-read its own
   output to check it — but requantizing is a *search over a calibration set*

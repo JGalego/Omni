@@ -254,6 +254,20 @@ VERBS:
                               Map a container onto an OCI image layout (§13.5)
                               that `oras`/`skopeo` can push; layers are cut at
                               object boundaries
+    oci     push <file.omni> <host[:port]/name[:tag]> [--pack 1Gi]
+                              Push over the OCI distribution API. Every blob is
+                              HEADed first, so what is uploaded is what the
+                              registry does not already have — which is §13.5's
+                              dedup claim answered by the party that would know.
+                              https needs a TLS stack this build has no
+                              dependency for, so what works is a plaintext
+                              registry: a local one, a mirror, or anything behind
+                              a terminator
+    oci     pull <host[:port]/name[:tag]> -o <file.omni>
+                              Pull it back. Every blob is checked against the
+                              digest that named it before it becomes a file, and
+                              the layers are reassembled and parsed as a
+                              container before anything is written
     oci     import <dir> -o <file.omni>
                               Reassemble a layout, verifying every blob against
                               the digest that named it
@@ -5619,8 +5633,123 @@ fn cmd_oci(args: &[String]) -> R {
             }
             Ok(0)
         }
+        // §13.5's other half: the transfer. `oras cp --from-oci-layout` does
+        // this today, and the reason to have it here is that a mapping nobody
+        // has pushed anywhere is a claim about distribution rather than a
+        // demonstration of one.
+        "push" => {
+            let (Some(input), Some(reference)) = (args.get(2), args.get(3)) else {
+                prr!("omni: oci push needs <file.omni> <host[:port]/name[:tag]>\n");
+                return Ok(2);
+            };
+            let r = match omni_core::registry::Reference::parse(reference) {
+                Ok(r) => r,
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    return Ok(2);
+                }
+            };
+            let c = Container::open(std::fs::read(input)?)?;
+            let opts = ExportOpts {
+                pack_bytes: match flag(args, "--pack") {
+                    Some(s) => parse_size(s)?,
+                    None => omni_core::oci::DEFAULT_PACK_BYTES,
+                },
+                reference: None,
+            };
+            let p = match omni_core::registry::push_container(&c, &r, &opts) {
+                Ok(p) => p,
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    return Ok(match e {
+                        omni_core::registry::Error::Auth(_) => 4,
+                        _ => 1,
+                    });
+                }
+            };
+            pr!(
+                "pushed {input} -> {}:{}/{}:{}",
+                r.host,
+                r.port,
+                r.name,
+                r.reference
+            );
+            pr!("  manifest     sha256:{}", p.manifest_digest);
+            pr!(
+                "  blobs        {} ({} uploaded, {} already there)",
+                p.blobs(),
+                p.uploaded,
+                p.skipped
+            );
+            // §13.5's dedup claim, answered by the party that would know.
+            pr!(
+                "  uploaded     {} of {}",
+                human(p.uploaded_bytes),
+                human(p.total_bytes())
+            );
+            if p.skipped > 0 {
+                pr!(
+                    "  deduplicated {} the registry already had ({:.1} % of the artifact)",
+                    human(p.skipped_bytes),
+                    100.0 * p.skipped_bytes as f64 / p.total_bytes().max(1) as f64
+                );
+            }
+            pr!("  requests     {}", commas(p.requests));
+            Ok(0)
+        }
+        "pull" => {
+            let (Some(reference), Some(out)) =
+                (args.get(2), flag(args, "-o").or(flag(args, "--out")))
+            else {
+                prr!("omni: oci pull needs <host[:port]/name[:tag]> -o <file.omni>\n");
+                return Ok(2);
+            };
+            let r = match omni_core::registry::Reference::parse(reference) {
+                Ok(r) => r,
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    return Ok(2);
+                }
+            };
+            let got = match omni_core::registry::pull(&r) {
+                Ok(p) => p,
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    return Ok(match e {
+                        omni_core::registry::Error::Auth(_) => 4,
+                        _ => 1,
+                    });
+                }
+            };
+            // It parsed as a container inside the pull, and every blob was
+            // checked against the digest that named it before that.
+            std::fs::write(out, &got.bytes)?;
+            pr!(
+                "pulled {reference} -> {out}  {}",
+                human(got.bytes.len() as u64)
+            );
+            pr!("  manifest     {}", got.manifest_digest);
+            pr!(
+                "  layers       {} verified against their digests",
+                got.layers
+            );
+            pr!(
+                "  fetched      {} in {} request(s)",
+                human(got.fetched_bytes),
+                commas(got.requests)
+            );
+            for (k, v) in &got.annotations {
+                if let Some(name) = k.strip_prefix("dev.omni.") {
+                    pr!("  {:<12} {v}", name);
+                }
+            }
+            Ok(0)
+        }
         other => {
-            prr!("omni: `oci {other}` is not a subcommand; try `export` or `import`\n");
+            prr!(
+                "omni: `oci {other}` is not a subcommand; try `export`, `import`, \
+                 `push` or `pull`\n"
+            );
             Ok(2)
         }
     }

@@ -449,24 +449,73 @@ impl Http {
     }
 
     fn request_raw(&self, range: Option<(u64, u64)>) -> Res<Vec<u8>> {
+        let headers: Vec<(String, String)> = match range {
+            Some((a, b)) => vec![("Range".into(), format!("bytes={a}-{b}"))],
+            None => Vec::new(),
+        };
+        let path = self.url.path.clone();
+        let r = self.send("GET", &path, &headers, None)?;
+        // 206 for a range, 200 for the whole object. A 200 in response to a
+        // Range header means the server ignored it, which is a different bug
+        // from a failure and is reported as one.
+        if range.is_some() && r.status == 200 {
+            return Err(Error::Protocol(
+                "the server ignored the Range header and sent the whole object".into(),
+            ));
+        }
+        if !(r.status == 200 || r.status == 206) {
+            return Err(Error::Protocol(format!("HTTP {}", r.status)));
+        }
+        Ok(r.body)
+    }
+
+    /// One HTTP/1.1 request on the kept-alive connection, with the response's
+    /// status and headers returned rather than interpreted.
+    ///
+    /// [`crate::registry`] needs all of that — a `Location` to continue an
+    /// upload at, a status that distinguishes "already there" from "not found",
+    /// a `WWW-Authenticate` challenge — and a second HTTP implementation living
+    /// beside this one would be two things to get wrong instead of one.
+    pub fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Res<Response> {
         use std::io::{BufRead, Read, Write};
         self.connect()?;
         let mut guard = self.stream.borrow_mut();
         let reader = guard.as_mut().expect("connected");
         let mut req = format!(
-            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: omni-rs/{}\r\n",
-            self.url.path,
+            "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: omni-rs/{}\r\n",
             self.url.host,
             self.url.port,
             env!("CARGO_PKG_VERSION")
         );
-        if let Some((a, b)) = range {
-            req.push_str(&format!("Range: bytes={a}-{b}\r\n"));
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
         }
+        // A request with a body always states its length: a registry that has to
+        // guess is a registry that hangs.
+        req.push_str(&format!(
+            "Content-Length: {}\r\n",
+            body.map(|b| b.len()).unwrap_or(0)
+        ));
         req.push_str("Connection: keep-alive\r\n\r\n");
         reader
             .get_mut()
             .write_all(req.as_bytes())
+            .map_err(|e| Error::Io(e.to_string()))?;
+        if let Some(b) = body {
+            reader
+                .get_mut()
+                .write_all(b)
+                .map_err(|e| Error::Io(e.to_string()))?;
+        }
+        reader
+            .get_mut()
+            .flush()
             .map_err(|e| Error::Io(e.to_string()))?;
         reader
             .get_mut()
@@ -485,6 +534,7 @@ impl Http {
             .ok_or_else(|| Error::Protocol(format!("bad status line `{}`", status.trim())))?;
         let mut length: Option<usize> = None;
         let mut chunked = false;
+        let mut received: Vec<(String, String)> = Vec::new();
         loop {
             let mut line = String::new();
             let n = reader
@@ -497,6 +547,9 @@ impl Http {
             if line.is_empty() {
                 break;
             }
+            if let Some((k, v)) = line.split_once(':') {
+                received.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
             let lower = line.to_ascii_lowercase();
             if let Some(v) = lower.strip_prefix("content-length:") {
                 length = v.trim().parse().ok();
@@ -504,17 +557,6 @@ impl Http {
             if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
                 chunked = true;
             }
-        }
-        // 206 for a range, 200 for the whole object. A 200 in response to a
-        // Range header means the server ignored it, which is a different bug
-        // from a failure and is reported as one.
-        if range.is_some() && code == 200 {
-            return Err(Error::Protocol(
-                "the server ignored the Range header and sent the whole object".into(),
-            ));
-        }
-        if !(code == 200 || code == 206) {
-            return Err(Error::Protocol(format!("HTTP {code}")));
         }
         let mut body = Vec::new();
         if chunked {
@@ -541,9 +583,18 @@ impl Http {
                     .map_err(|e| Error::Io(e.to_string()))?;
             }
         } else {
-            let n = length.ok_or_else(|| {
-                Error::Protocol("no Content-Length and not chunked; nothing to read".into())
-            })?;
+            // A 204 or a 304 has no body and no Content-Length, and neither does
+            // an empty 202: absent means zero, and only a 200 that promises
+            // bytes without saying how many is a protocol error.
+            let n = match length {
+                Some(n) => n,
+                None if code == 200 => {
+                    return Err(Error::Protocol(
+                        "no Content-Length and not chunked; nothing to read".into(),
+                    ))
+                }
+                None => 0,
+            };
             if n > 1 << 30 {
                 return Err(Error::Protocol("a response over 1 GiB".into()));
             }
@@ -553,7 +604,30 @@ impl Http {
                 .map_err(|e| Error::Io(e.to_string()))?;
         }
         self.bytes.set(self.bytes.get() + body.len() as u64);
-        Ok(body)
+        Ok(Response {
+            status: code,
+            headers: received,
+            body,
+        })
+    }
+}
+
+/// One HTTP response, as [`Http::send`] returns it.
+#[derive(Debug)]
+pub struct Response {
+    pub status: u16,
+    /// Header names lower-cased, values verbatim, in the order received.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
     }
 }
 

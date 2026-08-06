@@ -29,9 +29,12 @@
 //! `https://`: [`transport`] speaks HTTP/1.1 over a socket with ranges,
 //! coalescing and per-object verification, but TLS needs a cryptographic
 //! transport stack and there are no dependencies to provide one, so an
-//! `https://` URL is refused with that reason rather than downgraded. The OCI
-//! `omni mount` (§13.9) is unimplemented, and so is the registry client behind
-//! [`oci`]'s §13.5 mapping; [`serve`] is the object server of §13.4.3.
+//! `https://` URL is refused with that reason rather than downgraded, which is
+//! also the limit of what [`registry`] can reach: it speaks the OCI
+//! distribution API and CI pushes to a real registry over plaintext, but a
+//! registry wanting a bearer token from an https realm is told apart from one
+//! that does not rather than guessed at. `omni mount` (§13.9) is unimplemented;
+//! [`serve`] is the object server of §13.4.3 and [`oci`] the §13.5 mapping.
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
@@ -78,6 +81,7 @@ pub mod plugin;
 pub mod pytorch;
 pub mod quant;
 pub mod recover;
+pub mod registry;
 pub mod safetensors;
 pub mod serve;
 pub mod sha256;

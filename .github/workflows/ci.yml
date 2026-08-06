@@ -67,6 +67,15 @@ jobs:
   container-conformance:
     name: container conformance
     runs-on: ubuntu-latest
+    # §13.5's other half. A mapping nobody has pushed anywhere is a claim about
+    # distribution rather than a demonstration of one, so the push is tested
+    # against the reference registry implementation rather than against a mock
+    # of it.
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
     steps:
       - uses: actions/checkout@v4
 
@@ -988,6 +997,98 @@ jobs:
           test ! -f /tmp/oci-bad.omni
           grep -q 'hashes to' /tmp/ocibad.txt
           echo "a tampered blob is refused before it becomes a file"
+
+      # §13.5, the transfer: the client that was the missing half of Phase 3.
+      # Everything below runs against a real `registry:2` — the reference
+      # implementation of the distribution API — because the whole point of the
+      # OCI mapping is parasitic adoption, and adoption is not a property this
+      # repository can assert about itself.
+      - name: A model pushes to a real registry, and comes back byte for byte
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          REG=localhost:5000
+          "$OMNI" example --tune 0 /tmp/reg-base.omni >/dev/null
+          "$OMNI" example --tune 1 /tmp/reg-tuned.omni >/dev/null
+
+          "$OMNI" oci push /tmp/reg-base.omni "$REG/models/base:v1" | tee /tmp/push1.txt
+          grep -qE 'blobs +[0-9]+ \([0-9]+ uploaded, 0 already there\)' /tmp/push1.txt
+
+          # The round trip that matters: what comes back out of a registry is the
+          # file that went in, and every blob was checked against the digest that
+          # named it on the way.
+          "$OMNI" oci pull "$REG/models/base:v1" -o /tmp/reg-back.omni | tee /tmp/pull1.txt
+          cmp /tmp/reg-base.omni /tmp/reg-back.omni
+          grep -q 'verified against their digests' /tmp/pull1.txt
+          "$OMNI" verify /tmp/reg-back.omni --level 6 | grep -q '^valid'
+
+          # By digest rather than by tag, which is the only reference that says
+          # what you are going to get.
+          MD=$(grep -oE 'sha256:[0-9a-f]+' /tmp/push1.txt | head -1)
+          "$OMNI" oci pull "$REG/models/base@$MD" -o /tmp/reg-bydigest.omni >/dev/null
+          cmp /tmp/reg-base.omni /tmp/reg-bydigest.omni
+
+          # Content addressing, as the registry sees it: the same bytes under a
+          # second tag upload nothing at all. This is §13.5's dedup claim
+          # answered by the party that would know, rather than computed here.
+          "$OMNI" oci push /tmp/reg-base.omni "$REG/models/base:v2" | tee /tmp/push2.txt
+          grep -qE 'blobs +[0-9]+ \(0 uploaded, [0-9]+ already there\)' /tmp/push2.txt
+          grep -q '100.0 % of the artifact' /tmp/push2.txt
+
+          # And the part of the claim that is *not* true, measured rather than
+          # assumed. `oci.rs` says in as many words that re-exporting a modified
+          # model does not share blobs with the original — objects are placed in
+          # digest order, so one changed tensor moves everything after it — and
+          # that the saving lives in publishing the fine-tune as a delta
+          # container instead. Both halves are checked here, because a claim
+          # that is right for the wrong reason is one nobody can rely on.
+          "$OMNI" oci push /tmp/reg-tuned.omni "$REG/models/tuned:full" | tee /tmp/push3.txt
+          grep -qE 'blobs +[0-9]+ \([0-9]+ uploaded, 0 already there\)' /tmp/push3.txt
+          "$OMNI" delta /tmp/reg-base.omni /tmp/reg-tuned.omni -o /tmp/reg-delta.omni >/dev/null
+          "$OMNI" oci push /tmp/reg-delta.omni "$REG/models/tuned:delta" | tee /tmp/push4.txt
+          python3 - <<'PY_DEDUP'
+          import re
+          def uploaded(path):
+              t = open(path).read()
+              m = re.search(r'uploaded\s+([\d.]+) (B|KiB|MiB)', t)
+              n, unit = float(m.group(1)), m.group(2)
+              return n * {'B': 1, 'KiB': 1024, 'MiB': 1024 ** 2}[unit]
+          full, delta = uploaded('/tmp/push3.txt'), uploaded('/tmp/push4.txt')
+          share = 100.0 * delta / full
+          print(f"a fine-tune costs {full:.0f} B pushed in full and {delta:.0f} B "
+                f"pushed as a delta: {share:.1f} %")
+          # Modelled, not measured at scale: these are toy containers. What is
+          # being checked is the *mechanism* — that the delta artifact is the
+          # small one — and not a number that generalises to a real model.
+          assert share < 50, f"the delta uploaded {share:.1f} % of the full push"
+          PY_DEDUP
+
+          # "Published as signed OMNI containers" is the gate's own wording, so
+          # the signature has to survive the trip: a registry is a transport, and
+          # a transport that changed a byte would break §12.5's attestation.
+          SEED=$(python3 -c "print('33'*32)")
+          PUB=$("$OMNI" keygen --seed $SEED | awk '/^public/ {print $2}')
+          "$OMNI" sign /tmp/reg-base.omni --key $SEED -o /tmp/reg-signed.omni >/dev/null
+          "$OMNI" oci push /tmp/reg-signed.omni "$REG/models/base:signed" >/dev/null
+          "$OMNI" oci pull "$REG/models/base:signed" -o /tmp/reg-signed-back.omni >/dev/null
+          cmp /tmp/reg-signed.omni /tmp/reg-signed-back.omni
+          "$OMNI" sign --verify /tmp/reg-signed-back.omni --key $PUB | tee /tmp/regsig.txt
+
+          expect() {
+            local want=$1; shift
+            local got=0
+            "$@" >/dev/null 2>&1 || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          # A tag that is not there is a 404 with the repository named, not a
+          # stack trace; and https is refused with the reason rather than
+          # downgraded.
+          expect 1 "$OMNI" oci pull "$REG/models/base:nope" -o /tmp/never.omni
+          test ! -f /tmp/never.omni
+          expect 2 "$OMNI" oci push /tmp/reg-base.omni "https://$REG/models/base:v1"
+          "$OMNI" oci push /tmp/reg-base.omni "https://$REG/m:1" 2>&1 | grep -q 'TLS'
+          echo "a model pushes, pulls, deduplicates and keeps its signature"
 
       # §13.4.3: the other half of the transport. A hub SHOULD serve both a
       # pack and per-object URLs, and having both here means each is tested

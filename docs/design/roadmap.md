@@ -264,7 +264,8 @@ a second framework to run; none of them needs more code here.
 Deliverables:
 - HTTP and object-store stores with range coalescing and resumption.
 - OCI push/pull with `by-novelty` pack partitioning; referrers for adapters and
-  signatures. ◐ (the mapping and a pushable layout exist; the registry client does not)
+  signatures. ◐ (the mapping, the layout and the client exist and CI pushes to a
+  real registry; the referrers API and `by-novelty` partitioning do not)
 - Verified streaming (Bao) end to end; progressive load.
 - `omni mount` (FUSE) with synthesized safetensors and tokenizer views.
 - `omni serve`: an object server. ✅
@@ -284,18 +285,45 @@ per-object digest verification; the `.omni.idx` sidecar, which turns a
 three-request open into none; the index-only container of §13.8; Bao verified
 streaming (§13.3); and `store::FileStore` for the local half. CI fetches a
 container over HTTP by range and checks that the reassembled object graph is
-byte-identical to the original. What the gate actually asks for is untouched:
-there is no mirror of 10 000 models, no measured dedup or delta-size or
-load-time figures, no TTFT comparison over a throttled link. `omni serve` implements §13.4.3's
-per-object URLs alongside the pack, so CI exercises the client against a real
-server rather than a mock. §13.5's mapping is implemented: a container becomes an
-OCI image layout that `oras` can push, with the OMNI Manifest as the config and
-the container cut into pack layers, and CI validates the layout against the
-image-spec's rules and reassembles it byte for byte. `https://` is refused rather
-than downgraded — TLS needs a dependency this crate does not have — there is no
-registry *client* and no `mount`, and nothing has been pushed anywhere, so the
-*distribution* claims remain claims. The signature stack of §12.5 is implemented
-(Ed25519, COSE_Sign1, trust policies) and has had no third-party review.
+byte-identical to the original. `omni serve` implements §13.4.3's per-object URLs
+alongside the pack, so CI exercises the client against a real server rather than
+a mock.
+
+**§13.5 is now end to end.** A container becomes an OCI image layout — the OMNI
+Manifest as the config, the container cut into pack layers, validated against the
+image-spec's own rules and reassembled byte for byte — and `omni oci push` and
+`omni oci pull` carry it over the distribution API. CI runs a real `registry:2`
+and pushes to it: the model goes up, comes back down byte-identical, verifies at
+V6, and can be pulled by digest rather than by tag. The gate's phrase is
+"published as signed OMNI containers", so a signed container makes the same
+trip and its §12.5 attestation still verifies on the far side — which is the
+thing a transport that changed one byte would break. `https://` is still refused
+rather than downgraded, because TLS needs a dependency this crate does not have,
+so what this reaches is a plaintext registry: a local one, a mirror, or anything
+behind a terminator. A registry that answers `401` is told apart from one that
+answers `404`, and the bearer-token realm it names is reported rather than
+guessed at.
+
+**The dedup claim now has a number attached, and the number says something more
+specific than the claim did.** Pushing the same container under a second tag
+uploads *nothing*: the registry answers 200 to every blob `HEAD`, which is
+content addressing confirmed by the party that would know. Pushing a *modified*
+model shares nothing at all — objects are placed in digest order (§02.4), so one
+changed tensor moves the file offset of everything after it and every pack from
+there on is a different blob. `oci.rs` said that in as many words before any of
+this was pushed anywhere, and CI now measures it rather than repeating it. The
+saving is in the layer above: the same fine-tune published as a **delta
+container** (§08.6) uploads **20 %** of what the full model costs. That figure is
+*modelled*, not measured at scale — these are toy containers, and what is being
+demonstrated is the mechanism rather than a ratio that generalises.
+
+What the gate actually asks for is still untouched: there is no mirror of 10 000
+models, no dedup or delta-size or load-time figures over real ones, and no TTFT
+comparison over a throttled link. There is no `mount`, no referrers API and no
+`by-novelty` partitioning. The signature stack of §12.5 is implemented (Ed25519,
+COSE_Sign1, trust policies) and has had no third-party review. The distribution
+*mechanisms* are now demonstrated rather than claimed; the distribution
+*measurements* are what remains, and they need a corpus rather than more code.
 
 ## Phase 4 — Ecosystem (months 18–30)
 
