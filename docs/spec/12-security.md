@@ -290,8 +290,11 @@ data. Rules:
    limited to tensor-reconstruction primitives. `GLOBAL`/`REDUCE` to anything
    else is a hard error, not a warning.
 2. Run the import **in a separate process** with no network, a read-only
-   filesystem view, a memory cap, and a wall-clock cap. The reference importer
-   uses a seccomp/landlock-confined child on Linux and the equivalent elsewhere.
+   filesystem view, a memory cap, and a wall-clock cap. This is a defence in
+   depth for clause 1, not a replacement for it: an implementation whose
+   unpickler is a general evaluator with a filter in front of it needs the
+   sandbox, and an implementation whose unpickler cannot express a call at all
+   has nothing for the sandbox to contain. State which one you are.
 3. Record in `Provenance` that the source was an unsafe format, what was
    rejected, and the digest of the source file.
 4. Never re-emit pickle on export unless explicitly requested with a warning.

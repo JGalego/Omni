@@ -372,6 +372,49 @@ in OMNI and not in a format whose config states each of those once, and writing 
 config that is right for the first layer would be the quietest possible
 corruption.
 
+### PyTorch — import only, and the reason is §12.10
+
+```console
+$ omni import pytorch pytorch_model.bin -o model.omni
+```
+
+A `torch.save` file is a ZIP archive containing one pickle and a data member per
+storage. The pickle is the whole problem: unpickling *is* executing, and
+`torch.load` on a file from the internet has been a remote-code-execution
+primitive for as long as the format has existed. §12.10 is the answer and the
+importer implements it:
+
+- **An opcode allowlist.** Every opcode this build does not run is an error
+  naming the opcode — `INST`, `OBJ` and the three extension-registry opcodes
+  among them, since each resolves to an arbitrary class.
+- **A class allowlist of nineteen symbols**: `collections.OrderedDict`,
+  `torch.Size`, three tensor-rebuild functions, and fourteen storage classes.
+  A `GLOBAL` naming anything else is a hard error that quotes the symbol, and
+  the CLI exits **4** — policy, not "malformed" — because the file is perfectly
+  well formed and the answer is still no.
+- **No call mechanism.** `REDUCE` matches on six names. There is no `import`, no
+  attribute lookup, no `__reduce__` dispatch and no `__setstate__`, so `BUILD`
+  on anything but a dict is refused too.
+
+CI does not take this on faith: it builds a checkpoint with a `os.system`
+payload, asserts that Python's own `pickle.loads` **does** run it, then asserts
+that the importer refuses it by name and that nothing ran.
+
+What comes across is what a tensor *is* in PyTorch: a view. `storage_offset`,
+`size` and `stride` map onto §04.4's `strided` layout directly, so a transposed
+weight keeps its strides instead of being densified into a different array, and
+two views of one buffer are reported rather than silently duplicated. Non-tensor
+leaves — epoch counters, config scalars — are preserved as text in a `Foreign`
+object (I2); anything needing a Python class to reconstruct is refused, because
+the alternative is running it.
+
+Two things are deliberately absent. §12.10 also asks for a confined child
+process, and this build does not provide one, on the argument that there is
+nothing here to confine: the unpickler is a parser for a data language, not an
+evaluator with a filter in front of it. And there is no PyTorch *exporter* —
+§12.10 clause 4 says never to re-emit pickle, and "unless explicitly requested"
+is not a request this build accepts. Export to safetensors instead.
+
 Every other row of the matrix in §3 is unimplemented. A request to import one is
 refused by name, with a pointer to this document, rather than half-attempted.
 

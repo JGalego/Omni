@@ -57,7 +57,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PEFT, GPTQ and AWQ import and export, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), PEFT, GPTQ and AWQ import and export, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-ffi` | the C ABI (`omni.h`): opaque handles, panic-proof entry points, CLI-matching status codes, DLPack export. Built as `cdylib` + `staticlib`. The only crate here that uses `unsafe` | design/sdk.md §3 |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
@@ -368,12 +368,19 @@ What is **not** implemented, and is reported as such rather than faked:
   layout, but the push itself needs bearer-token auth and chunked blob uploads
   against a live registry, which is a client rather than a format concern
 - `omni mount` (§13.9), which needs FUSE
-- Every importer and exporter except safetensors, PEFT, GPTQ and AWQ. The
-  capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
-  build implements four of them; GGUF, PyTorch, ONNX and EXL2 do not exist, and a
+- Every importer and exporter except safetensors, PyTorch, PEFT, GPTQ and AWQ.
+  The capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
+  build implements five of them; GGUF, ONNX and EXL2 do not exist, and a
   request for one is refused by name rather than half-attempted. Export covers
-  safetensors, PEFT, GPTQ and AWQ. 3-bit GPTQ and AWQ's `gemv`/`marlin`
+  safetensors, PEFT, GPTQ and AWQ — not PyTorch, because §12.10 clause 4 says
+  never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
   versions are refused for the reasons named above
+- §12.10's confined child process for the pickle import. The restricted
+  unpickler is implemented in full — an opcode allowlist, 19 resolvable symbols,
+  no call mechanism beyond tensor reconstruction — and the sandbox is not, on
+  the argument that there is nothing to confine: it is a parser for a data
+  language, not an evaluator with a filter in front of it. A build that ever
+  grows a general evaluator needs the sandbox back
 - The **writer** side of the C ABI. `omni-ffi` reads: open, verify, walk, bytes,
   values, plan, DLPack. A C caller cannot yet *build* a container, so
   `ModelBuilder` is Rust-only
@@ -388,7 +395,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-466 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+483 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -632,6 +639,22 @@ contradicts the index's otype is invalid (R-O02).
 Every
 container-level test runs under both mandatory digest algorithms.
 
+And, for PyTorch, the tests that are about the threat rather than the format:
+that a global outside the allowlist is a hard error naming it — `posix.system`,
+`os.system`, `subprocess.Popen`, `builtins.eval`, `torch.load` and four more,
+each checked individually; that `INST`, `OBJ` and the three extension-registry
+opcodes are refused by the name of the opcode; that `BUILD` on anything but a
+dict is refused, because `__setstate__` needs the class; that a pickle with no
+`STOP` runs off the end rather than forever; that a truncated archive at every
+length and a bit flipped at a hundred positions inside the pickle are errors and
+never panics; and that the allowlist is exactly nineteen entries, asserted so it
+cannot grow by accident and stop being a security property. Then the format:
+that a transposed view keeps its strides instead of being densified into a
+different array, that a second view of one storage is reported rather than
+silently duplicated, that a view running past its storage is caught with the
+byte counts, and that Zip64's 0x0001 extra field is read — which is not an edge
+case when a 7 B model in fp16 is 14 GB.
+
 And, for the C ABI, the tests that a C caller would find out the hard way: that a
 null handle is a usage error rather than a segfault and freeing null does
 nothing; that 512 zero bytes are *invalid* rather than a panic crossing the
@@ -646,7 +669,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 466 passed; 0 failed
+test result: ok. 483 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

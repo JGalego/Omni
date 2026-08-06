@@ -91,7 +91,7 @@ Deliverables:
 - Quantization schemes: affine, sym, codebook, nested; GPTQ/AWQ/NF4/MX/GGUF-K
   structural mappings.
 - Sparsity schemes.
-- `omni-import-safetensors` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
+- `omni-import-safetensors` ✅, `-pytorch` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
 - `omni-export-safetensors` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
 - `omni delta`, `omni adapter`, `omni convert`.
 - Conformance corpus: `numeric/`, `roundtrip/`, `valid/features`.
@@ -105,9 +105,9 @@ be made bit-exact, §05.2.4 is wrong and gets revised.*
 **Gate 1 status.** Not met. The *format* side is done and tested: the dtype
 algebra, the layouts, the expression algebra with range pushdown, the sparsity and
 quantization catalogues, `omni delta` and `omni adapter`, and — as of the codec
-work — `zstd` in both directions, checked against libzstd on every push. **Four
-importers and one exporter now exist**: safetensors in both directions, PEFT LoRA
-in, and GPTQ and AWQ in, with the I1–I6 and E1–E4 contracts of
+work — `zstd` in both directions, checked against libzstd on every push. **Five
+importers and four exporters now exist**: safetensors, PEFT, GPTQ and AWQ in both
+directions, and PyTorch `.bin` in, with the I1–I6 and E1–E4 contracts of
 [`import-export.md`](import-export.md) implemented rather than summarised — every
 tensor verified byte-for-byte against the source on import, every loss named
 before an export writes anything, and a round-trip whose tensor digests are
@@ -116,12 +116,17 @@ two quantized importers go further, because byte identity cannot catch a
 misread packing: every layer is dequantized through the expression graph and
 compared against arithmetic done in Python, so §05.2.2's and §05.2.3's structural
 mappings are checked against the formats and not against this implementation.
-That is four rows of a 25-row capability matrix. GGUF, PyTorch and ONNX do not
-exist, and no exporter but safetensors does, so the gate's actual asks are still
-untouched: no round-trip over 100 real models (which needs the *export* side of
-GPTQ and AWQ, not just the import), no delta-size study over 50 real pairs, and no
-differential test against `llama.cpp`'s dequantization. The catalogue and these
-importers are necessary for that work and are not a substitute for it.
+The PyTorch importer is the §12.10 one: a restricted unpickler with an opcode
+allowlist and nineteen resolvable symbols, checked in CI against a payload that
+Python's own `pickle.loads` is first shown to execute. It imports only —
+§12.10 clause 4 says never to re-emit pickle.
+
+That is five rows of a 25-row capability matrix. GGUF, ONNX and EXL2 do not
+exist, so the gate's actual asks are still untouched: no round-trip over 100 real
+models, no delta-size study over 50 real pairs, and no differential test against
+`llama.cpp`'s dequantization — all three need corpora rather than code. The
+catalogue and these importers are necessary for that work and are not a
+substitute for it.
 
 ## Phase 2 — Prove the semantic layer (months 7–12)
 

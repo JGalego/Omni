@@ -8,7 +8,8 @@
 //! OMNI-IR (§07) with a reference interpreter that executes it, a Jinja2 to
 //! OMNI-CT translator (§06.9), training state (§09), a WebAssembly plugin host
 //! (§11.6),
-//! streaming transport (§13), and safetensors, PEFT, GPTQ and AWQ import.
+//! streaming transport (§13), and safetensors, PyTorch, PEFT, GPTQ and AWQ
+//! import.
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
 //!
@@ -33,9 +34,10 @@
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
-//! in `docs/design/import-export.md` §3, four are implemented — [`safetensors`],
-//! [`peft`], and GPTQ and AWQ in [`hfquant`] — and a request to import another is
-//! refused by name. All four export as well as import.
+//! in `docs/design/import-export.md` §3, five are implemented — [`safetensors`],
+//! [`pytorch`], [`peft`], and GPTQ and AWQ in [`hfquant`] — and a request to
+//! import another is refused by name. All but PyTorch export as well as import;
+//! §12.10 clause 4 says never to re-emit pickle, and this build does not.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -65,6 +67,7 @@ pub mod pattern;
 pub mod peft;
 pub mod plan;
 pub mod plugin;
+pub mod pytorch;
 pub mod quant;
 pub mod recover;
 pub mod safetensors;

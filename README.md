@@ -196,10 +196,11 @@ with the detached index sidecar, an object server and the OCI mapping, and
 lossless safetensors, PEFT LoRA, GPTQ and AWQ import *and* export — the quantized
 two as expressions over the packed words rather than as a conversion of them,
 checked by dequantizing every layer and comparing against arithmetic done in
-Python — and a [C ABI](reference/omni-ffi/include/omni.h) that a C program drives
-end to end, DLPack included. What is *not* implemented is stated in
+Python — PyTorch `.bin` import through a restricted unpickler, and a
+[C ABI](reference/omni-ffi/include/omni.h) that a C program drives end to end,
+DLPack included. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
-it — every importer but those four, the writer side of the C ABI, `https://` (TLS
+it — every importer but those five, the writer side of the C ABI, `https://` (TLS
 needs a dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
 plugin host, and the MAY-level codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See

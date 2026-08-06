@@ -126,6 +126,12 @@ VERBS:
                               Absorb another format and report the fidelity:
                               every tensor verified against the source, nothing
                               invented, the unrepresentable preserved (§1.1)
+    import  pytorch <in.bin> -o <out.omni> [--name N] [--arch FAMILY]
+                              A `torch.save` checkpoint, read by a restricted
+                              unpickler (§12.10): an opcode allowlist, 19
+                              resolvable symbols, and no way to call anything
+                              but tensor reconstruction. Exit 4 names the symbol
+                              a file asked for and did not get
     import  peft <adapter-dir> --base <base.omni> -o <out.omni>
                               A PEFT LoRA as an §08 Adapter, pinned to that base
                               by digest rather than by the name PEFT gives it
@@ -4093,14 +4099,17 @@ fn cmd_import(args: &[String]) -> R {
     if format == "peft" {
         return cmd_import_peft(args, input);
     }
+    if matches!(format.as_str(), "pytorch" | "pt" | "torch") {
+        return cmd_import_pytorch(args, input);
+    }
     if let Some(method) = omni_core::hfquant::Method::parse(format) {
         return cmd_import_hfquant(args, input, method);
     }
     if format != "safetensors" {
         prr!(
             "omni: no importer for `{format}`. This build imports safetensors, \
-             peft, gptq and awq; `docs/design/import-export.md` §3 lists what the \
-             others would need\n"
+             pytorch, peft, gptq and awq; `docs/design/import-export.md` §3 lists \
+             what the others would need\n"
         );
         return Ok(2);
     }
@@ -4163,6 +4172,100 @@ fn cmd_import(args: &[String]) -> R {
     }
     // The honest counterpart of "importers preserve everything": what this one
     // chose not to invent.
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    pr!(
+        "  size         {} -> {} ({:.1} %)",
+        human(r.source_size),
+        human(packed.len() as u64),
+        100.0 * packed.len() as f64 / r.source_size.max(1) as f64
+    );
+    pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni import pytorch` — a `torch.save` checkpoint, read under §12.10.
+///
+/// The output that matters here is not the container: it is the line saying what
+/// the restricted unpickler was allowed to resolve. A user who runs this instead
+/// of `torch.load` is buying exactly that, and they should be able to see it.
+fn cmd_import_pytorch(args: &[String], input: &str) -> R {
+    use omni_core::pytorch::{import, ALLOWED_GLOBALS};
+    use omni_core::safetensors::ImportOpts;
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let bytes = std::fs::read(input)?;
+    let opts = ImportOpts {
+        name: flag(args, "--name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("imported/{}", stem(input))),
+        source_path: input.to_string(),
+        hash: if flag(args, "--hash") == Some("sha256") {
+            HashAlgo::Sha256
+        } else {
+            HashAlgo::Blake3_256
+        },
+        chunk_size: flag(args, "--chunk")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 20),
+        license: flag(args, "--license").map(str::to_string),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+    };
+    let imported = match import(&bytes, &opts) {
+        Ok(i) => i,
+        Err(e @ omni_core::pytorch::Error::Refused(_)) => {
+            // §12.10 clause 1 is a hard error, and exit 4 says *policy* rather
+            // than *malformed*: the file is well-formed and this is a refusal.
+            prr!("omni: {e}\n");
+            return Ok(4);
+        }
+        Err(e @ omni_core::pytorch::Error::Unsupported(_)) => {
+            prr!("omni: {e}\n");
+            return Ok(3);
+        }
+        Err(e) => return Err(Box::new(e)),
+    };
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: opts.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+
+    let r = &imported.report;
+    pr!("imported {input} -> {out}");
+    pr!(
+        "  source       pytorch (pickle), {}, {}",
+        human(r.source_size),
+        short(opts.hash, &r.source_digest)
+    );
+    pr!(
+        "  unpickler    restricted: {} symbols resolvable, nothing callable but \
+tensor reconstruction (§12.10)",
+        ALLOWED_GLOBALS.len()
+    );
+    pr!(
+        "  tensors      {} verified byte-for-byte against the source ({}) — I4",
+        commas(r.verified_tensors as u64),
+        human(r.verified_bytes)
+    );
+    pr!("  represented  {}", r.represented.join(", "));
+    if r.unrepresented.is_empty() {
+        pr!("  unrepresented  nothing");
+    } else {
+        pr!("  unrepresented");
+        for n in &r.unrepresented {
+            pr!("     {} — {} ({})", n.item, n.reason, n.action);
+        }
+    }
     pr!("  assumptions");
     for n in &r.assumptions {
         pr!("     {} — {}", n.item, n.action);
