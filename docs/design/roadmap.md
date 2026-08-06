@@ -91,7 +91,7 @@ Deliverables:
 - Quantization schemes: affine, sym, codebook, nested; GPTQ/AWQ/NF4/MX/GGUF-K
   structural mappings.
 - Sparsity schemes.
-- `omni-import-safetensors` ✅, `-pytorch` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
+- `omni-import-safetensors` ✅, `-pytorch` ✅, `-hf-repo` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
 - `omni-export-safetensors` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
 - `omni delta`, `omni adapter`, `omni convert`.
 - Conformance corpus: `numeric/`, `roundtrip/`, `valid/features`.
@@ -105,9 +105,10 @@ be made bit-exact, §05.2.4 is wrong and gets revised.*
 **Gate 1 status.** Not met. The *format* side is done and tested: the dtype
 algebra, the layouts, the expression algebra with range pushdown, the sparsity and
 quantization catalogues, `omni delta` and `omni adapter`, and — as of the codec
-work — `zstd` in both directions, checked against libzstd on every push. **Five
+work — `zstd` in both directions, checked against libzstd on every push. **Six
 importers and four exporters now exist**: safetensors, PEFT, GPTQ and AWQ in both
-directions, and PyTorch `.bin` in, with the I1–I6 and E1–E4 contracts of
+directions, PyTorch `.bin` in, and a whole Hugging Face repo in, with the I1–I6
+and E1–E4 contracts of
 [`import-export.md`](import-export.md) implemented rather than summarised — every
 tensor verified byte-for-byte against the source on import, every loss named
 before an export writes anything, and a round-trip whose tensor digests are
@@ -121,7 +122,14 @@ allowlist and nineteen resolvable symbols, checked in CI against a payload that
 Python's own `pickle.loads` is first shown to execute. It imports only —
 §12.10 clause 4 says never to re-emit pickle.
 
-That is five rows of a 25-row capability matrix. GGUF, ONNX and EXL2 do not
+The repo importer is the one that makes the format usable rather than
+demonstrable: `omni import hf <dir>` turns the five files a model on the hub
+actually consists of — sharded weights, `config.json`, `tokenizer.json`, the
+chat template, the generation defaults — into one container where the tokenizer
+shipped with those weights is addressed by digest instead of downloaded
+separately and hoped about.
+
+That is six rows of a 25-row capability matrix. GGUF, ONNX and EXL2 do not
 exist, so the gate's actual asks are still untouched: no round-trip over 100 real
 models, no delta-size study over 50 real pairs, and no differential test against
 `llama.cpp`'s dequantization — all three need corpora rather than code. The

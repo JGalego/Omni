@@ -9,7 +9,8 @@
 //! OMNI-CT translator (§06.9), training state (§09), a WebAssembly plugin host
 //! (§11.6),
 //! streaming transport (§13), and safetensors, PyTorch, PEFT, GPTQ and AWQ
-//! import.
+//! import — and, over those, a whole Hugging Face model directory as one
+//! container.
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
 //!
@@ -34,10 +35,11 @@
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
-//! in `docs/design/import-export.md` §3, five are implemented — [`safetensors`],
-//! [`pytorch`], [`peft`], and GPTQ and AWQ in [`hfquant`] — and a request to
-//! import another is refused by name. All but PyTorch export as well as import;
-//! §12.10 clause 4 says never to re-emit pickle, and this build does not.
+//! in `docs/design/import-export.md` §3, six are implemented — [`safetensors`],
+//! [`pytorch`], [`peft`], GPTQ and AWQ in [`hfquant`], and a whole Hugging Face
+//! repo in [`hf`] — and a request to import another is refused by name. All but
+//! PyTorch and the repo importer export as well as import; §12.10 clause 4 says
+//! never to re-emit pickle, and this build does not.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -55,6 +57,7 @@ pub mod delta;
 pub mod dtype;
 pub mod ed25519;
 pub mod expr;
+pub mod hf;
 pub mod hfquant;
 pub mod interp;
 pub mod ir;

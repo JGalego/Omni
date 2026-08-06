@@ -132,6 +132,13 @@ VERBS:
                               resolvable symbols, and no way to call anything
                               but tensor reconstruction. Exit 4 names the symbol
                               a file asked for and did not get
+    import  hf <model-dir> -o <out.omni> [--name N] [--license SPDX]
+                              A whole Hugging Face repo as one container: the
+                              weights (sharded or not, safetensors or torch),
+                              config.json as §06.2 arch, tokenizer.json as a
+                              §06.7 tokenizer, and the chat template translated
+                              into OMNI-CT — or left out and named, if §06.9
+                              cannot express it
     import  peft <adapter-dir> --base <base.omni> -o <out.omni>
                               A PEFT LoRA as an §08 Adapter, pinned to that base
                               by digest rather than by the name PEFT gives it
@@ -4102,14 +4109,17 @@ fn cmd_import(args: &[String]) -> R {
     if matches!(format.as_str(), "pytorch" | "pt" | "torch") {
         return cmd_import_pytorch(args, input);
     }
+    if matches!(format.as_str(), "hf" | "huggingface" | "repo") {
+        return cmd_import_hf(args, input);
+    }
     if let Some(method) = omni_core::hfquant::Method::parse(format) {
         return cmd_import_hfquant(args, input, method);
     }
     if format != "safetensors" {
         prr!(
             "omni: no importer for `{format}`. This build imports safetensors, \
-             pytorch, peft, gptq and awq; `docs/design/import-export.md` §3 lists \
-             what the others would need\n"
+             pytorch, hf, peft, gptq and awq; `docs/design/import-export.md` §3 \
+             lists what the others would need\n"
         );
         return Ok(2);
     }
@@ -4172,6 +4182,158 @@ fn cmd_import(args: &[String]) -> R {
     }
     // The honest counterpart of "importers preserve everything": what this one
     // chose not to invent.
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    pr!(
+        "  size         {} -> {} ({:.1} %)",
+        human(r.source_size),
+        human(packed.len() as u64),
+        100.0 * packed.len() as f64 / r.source_size.max(1) as f64
+    );
+    pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni import hf` — a whole Hugging Face model directory.
+///
+/// The weights, the architecture, the tokenizer and the chat template arrive as
+/// separate files that only mean something together, and this is where they stop
+/// being separate: one container, content-addressed, where the tokenizer shipped
+/// with these weights is *in* the file rather than a second download that might
+/// not match.
+fn cmd_import_hf(args: &[String], input: &str) -> R {
+    use omni_core::hf::{import, Files, ImportOpts, Shard, Weights};
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let dir = std::path::Path::new(input);
+    if !dir.is_dir() {
+        prr!("omni: `{input}` is not a directory; `import hf` takes a model repo\n");
+        return Ok(2);
+    }
+    let read = |name: &str| std::fs::read(dir.join(name)).ok();
+
+    // Shards, in the order the index names them. A `*.index.json` is the file
+    // that decides load order for a sharded checkpoint; without one there is a
+    // single file, and it is its own order.
+    let mut shards: Vec<Shard> = Vec::new();
+    let push = |name: String, kind: Weights, seen: &mut Vec<Shard>| -> R {
+        if seen.iter().any(|s| s.name == name) {
+            return Ok(0);
+        }
+        let bytes = std::fs::read(dir.join(&name))?;
+        seen.push(Shard { name, kind, bytes });
+        Ok(0)
+    };
+    for (index, kind) in [
+        ("model.safetensors.index.json", Weights::Safetensors),
+        ("pytorch_model.bin.index.json", Weights::PyTorch),
+    ] {
+        let Some(raw) = read(index) else { continue };
+        let j = omni_core::json::parse(&raw)?;
+        let map = j
+            .get("weight_map")
+            .and_then(|x| x.as_object())
+            .ok_or_else(|| format!("{index} has no `weight_map`"))?;
+        // The map is tensor name -> file. The order that matters is the
+        // shards', so they are deduplicated and sorted by file name — which is
+        // what `model-00001-of-00003` is numbered for.
+        let names: std::collections::BTreeSet<String> = map
+            .values()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect();
+        for n in names {
+            push(n, kind, &mut shards)?;
+        }
+    }
+    if shards.is_empty() {
+        for (name, kind) in [
+            ("model.safetensors", Weights::Safetensors),
+            ("pytorch_model.bin", Weights::PyTorch),
+        ] {
+            if dir.join(name).exists() {
+                push(name.to_string(), kind, &mut shards)?;
+            }
+        }
+    }
+
+    let files = Files {
+        config: read("config.json"),
+        tokenizer: read("tokenizer.json"),
+        tokenizer_config: read("tokenizer_config.json"),
+        generation_config: read("generation_config.json"),
+        shards,
+    };
+    let opts = ImportOpts {
+        name: flag(args, "--name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("imported/{}", stem(input))),
+        source_path: input.to_string(),
+        hash: if flag(args, "--hash") == Some("sha256") {
+            HashAlgo::Sha256
+        } else {
+            HashAlgo::Blake3_256
+        },
+        chunk_size: flag(args, "--chunk")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 20),
+        license: flag(args, "--license").map(str::to_string),
+    };
+    let imported = match import(&files, &opts) {
+        Ok(i) => i,
+        Err(e @ omni_core::hf::Error::Unsupported(_)) => {
+            prr!("omni: {e}\n");
+            return Ok(3);
+        }
+        Err(e) => return Err(Box::new(e)),
+    };
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: opts.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+
+    let r = &imported.report;
+    pr!("imported {input} -> {out}");
+    pr!(
+        "  source       a model repo of {} file(s), {}, {}",
+        files.shards.len()
+            + [
+                &files.config,
+                &files.tokenizer,
+                &files.tokenizer_config,
+                &files.generation_config
+            ]
+            .iter()
+            .filter(|f| f.is_some())
+            .count(),
+        human(r.source_size),
+        short(opts.hash, &r.source_digest)
+    );
+    pr!(
+        "  tensors      {} across {} shard(s), {}",
+        commas(r.verified_tensors as u64),
+        files.shards.len(),
+        human(r.verified_bytes)
+    );
+    pr!("  represented  {}", r.represented.join(", "));
+    if r.unrepresented.is_empty() {
+        pr!("  unrepresented  nothing");
+    } else {
+        pr!("  unrepresented");
+        for n in &r.unrepresented {
+            pr!("     {} — {} ({})", n.item, n.reason, n.action);
+        }
+    }
     pr!("  assumptions");
     for n in &r.assumptions {
         pr!("     {} — {}", n.item, n.action);

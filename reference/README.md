@@ -57,7 +57,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), PEFT, GPTQ and AWQ import and export, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), PEFT, GPTQ and AWQ import and export, whole-Hugging-Face-repo import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-ffi` | the C ABI (`omni.h`): opaque handles, panic-proof entry points, CLI-matching status codes, DLPack export. Built as `cdylib` + `staticlib`. The only crate here that uses `unsafe` | design/sdk.md §3 |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
@@ -368,9 +368,10 @@ What is **not** implemented, and is reported as such rather than faked:
   layout, but the push itself needs bearer-token auth and chunked blob uploads
   against a live registry, which is a client rather than a format concern
 - `omni mount` (§13.9), which needs FUSE
-- Every importer and exporter except safetensors, PyTorch, PEFT, GPTQ and AWQ.
+- Every importer and exporter except safetensors, PyTorch, PEFT, GPTQ, AWQ and
+  a whole Hugging Face repo.
   The capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
-  build implements five of them; GGUF, ONNX and EXL2 do not exist, and a
+  build implements six of them; GGUF, ONNX and EXL2 do not exist, and a
   request for one is refused by name rather than half-attempted. Export covers
   safetensors, PEFT, GPTQ and AWQ — not PyTorch, because §12.10 clause 4 says
   never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
@@ -395,7 +396,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-483 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+496 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -639,6 +640,24 @@ contradicts the index's otype is invalid (R-O02).
 Every
 container-level test runs under both mandatory digest algorithms.
 
+And, for the Hugging Face repo importer, the tests that are about the five files
+meaning something only together: that a config maps onto §06.2's names while
+every key it does not model survives under its own; that `rope.interleaved` —
+which §06.3 calls the field responsible for the most silent corruption in format
+conversions — is written only for families whose `transformers` implementation is
+unambiguous, is reported as an assumption when it is, and is *omitted* for an
+unknown family rather than guessed, with `rope_theta` kept anyway; that BPE
+merges become id pairs and a merge naming a token the vocabulary lacks is an
+error rather than a skipped line; that a vocabulary with a hole in it is an error,
+because every id past the hole would be wrong; that a normalizer or pre-tokenizer
+outside §06.7's catalogue is carried by name so encoding is *indeterminate*
+rather than wrong; that a Unigram model keeps its scores; that a tokenizer model
+§06.7 has no entry for is refused by name; that the imported tokenizer reads back
+out of a packed container and reports nothing unsupported; that a chat template
+§06.9 cannot express is left out and named instead of shipped; and that two
+repos whose shards differ only in how they were cut get different source
+digests.
+
 And, for PyTorch, the tests that are about the threat rather than the format:
 that a global outside the allowlist is a hard error naming it — `posix.system`,
 `os.system`, `subprocess.Popen`, `builtins.eval`, `torch.load` and four more,
@@ -669,7 +688,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 483 passed; 0 failed
+test result: ok. 496 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
