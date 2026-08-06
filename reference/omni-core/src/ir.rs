@@ -1229,12 +1229,17 @@ static CORE_OPS: &[OpSpec] = &[
     op!("yield", &[1], 0, None, 0, 0, false, []),
     op!("if", &[1], 1, Some(1), 1, 2, false, []),
     op!("while", &[1], 0, None, 1, 2, false, []),
+    // Two results, not one: the threaded carry as it ended, and the emissions
+    // stacked along the scanned axis — which is what `scan` means everywhere it
+    // exists and what this build's interpreter has always returned. The spec
+    // said one until a synthesized LSTM used both and verification disagreed
+    // with execution about the same graph. See `docs/spec/07-graph.md` §7.3.
     op!(
         "scan",
         &[1],
         1,
         None,
-        1,
+        2,
         1,
         false,
         [
@@ -4388,8 +4393,14 @@ pub mod binary {
 pub const FAMILIES: &[&str] = &[
     "transformer.decoder",
     "transformer.encoder",
+    "transformer.moe",
     "cnn.classifier",
     "mlp",
+    "rnn.lstm",
+    "rnn.gru",
+    "gnn.mpnn",
+    "rl.actor_critic",
+    "audio.encoder",
 ];
 
 pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<Module, String> {
@@ -4402,8 +4413,17 @@ pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<
         // grouping, the norm — is the same graph, so it is the same
         // synthesizer with the flag rather than a copy that can drift.
         "transformer.encoder" => synthesize_transformer(params, available, false),
+        "transformer.moe" => synthesize_moe(params, available),
         "cnn.classifier" => synthesize_cnn(params, available),
         "mlp" => synthesize_mlp(params, available),
+        // One synthesizer, two cells, for the same reason the encoder shares
+        // the decoder's: the difference is the gate arithmetic, and a copy
+        // would drift.
+        "rnn.lstm" => synthesize_rnn(params, available, true),
+        "rnn.gru" => synthesize_rnn(params, available, false),
+        "gnn.mpnn" => synthesize_gnn(params, available),
+        "rl.actor_critic" => synthesize_rl(params, available),
+        "audio.encoder" => synthesize_audio(params, available),
         other => Err(format!(
             "no synthesizer for family `{other}`; this build knows {}",
             FAMILIES.join(", ")
@@ -5295,6 +5315,892 @@ fn synthesize_cnn(params: &Value, available: &[String]) -> Result<Module, String
     ))
 }
 
+// ------------------------------------------------------- six smaller families --
+
+/// A local emitter for the families below.
+///
+/// The synthesizers above build their ops by hand, which reads well when a
+/// graph is a straight line. These are not straight lines — one routes tokens
+/// to gathered expert weights, two carry a region, one has two heads — and
+/// hand-building them would bury what each family *is* under identical
+/// `with_output(Type::tensor(vec![…]))` boilerplate. So the boilerplate is here
+/// once, and each family below reads as the graph it emits.
+struct Emit {
+    ops: Vec<Op>,
+    next: u32,
+    dt: DType,
+}
+
+impl Emit {
+    fn new(first_free: u32, dt: DType) -> Emit {
+        Emit {
+            ops: Vec::new(),
+            next: first_free,
+            dt,
+        }
+    }
+
+    fn id(&mut self) -> u32 {
+        let id = self.next;
+        self.next += 1;
+        id
+    }
+
+    fn ty(&self, shape: &[Dim]) -> Type {
+        Type::tensor(shape.to_vec(), self.dt.clone())
+    }
+
+    /// A weight, by the name the tensor table gives it. R-I10 checks that name
+    /// against the table, so a synthesized graph cannot drift from the weights
+    /// it was synthesized for.
+    fn constant(&mut self, tensor: &str, shape: &[Dim]) -> u32 {
+        let id = self.id();
+        let t = self.ty(shape);
+        self.ops.push(
+            Op::new("omni.core", "constant", 1)
+                .with_attr("tensor", Value::text(tensor.to_string()))
+                .with_output(id, t),
+        );
+        id
+    }
+
+    fn op(&mut self, dialect: &str, name: &str, ins: &[u32], shape: &[Dim]) -> u32 {
+        self.op_attrs(dialect, name, ins, Vec::new(), shape)
+    }
+
+    fn op_attrs(
+        &mut self,
+        dialect: &str,
+        name: &str,
+        ins: &[u32],
+        attrs: Vec<(&str, Value)>,
+        shape: &[Dim],
+    ) -> u32 {
+        let id = self.id();
+        let t = self.ty(shape);
+        let mut op = Op::new(dialect, name, 1).with_inputs(ins);
+        for (k, v) in attrs {
+            op = op.with_attr(k, v);
+        }
+        self.ops.push(op.with_output(id, t));
+        id
+    }
+
+    fn act(&mut self, x: u32, kind: &str, shape: &[Dim]) -> u32 {
+        self.op_attrs(
+            "omni.nn",
+            "activation",
+            &[x],
+            vec![("kind", Value::text(kind.to_string()))],
+            shape,
+        )
+    }
+
+    fn einsum(&mut self, eq: &str, ins: &[u32], shape: &[Dim]) -> u32 {
+        self.op_attrs(
+            "omni.tensor",
+            "einsum",
+            ins,
+            vec![("equation", Value::text(eq.to_string()))],
+            shape,
+        )
+    }
+
+    /// `x[start..stop]` on every axis at once, which is the only form
+    /// `tensor.slice` has. Every bound here is concrete: a symbolic axis has no
+    /// number to slice at, and the families below slice features rather than
+    /// batches for exactly that reason.
+    fn slice(&mut self, x: u32, start: &[u64], stop: &[u64], shape: &[Dim]) -> u32 {
+        self.op_attrs(
+            "omni.tensor",
+            "slice",
+            &[x],
+            vec![
+                (
+                    "start",
+                    Value::Array(start.iter().map(|v| Value::U(*v)).collect()),
+                ),
+                (
+                    "stop",
+                    Value::Array(stop.iter().map(|v| Value::U(*v)).collect()),
+                ),
+            ],
+            shape,
+        )
+    }
+
+    fn reshape(&mut self, x: u32, shape: &[u64]) -> u32 {
+        let dims: Vec<Dim> = shape.iter().map(|d| Dim::N(*d)).collect();
+        self.op_attrs(
+            "omni.tensor",
+            "reshape",
+            &[x],
+            vec![(
+                "shape",
+                Value::Array(shape.iter().map(|d| Value::U(*d)).collect()),
+            )],
+            &dims,
+        )
+    }
+
+    /// `x @ Wᵀ (+ b)` — most of what these families are made of. The transpose
+    /// is a node rather than an assumption: `[out, in]` is what frameworks
+    /// store, and turning it into `[in, out]` silently is how a graph comes to
+    /// disagree with its weights.
+    fn linear(
+        &mut self,
+        x: u32,
+        weight: &str,
+        bias: Option<&String>,
+        rows: &[Dim],
+        in_f: u64,
+        out_f: u64,
+    ) -> u32 {
+        let w = self.constant(weight, &[Dim::N(out_f), Dim::N(in_f)]);
+        let wt = self.op_attrs(
+            "omni.tensor",
+            "transpose",
+            &[w],
+            vec![("perm", Value::Array(vec![Value::U(1), Value::U(0)]))],
+            &[Dim::N(in_f), Dim::N(out_f)],
+        );
+        let mut out_shape = rows.to_vec();
+        out_shape.push(Dim::N(out_f));
+        let y = self.op("omni.tensor", "matmul", &[x, wt], &out_shape);
+        match bias {
+            Some(name) => {
+                let b = self.constant(name, &[Dim::N(out_f)]);
+                self.op("omni.tensor", "add", &[y, b], &out_shape)
+            }
+            None => y,
+        }
+    }
+
+    fn ret(&mut self, ids: &[u32]) {
+        self.ops
+            .push(Op::new("omni.core", "return", 1).with_inputs(ids));
+    }
+}
+
+/// An optional weight: present is a name, absent stays absent. A zero bias that
+/// the checkpoint does not contain is a tensor this build would be inventing.
+fn optional(available: &[String], name: String) -> Option<String> {
+    available.contains(&name).then_some(name)
+}
+
+fn function(
+    params: Vec<(String, Type)>,
+    results: Vec<Type>,
+    attrs: Vec<(&str, Value)>,
+    ops: Vec<Op>,
+    constraints: Vec<Constraint>,
+) -> Function {
+    Function {
+        params,
+        results,
+        attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        body: Region {
+            blocks: vec![Block {
+                args: Vec::new(),
+                ops,
+            }],
+        },
+        constraints,
+    }
+}
+
+fn at_least_one(sym: &str) -> Constraint {
+    Constraint {
+        dim: sym.into(),
+        rel: Rel::Ge,
+        bound: 1,
+    }
+}
+
+/// `transformer.moe` — §07.8's MoE row: a router, gathered expert weights, and
+/// a weighted sum of what the chosen experts computed.
+///
+/// The expert weights are one tensor per layer (`[experts, d_model, d_ff]`)
+/// rather than one tensor per expert, and that is what makes `gather` the
+/// mechanism §07.8 says it is: routing produces indices, `tensor.gather` turns
+/// indices into the weight matrices themselves, and the per-token application is
+/// an `einsum` over a batch of them. No new op, and no expert loop — a loop over
+/// experts would make the graph's size depend on how many there are.
+///
+/// The cost of expressing it this way honestly: `gather` materialises
+/// `[tokens, top_k, d_model, d_ff]`, which is the dense reading of a sparse
+/// operation. A runtime lowers this to a grouped matmul; the canonical form's
+/// job is to say what is computed, and this says it exactly.
+fn synthesize_moe(params: &Value, available: &[String]) -> Result<Module, String> {
+    let get = |k: &str| -> Option<u64> { params.get(k).and_then(|v| v.as_u64()) };
+    let hidden = get("hidden_size").ok_or("arch.params has no `hidden_size`")?;
+    let ff = get("intermediate_size").ok_or("arch.params has no `intermediate_size`")?;
+    let experts = get("n_experts").ok_or("arch.params has no `n_experts`")?;
+    let layers = get("n_layers").unwrap_or(1).max(1);
+    let top_k = get("top_k").unwrap_or(2).max(1);
+    if top_k > experts {
+        return Err(format!(
+            "`top_k` is {top_k} and there are {experts} expert(s)"
+        ));
+    }
+    let activation = params
+        .get("activation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("silu")
+        .to_string();
+    let mut needed = Vec::new();
+    for l in 0..layers {
+        needed.push(format!("moe.layers.{l}.router.weight"));
+        needed.push(format!("moe.layers.{l}.experts.w_in"));
+        needed.push(format!("moe.layers.{l}.experts.w_out"));
+    }
+    require(available, needed)?;
+
+    let t = Dim::Sym("T".into());
+    let mut e = Emit::new(1, DType::F32);
+    let mut h = 0u32;
+    for l in 0..layers {
+        // `[d_model, experts]` is the orientation `moe_route` takes. A
+        // checkpoint that stores the router the other way is transposed in the
+        // graph, where a reader can see it.
+        let router = e.constant(
+            &format!("moe.layers.{l}.router.weight"),
+            &[Dim::N(hidden), Dim::N(experts)],
+        );
+        let (weights, idx) = (e.id(), e.id());
+        let wt_ty = e.ty(&[t.clone(), Dim::N(top_k)]);
+        let idx_ty = Type::tensor(
+            vec![t.clone(), Dim::N(top_k)],
+            DType::Int {
+                w: 32,
+                signed: true,
+            },
+        );
+        e.ops.push(
+            Op::new("omni.nn", "moe_route", 1)
+                .with_inputs(&[h, router])
+                .with_attr("top_k", Value::U(top_k))
+                .with_output(weights, wt_ty)
+                .with_output(idx, idx_ty),
+        );
+        let w_in = e.constant(
+            &format!("moe.layers.{l}.experts.w_in"),
+            &[Dim::N(experts), Dim::N(hidden), Dim::N(ff)],
+        );
+        let w_out = e.constant(
+            &format!("moe.layers.{l}.experts.w_out"),
+            &[Dim::N(experts), Dim::N(ff), Dim::N(hidden)],
+        );
+        let g_in = e.op_attrs(
+            "omni.tensor",
+            "gather",
+            &[w_in, idx],
+            vec![("axis", Value::U(0))],
+            &[t.clone(), Dim::N(top_k), Dim::N(hidden), Dim::N(ff)],
+        );
+        let g_out = e.op_attrs(
+            "omni.tensor",
+            "gather",
+            &[w_out, idx],
+            vec![("axis", Value::U(0))],
+            &[t.clone(), Dim::N(top_k), Dim::N(ff), Dim::N(hidden)],
+        );
+        let up = e.einsum(
+            "td,tkdf->tkf",
+            &[h, g_in],
+            &[t.clone(), Dim::N(top_k), Dim::N(ff)],
+        );
+        let act = e.act(up, &activation, &[t.clone(), Dim::N(top_k), Dim::N(ff)]);
+        let down = e.einsum(
+            "tkf,tkfd->tkd",
+            &[act, g_out],
+            &[t.clone(), Dim::N(top_k), Dim::N(hidden)],
+        );
+        // The routing weights are what makes this a mixture rather than a
+        // choice: each chosen expert's output is scaled by its gate.
+        let mixed = e.einsum("tkd,tk->td", &[down, weights], &[t.clone(), Dim::N(hidden)]);
+        h = e.op(
+            "omni.tensor",
+            "add",
+            &[h, mixed],
+            &[t.clone(), Dim::N(hidden)],
+        );
+    }
+    e.ret(&[h]);
+    let dt = DType::F32;
+    let f = function(
+        vec![(
+            "tokens".into(),
+            Type::tensor(vec![t.clone(), Dim::N(hidden)], dt.clone()),
+        )],
+        vec![Type::tensor(vec![t, Dim::N(hidden)], dt)],
+        vec![
+            ("kind", Value::text("forward")),
+            ("experts", Value::U(experts)),
+            ("top_k", Value::U(top_k)),
+        ],
+        e.ops,
+        vec![at_least_one("T")],
+    );
+    Ok(finish_module(
+        "transformer.moe",
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
+/// `rnn.lstm` and `rnn.gru` — §07.8's recurrent row: `core.scan` with an
+/// explicit state carry.
+///
+/// One graph over one sequence, not over a batch. `scan` threads its first
+/// operand as the carry and slices the second along the time axis, so a batch
+/// dimension would have to be sliced inside the body — and slicing needs
+/// concrete bounds, which a symbolic batch does not have. A batch is a `map`
+/// over this function, which is where §07.10 says that belongs: the canonical
+/// graph says what is computed, and how many of them run at once is a
+/// scheduling question.
+///
+/// The carry is one tensor because `scan` threads one. For GRU that is the
+/// hidden state; for LSTM it is `[h ‖ c]`, split inside the body — visible in
+/// the graph rather than hidden in an op.
+fn synthesize_rnn(params: &Value, available: &[String], lstm: bool) -> Result<Module, String> {
+    let get = |k: &str| -> Option<u64> { params.get(k).and_then(|v| v.as_u64()) };
+    let input = get("input_size").ok_or("arch.params has no `input_size`")?;
+    let hidden = get("hidden_size").ok_or("arch.params has no `hidden_size`")?;
+    let layers = get("n_layers").unwrap_or(1).max(1);
+    let gates = if lstm { 4 } else { 3 };
+    let carry = if lstm { 2 * hidden } else { hidden };
+    let mut needed = Vec::new();
+    for l in 0..layers {
+        needed.push(format!("rnn.layers.{l}.weight_ih"));
+        needed.push(format!("rnn.layers.{l}.weight_hh"));
+    }
+    require(available, needed)?;
+
+    let time = Dim::Sym("T".into());
+    let dt = DType::F32;
+    // 0 and 1 are the function's parameters — the sequence and the initial
+    // state — so the first value this synthesizer defines is 2.
+    let mut next = 2u32;
+    let mut ops: Vec<Op> = Vec::new();
+    let mut seq = 0u32; // the input sequence, [T, input] then [T, 1, hidden]
+    let mut states: Vec<u32> = Vec::new();
+    for l in 0..layers {
+        let in_f = if l == 0 { input } else { hidden };
+        let bias_ih = optional(available, format!("rnn.layers.{l}.bias_ih"));
+        let bias_hh = optional(available, format!("rnn.layers.{l}.bias_hh"));
+
+        // This layer's slice of the initial state: `[layers, carry]` sliced on a
+        // concrete axis, which is why the state is stored that way.
+        let mut outer = Emit::new(next, dt.clone());
+        let h0 = outer.slice(1, &[l, 0], &[l + 1, carry], &[Dim::N(1), Dim::N(carry)]);
+        next = outer.next;
+        ops.append(&mut outer.ops);
+
+        // The body: one timestep. Its arguments are the carry and the slice
+        // `scan` took, which is rank-1 on the first layer (`[input]`) and
+        // rank-2 afterwards (`[1, hidden]`).
+        let carry_id = next;
+        let step_id = next + 1;
+        let mut b = Emit::new(next + 2, dt.clone());
+        let x = if l == 0 {
+            b.reshape(step_id, &[1, in_f])
+        } else {
+            step_id
+        };
+        let row = [Dim::N(1)];
+        let gi = b.linear(
+            x,
+            &format!("rnn.layers.{l}.weight_ih"),
+            bias_ih.as_ref(),
+            &row,
+            in_f,
+            gates * hidden,
+        );
+        let h_prev = if lstm {
+            b.slice(
+                carry_id,
+                &[0, 0],
+                &[1, hidden],
+                &[Dim::N(1), Dim::N(hidden)],
+            )
+        } else {
+            carry_id
+        };
+        let gh = b.linear(
+            h_prev,
+            &format!("rnn.layers.{l}.weight_hh"),
+            bias_hh.as_ref(),
+            &row,
+            hidden,
+            gates * hidden,
+        );
+        let gate = |b: &mut Emit, x: u32, k: u64| -> u32 {
+            b.slice(
+                x,
+                &[0, k * hidden],
+                &[1, (k + 1) * hidden],
+                &[Dim::N(1), Dim::N(hidden)],
+            )
+        };
+        let hshape = [Dim::N(1), Dim::N(hidden)];
+        let (new_carry, emit) = if lstm {
+            // The gate order is PyTorch's — i, f, g, o — because that is the
+            // order the weights are stored in, and a different reading of the
+            // same bytes is a different model that runs without complaining.
+            let g = b.op(
+                "omni.tensor",
+                "add",
+                &[gi, gh],
+                &[Dim::N(1), Dim::N(gates * hidden)],
+            );
+            let (gi_, gf, gg, go) = (
+                gate(&mut b, g, 0),
+                gate(&mut b, g, 1),
+                gate(&mut b, g, 2),
+                gate(&mut b, g, 3),
+            );
+            let i = b.op("omni.tensor", "sigmoid", &[gi_], &hshape);
+            let f = b.op("omni.tensor", "sigmoid", &[gf], &hshape);
+            let gt = b.op("omni.tensor", "tanh", &[gg], &hshape);
+            let o = b.op("omni.tensor", "sigmoid", &[go], &hshape);
+            let c_prev = b.slice(
+                carry_id,
+                &[0, hidden],
+                &[1, 2 * hidden],
+                &[Dim::N(1), Dim::N(hidden)],
+            );
+            let fc = b.op("omni.tensor", "mul", &[f, c_prev], &hshape);
+            let ig = b.op("omni.tensor", "mul", &[i, gt], &hshape);
+            let c = b.op("omni.tensor", "add", &[fc, ig], &hshape);
+            let tc = b.op("omni.tensor", "tanh", &[c], &hshape);
+            let h = b.op("omni.tensor", "mul", &[o, tc], &hshape);
+            let cat = b.op_attrs(
+                "omni.tensor",
+                "concat",
+                &[h, c],
+                vec![("axis", Value::U(1))],
+                &[Dim::N(1), Dim::N(2 * hidden)],
+            );
+            (cat, Some(h))
+        } else {
+            // GRU, in PyTorch's formulation: the reset gate multiplies the
+            // *hidden* half of the candidate only, which is why `gi` and `gh`
+            // are kept apart until here instead of being added like the LSTM's.
+            let (ir, iz, in_) = (
+                gate(&mut b, gi, 0),
+                gate(&mut b, gi, 1),
+                gate(&mut b, gi, 2),
+            );
+            let (hr, hz, hn) = (
+                gate(&mut b, gh, 0),
+                gate(&mut b, gh, 1),
+                gate(&mut b, gh, 2),
+            );
+            let rs = b.op("omni.tensor", "add", &[ir, hr], &hshape);
+            let r = b.op("omni.tensor", "sigmoid", &[rs], &hshape);
+            let zs = b.op("omni.tensor", "add", &[iz, hz], &hshape);
+            let z = b.op("omni.tensor", "sigmoid", &[zs], &hshape);
+            let rhn = b.op("omni.tensor", "mul", &[r, hn], &hshape);
+            let ns = b.op("omni.tensor", "add", &[in_, rhn], &hshape);
+            let n = b.op("omni.tensor", "tanh", &[ns], &hshape);
+            // (1 − z)·n + z·h, written as n + z·(h − n): the same value, and it
+            // needs no constant one — a graph's constants name tensors, and a
+            // scalar this build invented would not be one of the model's.
+            let diff = b.op("omni.tensor", "sub", &[carry_id, n], &hshape);
+            let scaled = b.op("omni.tensor", "mul", &[z, diff], &hshape);
+            let h = b.op("omni.tensor", "add", &[n, scaled], &hshape);
+            (h, None)
+        };
+        let mut yields = vec![new_carry];
+        if let Some(h) = emit {
+            yields.push(h);
+        }
+        b.ops
+            .push(Op::new("omni.core", "yield", 1).with_inputs(&yields));
+        let body_ops = std::mem::take(&mut b.ops);
+        next = b.next;
+
+        let carry_ty = Type::tensor(vec![Dim::N(1), Dim::N(carry)], dt.clone());
+        let step_ty = if l == 0 {
+            Type::tensor(vec![Dim::N(in_f)], dt.clone())
+        } else {
+            Type::tensor(vec![Dim::N(1), Dim::N(hidden)], dt.clone())
+        };
+        let (final_id, hs_id) = (next, next + 1);
+        next += 2;
+        let mut scan = Op::new("omni.core", "scan", 1)
+            .with_inputs(&[h0, seq])
+            .with_attr("axis", Value::U(0))
+            .with_output(final_id, carry_ty)
+            .with_output(
+                hs_id,
+                Type::tensor(vec![time.clone(), Dim::N(1), Dim::N(hidden)], dt.clone()),
+            );
+        scan.regions = vec![Region {
+            blocks: vec![Block {
+                args: vec![
+                    (
+                        carry_id,
+                        Type::tensor(vec![Dim::N(1), Dim::N(carry)], dt.clone()),
+                    ),
+                    (step_id, step_ty),
+                ],
+                ops: body_ops,
+            }],
+        }];
+        ops.push(scan);
+        seq = hs_id;
+        states.push(final_id);
+    }
+    // The last layer's outputs, and every layer's final state — a caller
+    // continuing the sequence needs all of them, and a caller that does not can
+    // ignore the second result.
+    let stacked = if states.len() == 1 {
+        states[0]
+    } else {
+        let id = next;
+        next += 1;
+        ops.push(
+            Op::new("omni.tensor", "concat", 1)
+                .with_inputs(&states)
+                .with_attr("axis", Value::U(0))
+                .with_output(
+                    id,
+                    Type::tensor(vec![Dim::N(states.len() as u64), Dim::N(carry)], dt.clone()),
+                ),
+        );
+        id
+    };
+    let _ = next;
+    ops.push(Op::new("omni.core", "return", 1).with_inputs(&[seq, stacked]));
+
+    let f = function(
+        vec![
+            (
+                "x".into(),
+                Type::tensor(vec![time.clone(), Dim::N(input)], dt.clone()),
+            ),
+            (
+                "state".into(),
+                Type::tensor(vec![Dim::N(layers), Dim::N(carry)], dt.clone()),
+            ),
+        ],
+        vec![
+            Type::tensor(vec![time, Dim::N(1), Dim::N(hidden)], dt.clone()),
+            Type::tensor(vec![Dim::N(layers.max(1)), Dim::N(carry)], dt),
+        ],
+        vec![
+            ("kind", Value::text("forward")),
+            ("cell", Value::text(if lstm { "lstm" } else { "gru" })),
+            ("gates", Value::U(gates)),
+        ],
+        ops,
+        vec![at_least_one("T")],
+    );
+    Ok(finish_module(
+        if lstm { "rnn.lstm" } else { "rnn.gru" },
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
+/// `gnn.mpnn` — §07.8's GNN row: messages gathered along an edge index and
+/// aggregated per node.
+///
+/// The gather half is exactly what §07.8 describes. The aggregation is not:
+/// `tensor.scatter` writes element for element, last write wins, so two edges
+/// into the same node leave one message and drop the other. Summing them needs
+/// a scatter-*add*, and §07 defines no reduction on `scatter`. Rather than
+/// invent one, this synthesizer takes the incidence matrix as an input and
+/// aggregates with an `einsum`, which is the same arithmetic written in an op
+/// that exists — and the gap is recorded in §07.8 next to `ssm_scan`'s.
+fn synthesize_gnn(params: &Value, available: &[String]) -> Result<Module, String> {
+    let get = |k: &str| -> Option<u64> { params.get(k).and_then(|v| v.as_u64()) };
+    let in_f = get("input_size").ok_or("arch.params has no `input_size`")?;
+    let hidden = get("hidden_size").ok_or("arch.params has no `hidden_size`")?;
+    let layers = get("n_layers").unwrap_or(1).max(1);
+    let classes = get("num_classes").ok_or("arch.params has no `num_classes`")?;
+    let activation = params
+        .get("activation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("relu")
+        .to_string();
+    let mut needed = Vec::new();
+    for l in 0..layers {
+        needed.push(format!("gnn.layers.{l}.message.weight"));
+        needed.push(format!("gnn.layers.{l}.self.weight"));
+    }
+    needed.push("gnn.head.weight".into());
+    require(available, needed)?;
+
+    let (n, edges) = (Dim::Sym("N".into()), Dim::Sym("E".into()));
+    let dt = DType::F32;
+    let mut e = Emit::new(3, dt.clone());
+    let mut h = 0u32; // node features
+    let mut width = in_f;
+    for l in 0..layers {
+        // `src` selects the source node of every edge; the result is one
+        // message per edge, which is the shape the whole family is about.
+        let msg = e.op_attrs(
+            "omni.tensor",
+            "gather",
+            &[h, 1],
+            vec![("axis", Value::U(0))],
+            &[edges.clone(), Dim::N(width)],
+        );
+        let projected = e.linear(
+            msg,
+            &format!("gnn.layers.{l}.message.weight"),
+            optional(available, format!("gnn.layers.{l}.message.bias")).as_ref(),
+            std::slice::from_ref(&edges),
+            width,
+            hidden,
+        );
+        // Aggregation: incidence is `[E, N]`, one row per edge with a one in
+        // the destination's column, so this sums the messages arriving at each
+        // node. See the note above about why it is not a scatter.
+        let agg = e.einsum("en,eh->nh", &[2, projected], &[n.clone(), Dim::N(hidden)]);
+        let own = e.linear(
+            h,
+            &format!("gnn.layers.{l}.self.weight"),
+            optional(available, format!("gnn.layers.{l}.self.bias")).as_ref(),
+            std::slice::from_ref(&n),
+            width,
+            hidden,
+        );
+        let sum = e.op(
+            "omni.tensor",
+            "add",
+            &[agg, own],
+            &[n.clone(), Dim::N(hidden)],
+        );
+        h = e.act(sum, &activation, &[n.clone(), Dim::N(hidden)]);
+        width = hidden;
+    }
+    let logits = e.linear(
+        h,
+        "gnn.head.weight",
+        optional(available, "gnn.head.bias".into()).as_ref(),
+        std::slice::from_ref(&n),
+        width,
+        classes,
+    );
+    e.ret(&[logits]);
+
+    let i32t = DType::Int {
+        w: 32,
+        signed: true,
+    };
+    let f = function(
+        vec![
+            (
+                "x".into(),
+                Type::tensor(vec![n.clone(), Dim::N(in_f)], dt.clone()),
+            ),
+            ("src".into(), Type::tensor(vec![edges.clone()], i32t)),
+            (
+                "incidence".into(),
+                Type::tensor(vec![edges, n.clone()], dt.clone()),
+            ),
+        ],
+        vec![Type::tensor(vec![n, Dim::N(classes)], dt)],
+        vec![
+            ("kind", Value::text("forward")),
+            ("aggregation", Value::text("sum")),
+        ],
+        e.ops,
+        vec![at_least_one("N"), at_least_one("E")],
+    );
+    Ok(finish_module(
+        "gnn.mpnn",
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
+/// `rl.actor_critic` — §07.8's RL row: one trunk, two heads, two results.
+///
+/// It is in the list because of the *two results*. A policy and a value are one
+/// model with one set of shared weights, and a format that can only describe a
+/// single output tensor forces them apart into two artifacts that then have to
+/// be kept in step by convention.
+fn synthesize_rl(params: &Value, available: &[String]) -> Result<Module, String> {
+    let sizes: Vec<u64> = match params.get("hidden_sizes") {
+        Some(Value::Array(xs)) => xs
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .ok_or("a non-integer in `hidden_sizes`".to_string())
+            })
+            .collect::<Result<Vec<u64>, String>>()?,
+        _ => return Err("arch.params has no `hidden_sizes`".into()),
+    };
+    if sizes.len() < 2 {
+        return Err("`hidden_sizes` needs an observation size and at least one layer".into());
+    }
+    let actions = params
+        .get("n_actions")
+        .and_then(|v| v.as_u64())
+        .ok_or("arch.params has no `n_actions`")?;
+    let activation = params
+        .get("activation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tanh")
+        .to_string();
+    let n = sizes.len() - 1;
+    let mut needed: Vec<String> = (0..n).map(|i| format!("rl.trunk.{i}.weight")).collect();
+    needed.push("rl.policy.weight".into());
+    needed.push("rl.value.weight".into());
+    require(available, needed)?;
+
+    let b = Dim::Sym("B".into());
+    let dt = DType::F32;
+    let mut e = Emit::new(1, dt.clone());
+    let mut h = 0u32;
+    for i in 0..n {
+        let y = e.linear(
+            h,
+            &format!("rl.trunk.{i}.weight"),
+            optional(available, format!("rl.trunk.{i}.bias")).as_ref(),
+            std::slice::from_ref(&b),
+            sizes[i],
+            sizes[i + 1],
+        );
+        h = e.act(y, &activation, &[b.clone(), Dim::N(sizes[i + 1])]);
+    }
+    let features = sizes[n];
+    let policy = e.linear(
+        h,
+        "rl.policy.weight",
+        optional(available, "rl.policy.bias".into()).as_ref(),
+        std::slice::from_ref(&b),
+        features,
+        actions,
+    );
+    // Logits, not probabilities: a softmax here would decide the sampling
+    // temperature on the model's behalf.
+    let value = e.linear(
+        h,
+        "rl.value.weight",
+        optional(available, "rl.value.bias".into()).as_ref(),
+        std::slice::from_ref(&b),
+        features,
+        1,
+    );
+    e.ret(&[policy, value]);
+
+    let f = function(
+        vec![(
+            "obs".into(),
+            Type::tensor(vec![b.clone(), Dim::N(sizes[0])], dt.clone()),
+        )],
+        vec![
+            Type::tensor(vec![b.clone(), Dim::N(actions)], dt.clone()),
+            Type::tensor(vec![b, Dim::N(1)], dt),
+        ],
+        vec![
+            ("kind", Value::text("forward")),
+            ("heads", Value::text("policy,value")),
+        ],
+        e.ops,
+        vec![at_least_one("B")],
+    );
+    Ok(finish_module(
+        "rl.actor_critic",
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
+/// `audio.encoder` — §07.8's speech row: a stack of causal 1-D convolutions.
+///
+/// Causality is the whole point of the row and the reason `conv1d_causal` is
+/// its own op rather than `conv` with a padding attribute: a streaming encoder
+/// that pads symmetrically sees one frame of the future, produces slightly
+/// better numbers offline, and cannot be run live. The op with the padding
+/// baked in is the one that cannot be got wrong.
+fn synthesize_audio(params: &Value, available: &[String]) -> Result<Module, String> {
+    let channels: Vec<u64> = match params.get("channels") {
+        Some(Value::Array(xs)) => xs
+            .iter()
+            .map(|v| v.as_u64().ok_or("a non-integer in `channels`".to_string()))
+            .collect::<Result<Vec<u64>, String>>()?,
+        _ => return Err("arch.params has no `channels`".into()),
+    };
+    if channels.len() < 2 {
+        return Err("`channels` needs an input channel count and at least one block".into());
+    }
+    let kernel = params
+        .get("kernel")
+        .and_then(|v| v.as_u64())
+        .ok_or("arch.params has no `kernel`")?;
+    if kernel == 0 {
+        return Err("`kernel` is 0".into());
+    }
+    let activation = params
+        .get("activation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gelu")
+        .to_string();
+    let n = channels.len() - 1;
+    require(
+        available,
+        (0..n)
+            .map(|i| format!("audio.blocks.{i}.conv.weight"))
+            .collect(),
+    )?;
+
+    let (b, len) = (Dim::Sym("B".into()), Dim::Sym("L".into()));
+    let dt = DType::F32;
+    let mut e = Emit::new(1, dt.clone());
+    let mut x = 0u32;
+    for i in 0..n {
+        let (cin, cout) = (channels[i], channels[i + 1]);
+        let w = e.constant(
+            &format!("audio.blocks.{i}.conv.weight"),
+            &[Dim::N(cout), Dim::N(cin), Dim::N(kernel)],
+        );
+        let mut ins = vec![x, w];
+        if let Some(bias) = optional(available, format!("audio.blocks.{i}.conv.bias")) {
+            let bid = e.constant(&bias, &[Dim::N(cout)]);
+            ins.push(bid);
+        }
+        let out = [b.clone(), Dim::N(cout), len.clone()];
+        let y = e.op("omni.nn", "conv1d_causal", &ins, &out);
+        // The last block's output is the encoding, and an activation on it
+        // would be a choice about what the encoding means.
+        x = if i + 1 < n {
+            e.act(y, &activation, &out)
+        } else {
+            y
+        };
+    }
+    e.ret(&[x]);
+
+    let f = function(
+        vec![(
+            "audio".into(),
+            Type::tensor(
+                vec![b.clone(), Dim::N(channels[0]), len.clone()],
+                dt.clone(),
+            ),
+        )],
+        vec![Type::tensor(vec![b, Dim::N(channels[n]), len], dt)],
+        vec![
+            ("kind", Value::text("forward")),
+            ("causal", Value::Bool(true)),
+        ],
+        e.ops,
+        vec![at_least_one("B"), at_least_one("L")],
+    );
+    Ok(finish_module(
+        "audio.encoder",
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
 /// The module wrapper every synthesizer ends with: one `forward` function, the
 /// dialects it used, and the family it came from recorded so a reader can tell a
 /// synthesized graph from an authored one (§07.5).
@@ -5911,6 +6817,125 @@ mod tests {
         let mut bad = blob.clone();
         bad[0] = b'X';
         assert!(binary::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn every_family_in_the_list_synthesizes_and_verifies() {
+        // FAMILIES is what `omni graph synthesize` offers and what the roadmap
+        // counts, so a name in it that does not build a graph — or builds one
+        // with a finding — is a claim this build cannot support. The
+        // architectures are tiny; what is checked is that each name produces a
+        // module the verifier accepts against the weights it asked for.
+        type Case = (&'static str, Value, Vec<(&'static str, Vec<u64>)>);
+        let shapes: Vec<Case> = vec![
+            (
+                "transformer.moe",
+                Value::map(vec![
+                    ("hidden_size", Value::U(4)),
+                    ("intermediate_size", Value::U(6)),
+                    ("n_experts", Value::U(3)),
+                    ("top_k", Value::U(2)),
+                ]),
+                vec![
+                    ("moe.layers.0.router.weight", vec![4, 3]),
+                    ("moe.layers.0.experts.w_in", vec![3, 4, 6]),
+                    ("moe.layers.0.experts.w_out", vec![3, 6, 4]),
+                ],
+            ),
+            (
+                "rnn.lstm",
+                Value::map(vec![
+                    ("input_size", Value::U(3)),
+                    ("hidden_size", Value::U(4)),
+                ]),
+                vec![
+                    ("rnn.layers.0.weight_ih", vec![16, 3]),
+                    ("rnn.layers.0.weight_hh", vec![16, 4]),
+                ],
+            ),
+            (
+                "rnn.gru",
+                Value::map(vec![
+                    ("input_size", Value::U(3)),
+                    ("hidden_size", Value::U(4)),
+                ]),
+                vec![
+                    ("rnn.layers.0.weight_ih", vec![12, 3]),
+                    ("rnn.layers.0.weight_hh", vec![12, 4]),
+                ],
+            ),
+            (
+                "gnn.mpnn",
+                Value::map(vec![
+                    ("input_size", Value::U(2)),
+                    ("hidden_size", Value::U(3)),
+                    ("num_classes", Value::U(2)),
+                ]),
+                vec![
+                    ("gnn.layers.0.message.weight", vec![3, 2]),
+                    ("gnn.layers.0.self.weight", vec![3, 2]),
+                    ("gnn.head.weight", vec![2, 3]),
+                ],
+            ),
+            (
+                "rl.actor_critic",
+                Value::map(vec![
+                    ("hidden_sizes", Value::Array(vec![Value::U(4), Value::U(5)])),
+                    ("n_actions", Value::U(3)),
+                ]),
+                vec![
+                    ("rl.trunk.0.weight", vec![5, 4]),
+                    ("rl.policy.weight", vec![3, 5]),
+                    ("rl.value.weight", vec![1, 5]),
+                ],
+            ),
+            (
+                "audio.encoder",
+                Value::map(vec![
+                    ("channels", Value::Array(vec![Value::U(2), Value::U(3)])),
+                    ("kernel", Value::U(3)),
+                ]),
+                vec![("audio.blocks.0.conv.weight", vec![3, 2, 3])],
+            ),
+        ];
+        for (family, params, weights) in &shapes {
+            let names: Vec<String> = weights.iter().map(|(n, _)| n.to_string()).collect();
+            let m = synthesize(family, params, &names).unwrap_or_else(|e| panic!("{family}: {e}"));
+            assert_eq!(
+                m.attrs
+                    .iter()
+                    .find(|(k, _)| k == "family")
+                    .and_then(|(_, v)| v.as_str()),
+                Some(*family)
+            );
+            let lookup = |name: &str| -> Option<(Vec<u64>, DType)> {
+                weights
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, s)| (s.clone(), DType::F32))
+            };
+            let cx = Context {
+                tensor: Some(&lookup),
+                ..Default::default()
+            };
+            let r = verify(&m, &cx);
+            assert!(r.is_valid(), "{family}: {:?}", r.findings);
+            assert_eq!(r.unknown, 0, "{family} used an op no dialect declares");
+            // A weight the model does not have is named rather than emitted.
+            let short: Vec<String> = names[..names.len() - 1].to_vec();
+            assert!(
+                synthesize(family, params, &short).is_err(),
+                "{family} synthesized a graph over a weight that is not there"
+            );
+        }
+        // And the list itself is the thing the CLI offers, so nothing in it is
+        // unreachable.
+        for family in FAMILIES {
+            assert!(
+                synthesize(family, &Value::map(vec![]), &[]).is_err(),
+                "{family} synthesized something out of no parameters at all"
+            );
+        }
     }
 
     #[test]

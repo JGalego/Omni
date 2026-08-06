@@ -267,13 +267,19 @@ implemented:
   about its input has to say so differently. Whitespace
   control is carried across, because `{%- … -%}` decides whether a prompt has a
   leading newline and a tokenizer notices
-- **Three synthesizable architecture families**, not one: `transformer.decoder`,
-  `cnn.classifier` and `mlp`. Each is *executed* in the tests over known weights
-  and compared against arithmetic done in the test — the mlp against its own
-  affine stack element by element, the CNN through the `conv` and `pool` ops for
-  every intermediate shape. Gate 2 asks for ten, so this is three tenths of one
-  criterion, and the honest framing is that the machinery for adding a family is
-  now cheap while the families themselves are not
+- **Ten synthesizable architecture families**, which is the count Gate 2 asks
+  for: `transformer.decoder`, `transformer.encoder`, `transformer.moe`,
+  `cnn.classifier`, `mlp`, `rnn.lstm`, `rnn.gru`, `gnn.mpnn`, `rl.actor_critic`
+  and `audio.encoder`. Each is *executed* in the tests over known weights, and
+  each assertion is a property of that architecture rather than "it produced
+  numbers": the mixture's output moves when only the router changes, the
+  recurrence's first step cannot see the last input, the graph network's node
+  moves when its neighbour does and not when a stranger does, the causal audio
+  encoder's earlier frames do not move when a later frame changes. Running them
+  is what found `core.scan` declared with one result and returning two, and
+  found that `tensor.scatter` cannot aggregate messages at all. The count is met
+  and the rest of the criterion is not: the gate also wants outputs matched
+  against the source framework, and there is no source framework here
 - **A reference interpreter for OMNI-IR** (`omni graph run`), which is where §07's
   claim gets tested rather than asserted: a model that describes its own
   computation can be executed by something that was never told its architecture.

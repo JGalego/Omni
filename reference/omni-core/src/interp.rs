@@ -3966,6 +3966,309 @@ mod tests {
         );
     }
 
+    /// The six families added to reach §07.8's coverage, each *executed* rather
+    /// than merely emitted.
+    ///
+    /// A synthesizer that produces a well-typed graph nobody has run is how the
+    /// decoder came to attend across heads instead of positions and pass
+    /// verification while doing it. So every family here is run over known
+    /// weights, and each assertion is a property of *that* architecture — the
+    /// mixture's output moves when the router changes, the recurrence's output
+    /// at step t depends on step t−1, the graph convolution's node feature moves
+    /// when a neighbour's does — rather than "it produced numbers".
+    fn seeded_weights(specs: &[(&str, Vec<u64>, f64)]) -> Vec<(String, Tensor)> {
+        specs
+            .iter()
+            .map(|(name, shape, k)| {
+                let n = numel(shape);
+                let data: Vec<f64> = (0..n).map(|i| (i as f64 * k).sin() * 0.4).collect();
+                (
+                    name.to_string(),
+                    Tensor::new(shape.clone(), DType::F32, data),
+                )
+            })
+            .collect()
+    }
+
+    fn synth_names(w: &[(String, Tensor)]) -> Vec<String> {
+        w.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    #[test]
+    fn a_synthesized_mixture_of_experts_routes_and_runs() {
+        let (d, ff, experts, k) = (4u64, 6u64, 3u64, 2u64);
+        let w = seeded_weights(&[
+            ("moe.layers.0.router.weight", vec![d, experts], 1.3),
+            ("moe.layers.0.experts.w_in", vec![experts, d, ff], 0.7),
+            ("moe.layers.0.experts.w_out", vec![experts, ff, d], 1.1),
+        ]);
+        let params = Value::map(vec![
+            ("hidden_size", Value::U(d)),
+            ("intermediate_size", Value::U(ff)),
+            ("n_experts", Value::U(experts)),
+            ("top_k", Value::U(k)),
+        ]);
+        let m = crate::ir::synthesize("transformer.moe", &params, &synth_names(&w))
+            .expect("the synthesizer should build this");
+        let tokens = Tensor::new(
+            vec![3, d],
+            DType::F32,
+            (0..3 * d).map(|i| (i as f64 * 0.37).cos()).collect(),
+        );
+        let out = run(&m, std::slice::from_ref(&tokens), &w, &Limits::default())
+            .unwrap_or_else(|e| panic!("the synthesized mixture did not run: {e}"));
+        assert_eq!(out.returned[0].shape, vec![3, d]);
+        assert!(out.returned[0].data.iter().all(|x| x.is_finite()));
+
+        // The property that makes it a mixture rather than a stack: change the
+        // router and the same tokens take a different path, so the output
+        // changes even though every expert's weights are untouched.
+        let mut rerouted = w.clone();
+        rerouted[0].1 = Tensor::new(
+            vec![d, experts],
+            DType::F32,
+            (0..d * experts)
+                .map(|i| -(i as f64 * 1.3).sin() * 0.4)
+                .collect(),
+        );
+        let out2 = run(&m, &[tokens], &rerouted, &Limits::default()).unwrap();
+        assert_ne!(
+            out.returned[0].data, out2.returned[0].data,
+            "the routing made no difference, so nothing was routed"
+        );
+    }
+
+    #[test]
+    fn synthesized_recurrences_carry_state_across_time() {
+        for (family, carry) in [("rnn.lstm", 2u64), ("rnn.gru", 1u64)] {
+            let (input, hidden) = (3u64, 4u64);
+            let gates = if family == "rnn.lstm" { 4 } else { 3 };
+            let w = seeded_weights(&[
+                ("rnn.layers.0.weight_ih", vec![gates * hidden, input], 0.9),
+                ("rnn.layers.0.weight_hh", vec![gates * hidden, hidden], 1.4),
+                ("rnn.layers.0.bias_ih", vec![gates * hidden], 0.3),
+                ("rnn.layers.0.bias_hh", vec![gates * hidden], 0.6),
+            ]);
+            let params = Value::map(vec![
+                ("input_size", Value::U(input)),
+                ("hidden_size", Value::U(hidden)),
+            ]);
+            let m = crate::ir::synthesize(family, &params, &synth_names(&w))
+                .unwrap_or_else(|e| panic!("{family}: {e}"));
+            let x = |last: f64| {
+                Tensor::new(
+                    vec![3, input],
+                    DType::F32,
+                    (0..3 * input)
+                        .map(|i| {
+                            if i == 3 * input - 1 {
+                                last
+                            } else {
+                                (i as f64 * 0.5).sin()
+                            }
+                        })
+                        .collect(),
+                )
+            };
+            let state = Tensor::new(
+                vec![1, carry * hidden],
+                DType::F32,
+                vec![0.0; (carry * hidden) as usize],
+            );
+            let out = run(&m, &[x(0.2), state.clone()], &w, &Limits::default())
+                .unwrap_or_else(|e| panic!("{family} did not run: {e}"));
+            let hs = &out.returned[0];
+            assert_eq!(hs.shape, vec![3, 1, hidden], "{family}");
+            assert!(hs.data.iter().all(|v| v.is_finite()), "{family}");
+            assert_eq!(out.returned[1].shape, vec![1, carry * hidden], "{family}");
+
+            // Recurrence, stated as a property: changing the *last* input must
+            // move the last output and leave the first alone. A body that
+            // ignored its carry would pass the first half and fail the second,
+            // and one that leaked the future would fail the first.
+            let out2 = run(&m, &[x(-0.9), state], &w, &Limits::default()).unwrap();
+            let h2 = &out2.returned[0];
+            assert_eq!(
+                hs.data[..hidden as usize],
+                h2.data[..hidden as usize],
+                "{family}: step 0 saw a later input"
+            );
+            assert_ne!(
+                hs.data[(2 * hidden) as usize..],
+                h2.data[(2 * hidden) as usize..],
+                "{family}: the last step ignored its input"
+            );
+            // And the state really is threaded: the final carry is not the
+            // zero it started from.
+            assert!(
+                out.returned[1].data.iter().any(|v| *v != 0.0),
+                "{family}: the carry never changed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_synthesized_graph_network_passes_messages_along_its_edges() {
+        let (fin, hidden, classes) = (2u64, 3u64, 2u64);
+        let w = seeded_weights(&[
+            ("gnn.layers.0.message.weight", vec![hidden, fin], 0.8),
+            ("gnn.layers.0.self.weight", vec![hidden, fin], 1.2),
+            ("gnn.head.weight", vec![classes, hidden], 1.9),
+        ]);
+        let params = Value::map(vec![
+            ("input_size", Value::U(fin)),
+            ("hidden_size", Value::U(hidden)),
+            ("num_classes", Value::U(classes)),
+        ]);
+        let m = crate::ir::synthesize("gnn.mpnn", &params, &synth_names(&w)).expect("synthesizes");
+
+        // Three nodes, two edges: 0 → 2 and 1 → 2. Node 2 therefore aggregates
+        // *both* messages, which is the case a scatter would get wrong.
+        let x = Tensor::new(
+            vec![3, fin],
+            DType::F32,
+            vec![1.0, 0.5, -0.5, 0.25, 0.0, 0.0],
+        );
+        let src = Tensor::new(
+            vec![2],
+            DType::Int {
+                w: 32,
+                signed: true,
+            },
+            vec![0.0, 1.0],
+        );
+        let inc = Tensor::new(vec![2, 3], DType::F32, vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        let out = run(
+            &m,
+            &[x.clone(), src.clone(), inc.clone()],
+            &w,
+            &Limits::default(),
+        )
+        .unwrap_or_else(|e| panic!("the synthesized GNN did not run: {e}"));
+        assert_eq!(out.returned[0].shape, vec![3, classes]);
+
+        // Message passing, as a property: change node 0's features and node 2's
+        // output must move, because there is an edge from 0 to 2 — while node
+        // 1's output must not, because there is no edge from 0 to 1.
+        let mut x2 = x.clone();
+        x2.data[0] = -2.0;
+        let out2 = run(&m, &[x2, src, inc], &w, &Limits::default()).unwrap();
+        let row = |t: &Tensor, n: u64| -> Vec<f64> {
+            (0..classes).map(|c| t.get(&[n, c]).unwrap()).collect()
+        };
+        assert_ne!(
+            row(&out.returned[0], 2),
+            row(&out2.returned[0], 2),
+            "node 2 did not receive node 0's message"
+        );
+        assert_eq!(
+            row(&out.returned[0], 1),
+            row(&out2.returned[0], 1),
+            "node 1 changed, and no edge reaches it from node 0"
+        );
+    }
+
+    #[test]
+    fn a_synthesized_policy_returns_both_of_its_heads() {
+        let (obs, hidden, actions) = (4u64, 5u64, 3u64);
+        let w = seeded_weights(&[
+            ("rl.trunk.0.weight", vec![hidden, obs], 0.6),
+            ("rl.trunk.0.bias", vec![hidden], 0.2),
+            ("rl.policy.weight", vec![actions, hidden], 1.5),
+            ("rl.value.weight", vec![1, hidden], 2.1),
+        ]);
+        let params = Value::map(vec![
+            (
+                "hidden_sizes",
+                Value::Array(vec![Value::U(obs), Value::U(hidden)]),
+            ),
+            ("n_actions", Value::U(actions)),
+        ]);
+        let m = crate::ir::synthesize("rl.actor_critic", &params, &synth_names(&w))
+            .expect("synthesizes");
+        let x = Tensor::new(
+            vec![2, obs],
+            DType::F32,
+            (0..2 * obs).map(|i| (i as f64 * 0.9).cos()).collect(),
+        );
+        let out = run(&m, &[x], &w, &Limits::default())
+            .unwrap_or_else(|e| panic!("the synthesized policy did not run: {e}"));
+        // Two results from one graph over shared weights, which is the reason
+        // this family is in the list at all.
+        assert_eq!(out.returned.len(), 2);
+        assert_eq!(out.returned[0].shape, vec![2, actions]);
+        assert_eq!(out.returned[1].shape, vec![2, 1]);
+        assert!(out
+            .returned
+            .iter()
+            .all(|t| t.data.iter().all(|v| v.is_finite())));
+    }
+
+    #[test]
+    fn a_synthesized_audio_encoder_cannot_see_the_future() {
+        let channels = [2u64, 3u64, 2u64];
+        let kernel = 3u64;
+        let w = seeded_weights(&[
+            (
+                "audio.blocks.0.conv.weight",
+                vec![channels[1], channels[0], kernel],
+                0.7,
+            ),
+            (
+                "audio.blocks.1.conv.weight",
+                vec![channels[2], channels[1], kernel],
+                1.3,
+            ),
+        ]);
+        let params = Value::map(vec![
+            (
+                "channels",
+                Value::Array(channels.iter().map(|c| Value::U(*c)).collect()),
+            ),
+            ("kernel", Value::U(kernel)),
+        ]);
+        let m =
+            crate::ir::synthesize("audio.encoder", &params, &synth_names(&w)).expect("synthesizes");
+        let len = 6u64;
+        let make = |last: f64| {
+            Tensor::new(
+                vec![1, channels[0], len],
+                DType::F32,
+                (0..channels[0] * len)
+                    .map(|i| {
+                        if i == channels[0] * len - 1 {
+                            last
+                        } else {
+                            (i as f64 * 0.4).sin()
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let out = run(&m, &[make(0.1)], &w, &Limits::default())
+            .unwrap_or_else(|e| panic!("the synthesized encoder did not run: {e}"));
+        assert_eq!(out.returned[0].shape, vec![1, channels[2], len]);
+
+        // Causality, as a property rather than as an attribute: change the last
+        // frame and every earlier output frame must be untouched. A symmetric
+        // padding — the mistake `conv1d_causal` exists to prevent — moves them.
+        let out2 = run(&m, &[make(-0.8)], &w, &Limits::default()).unwrap();
+        for c in 0..channels[2] {
+            for t in 0..len - 1 {
+                assert_eq!(
+                    out.returned[0].get(&[0, c, t]),
+                    out2.returned[0].get(&[0, c, t]),
+                    "frame {t} moved when a later frame changed"
+                );
+            }
+        }
+        assert_ne!(
+            out.returned[0].get(&[0, 0, len - 1]),
+            out2.returned[0].get(&[0, 0, len - 1]),
+            "the last frame ignored the input that changed"
+        );
+    }
+
     #[test]
     fn a_synthesized_decoder_graph_executes_end_to_end() {
         let (hidden, heads, kv_heads, layers, vocab) = (8u64, 2u64, 1u64, 2u64, 5u64);

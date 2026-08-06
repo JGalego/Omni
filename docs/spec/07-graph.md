@@ -111,6 +111,19 @@ A dialect is a namespaced, versioned set of ops.
 | `omni.io` | registry | model inputs/outputs, tokenization boundaries, streaming |
 | `org.*` / `com.*` | third-party | anything |
 
+> **`core.scan` has two results, and this sentence is here because it once did
+> not.** A scan threads a carry and emits a value per step, so it produces the
+> final carry *and* the emissions stacked along the scanned axis — what
+> `lax.scan` and every other scan in the field produce. The reference
+> implementation's op registry declared one result while its interpreter
+> returned two, and nothing noticed until a synthesized LSTM used both: the same
+> graph then ran correctly and failed verification. An op's arity is exactly the
+> kind of thing two halves of one implementation can disagree about silently,
+> which is the argument for writing the families down and executing them.
+>
+> `core.map` has one result: it does not thread a carry, so there is nothing
+> else to return.
+
 **`omni.core` is frozen for the life of OMNI/1.x.** Everything else, including
 `omni.nn`, can be versioned, deprecated, or replaced without touching the spec.
 An architecture is therefore a *dialect + weights*, and a new architecture in
@@ -225,7 +238,7 @@ plausible `omni.nn` covers everything. Sketches:
 | CNN | `nn.conv`, `nn.pool`, `nn.norm` |
 | Diffusion / flow matching | The denoiser is a `Model`; the **sampler is a graph**: `core.while` over timesteps with a schedule tensor. Multi-model bundle (§01.7) holds text encoder + denoiser + VAE + scheduler graph |
 | RNN / LSTM / GRU | `core.scan` with `state` |
-| GNN | `tensor.scatter`/`gather` over edge index tensors; ragged types |
+| GNN | `tensor.gather` over edge index tensors; aggregation is **not** `scatter` — see below; ragged types |
 | Speech / audio | streaming `stream` types, `nn.conv1d_causal`, chunked `scan` |
 | Video | temporal axis in shapes; `scan` over frames; state for caches |
 | RL policies | ordinary graph + `omni.io` observation/action typing; value and policy heads as separate functions in one module |
@@ -245,6 +258,18 @@ plausible `omni.nn` covers everything. Sketches:
 > **refuses it by name** rather than picking a reading — an implementation that
 > guessed would then be checking its guess against itself. Defining it is
 > outstanding specification work, not outstanding implementation work.
+>
+> **Known gap: `tensor.scatter` cannot aggregate.** Synthesizing the GNN row
+> surfaced this one. `scatter` is defined element for element — index *k* of the
+> updates goes to position *k* with the scattered axis replaced — so when two
+> edges arrive at the same node, the second message overwrites the first and the
+> aggregation silently loses it. Message passing needs a scatter-*add*, and §07
+> defines no reduction on `scatter`; ONNX spells it `ScatterElements(reduction)`
+> and JAX spells it `segment_sum`, so the shape of the fix is not in doubt, only
+> its spelling. Until it is spelled, `gnn.mpnn` takes the incidence matrix as an
+> input and aggregates with `einsum`, which is the same arithmetic in an op that
+> exists — and is dense where the operation is sparse, which is the cost of the
+> gap.
 | **Unknown, 2040** | New dialect. Core unchanged. |
 
 The load-bearing claim is the last row, and it is supported by the fact that

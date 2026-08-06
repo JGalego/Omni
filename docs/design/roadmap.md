@@ -181,61 +181,56 @@ Jinja2 → OMNI-CT translation succeeds for ≥ 95 % of chat templates on a publ
 hub snapshot, with the failures analyzed and published. *If OMNI-CT cannot cover
 95 %, the language grows or the fallback story changes.*
 
-**Gate 2 status.** Not met: the gate wants ten architecture families and this
-build synthesizes **four** — `transformer.decoder`, `transformer.encoder`,
-`cnn.classifier` and `mlp` — with a fifth, Mamba/SSM, blocked on a specification
-gap rather than on code (see `ssm_scan` below). OMNI-IR parses, verifies, prints
-and rewrites; `omni.core` is frozen and
+**Gate 2 status.** Not met, and closer than it was: the gate wants ten
+architecture families and this build now synthesizes **ten** —
+`transformer.decoder`, `transformer.encoder`, `transformer.moe`,
+`cnn.classifier`, `mlp`, `rnn.lstm`, `rnn.gru`, `gnn.mpnn`, `rl.actor_critic`
+and `audio.encoder` — with Mamba/SSM still blocked on a specification gap rather
+than on code (see `ssm_scan` below). That is the *count* the gate names; what it
+also asks for is outputs matching the source framework within a declared
+tolerance, and there is no source framework here to compare against, so the
+count is met and the comparison is not.
+
+OMNI-IR parses, verifies, prints and rewrites; `omni.core` is frozen and
 `omni.tensor`/`omni.nn`/`omni.quant`/`omni.io` are defined with per-op versions;
 `graph synthesize` builds a graph from `arch.params` and `graph lower` applies
-the shipped lowerings. The tokenizer IR and OMNI-CT run
-their own conformance vectors. The WASM host of §11.6 exists and runs plugin
-expression ops under the restricted profile. **A reference interpreter now exists**
-(`omni graph run`): all of `omni.core` including its control flow, all 31
-`omni.tensor` ops with a general `einsum`, `omni.quant`'s four, and all of
-`omni.nn` except one. The exception is `ssm_scan`, which is refused because §07
-names it without defining it — the operand roles and the discretization rule are
-unstated, and different readings give different numbers — so the gap is recorded
-in §07.8 as specification work rather than papered over with a guess.
+the shipped lowerings. The tokenizer IR and OMNI-CT run their own conformance
+vectors. The WASM host of §11.6 exists and runs plugin expression ops under the
+restricted profile. A reference interpreter (`omni graph run`) executes all of
+`omni.core` including its control flow, all 31 `omni.tensor` ops with a general
+`einsum`, `omni.quant`'s four, and all of `omni.nn` except `ssm_scan`, which is
+refused because §07 names it without defining it — the operand roles and the
+discretization rule are unstated, and different readings give different numbers.
 
-The encoder is the same synthesizer as the decoder with one flag, which is the
-honest way to have both: the difference between them is not shape, it is
-*meaning*, and a copy would drift. The check that keeps it honest is in the
-interpreter rather than the verifier — an encoder's output at position 0 must
-move when a later token changes, and an encoder that emitted `causal: true` by
-accident would verify, run, produce finite numbers, and pass every other
-assertion in the file.
+**Every family is executed, not merely emitted**, and each is checked against a
+property of *that* architecture rather than against "it produced numbers": the
+encoder's position 0 must move when a later token changes and the decoder's must
+not; the mixture's output must change when only the router changes; the
+recurrence's first step must not see the last input and its last step must;
+the graph network's node must move when its neighbour's features move and must
+not when a non-neighbour's do; the causal audio encoder's earlier frames must not
+move when a later frame does. That discipline has now paid three times. It found
+the decoder attending across *heads* instead of positions while passing
+verification. It found `core.scan` declared with one result in the op registry
+and returning two in the interpreter — the same graph ran correctly and failed
+verification, and nothing had used both results until an LSTM did. And
+synthesizing the GNN row found that `tensor.scatter` cannot aggregate at all:
+it writes element for element, so two edges into one node lose a message. Both
+are now recorded in §07.
 
-Writing the interpreter paid for itself immediately, which is the argument for
-gates of this kind: **the synthesizer was emitting a graph that verified and computed the wrong
-thing.** It reshaped the projections to `[B·S, heads, head_dim]` and handed them
-to `attention`, whose last two axes are keys and head dimension — so the op was
-attending across the *heads of a single token* instead of across positions. Every
-shape agreed, every type checked, `graph --verify` reported no findings. Only
-running it and asking whether position 0's logits could be moved by a later token
-found it. Fixed, along with a `B == 1` constraint the graph had been missing:
-`reshape` takes static extents, so the only reshape the synthesizer can write
-collapses batch and sequence, and a batch of two would have attended across the
-boundary between sequences.
+**Jinja2 → OMNI-CT now converts 14 of the 15-template corpus**, up from 10. The
+three blockers §06.9 had recorded as gaps in itself — no loop variable, no slice
+form, two missing standard-library entries — are closed, each in the form the
+analysis named. The one still refused calls `raise_exception`, and it should be:
+a total language has no failure form. The measurement is still of this
+repository's corpus rather than of a hub snapshot.
 
-**Still not met:** three architecture families are synthesizable rather than ten
-— `transformer.decoder`, `cnn.classifier` and `mlp`, each of which CI *executes*
-rather than merely emits, because a graph nobody has run is how the decoder came
-to attend across heads instead of positions and verify while doing it. The
-tokenizer vectors are this repository's rather than 200 real ones. **A
-Jinja2 → OMNI-CT translator now exists** (`omni jinja`) and converts 10 of a
-15-template corpus of real model families — a percentage of that corpus and not
-of the hub, which the verb says out loud so the two are not confused. What it
-produced that is worth more than the percentage: three of its four blockers are
-gaps in §06.9 rather than in the templates, and each has a named fix (a loop
-variable, a slice form, two more standard-library entries). The fourth kind —
-`raise_exception`, `namespace`, `{% macro %}`, `strftime_now` — wants exactly the
-capabilities §06.9 exists to remove, and should keep being refused. §06.9 now
-records all of it.
-
-The coverage numbers in this gate are the point of it. Two of them now have
-values against local corpora and none against the public snapshots the gate
-actually names.
+**Still not met:** the ten families are executed against arithmetic done in the
+tests rather than against PyTorch, the tokenizer vectors are this repository's
+rather than 200 real ones, and the translation figure is a percentage of a
+15-template corpus and not of the public snapshot the gate names. All three of
+those need corpora and a second framework to run; none of them needs more code
+here.
 
 ## Phase 3 — Prove the distribution layer (months 12–18)
 
