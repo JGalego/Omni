@@ -301,6 +301,85 @@ pub struct TensorTable {
     pub groups: BTreeMap<String, Vec<String>>,
 }
 
+/// What checking a tensor against its declared `digest_materialized` found.
+///
+/// §04.7.6 is the reason this is four outcomes rather than a boolean: the field
+/// is "normative only over fully-deterministic subtrees", so an expression whose
+/// reduction order is unpinned can disagree with the publisher's digest without
+/// either of them being wrong. Reporting that as a failure would teach readers
+/// to ignore the check; reporting it as a pass would make the check a lie.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Materialized {
+    /// No digest declared: nothing to check, which is the common case.
+    NotDeclared,
+    Matched(Digest),
+    Mismatch {
+        want: Digest,
+        got: Digest,
+    },
+    /// The expression is not bit-reproducible (§04.7.6), so the digest is not
+    /// normative over it. The value is reported so a caller can still show it.
+    Indeterminate {
+        want: Digest,
+        got: Digest,
+    },
+    /// The expression could not be evaluated here at all.
+    Unevaluated(String),
+}
+
+impl TensorDesc {
+    /// The digest of this tensor's *evaluated* bytes: the values, encoded in the
+    /// declared dtype, dense and row-major.
+    ///
+    /// Dense and row-major rather than "as stored": the point of the field is to
+    /// let two implementations compare what they computed, and comparing what
+    /// they happened to store would compare their packing instead.
+    pub fn materialized_digest(
+        &self,
+        ctx: &Ctx<'_>,
+        hash: crate::container::HashAlgo,
+    ) -> Res<Digest> {
+        let t = self.value.eval(ctx)?;
+        let n = t.data.len() as u64;
+        let mut bytes = vec![0u8; self.dtype.packed_bytes(n) as usize];
+        for (i, v) in t.data.iter().enumerate() {
+            if !self
+                .dtype
+                .encode(&mut bytes, i as u64, *v, crate::dtype::Round::Rne)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{} cannot hold the value at index {i}",
+                    self.dtype.label()
+                )));
+            }
+        }
+        Ok(hash.digest(&bytes))
+    }
+
+    /// Checks this tensor against its own declared digest (§04.3's
+    /// `digest_materialized`).
+    pub fn check_materialized(
+        &self,
+        ctx: &Ctx<'_>,
+        hash: crate::container::HashAlgo,
+    ) -> Materialized {
+        let Some(want) = self.digest_materialized else {
+            return Materialized::NotDeclared;
+        };
+        let got = match self.materialized_digest(ctx, hash) {
+            Ok(d) => d,
+            Err(e) => return Materialized::Unevaluated(e.to_string()),
+        };
+        if got == want {
+            Materialized::Matched(got)
+        } else if !self.value.deterministic() {
+            Materialized::Indeterminate { want, got }
+        } else {
+            Materialized::Mismatch { want, got }
+        }
+    }
+}
+
 impl TensorTable {
     pub fn from_value(v: &Value) -> Res<TensorTable> {
         let t = v.get("t").and_then(|x| x.as_str());

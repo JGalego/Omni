@@ -581,6 +581,29 @@ jobs:
           grep -q 'calibration set' /tmp/conv4.txt
           test ! -f /tmp/no.omni
 
+      # §15's R-T08 is the only rule that cannot be decided from a file's
+      # framing, and the `numeric/` suite is what tests it: containers that are
+      # structurally perfect and can still be read wrong.
+      - name: A reader that gets the arithmetic wrong fails its own corpus
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          # Every numeric case verifies at the level that evaluates …
+          for f in conformance/numeric/*.omni; do
+            case "$f" in *materialized-digest-wrong*) continue;; esac
+            "$OMNI" verify "$f" --level 6 | tee /tmp/num.txt | tail -3
+            grep -q 'V6 arithmetic  ✓' /tmp/num.txt
+          done
+          # … and the one whose declared digest is a lie is invalid, by that
+          # rule, with the tensor named.
+          set +e
+          "$OMNI" verify conformance/numeric/materialized-digest-wrong.omni --level 6 \
+            > /tmp/numbad.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 1
+          grep -q 'R-T08' /tmp/numbad.txt
+          grep -q 'declares b3:5a5a5a5a' /tmp/numbad.txt
+
       # §08 + import: a PEFT LoRA is safetensors plus a config, and the thing OMNI
       # adds is that the base is pinned by digest rather than named by a string.
       - name: A PEFT LoRA imports as an adapter pinned to its base

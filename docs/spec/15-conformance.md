@@ -83,6 +83,14 @@ conformance violation.
 - R-T06 `approx` wraps every lossy subtree; no lossy codec on a non-cacheable,
   non-`approx` object.
 - R-T07 Declared `stats`, when present and checked, match recomputation.
+- R-T08 `digest_materialized`, when present, equals the digest of the tensor's
+  evaluated bytes — the values encoded in the declared dtype, dense and
+  row-major. Normative only over deterministic subtrees (§04.7.6): an unpinned
+  reduction order that disagrees is *indeterminate*, not invalid. This is the
+  only rule in the suite that cannot be decided from a file's framing, and the
+  `numeric/` cases exist because of it: a reader that unpacks `int4` in the
+  wrong nibble order or rounds `bf16` away from even produces a structurally
+  perfect container full of wrong numbers.
 
 ### Metadata and tokenizer (V5)
 

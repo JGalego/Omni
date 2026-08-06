@@ -215,6 +215,10 @@ fn manifest(cases: &[Case]) -> Value {
                             ("name", Value::text(c.name)),
                             ("expect", Value::text(c.expect.name())),
                             (
+                                "args",
+                                Value::Array(c.args.iter().map(|a| Value::text(*a)).collect()),
+                            ),
+                            (
                                 "rule",
                                 match c.rule {
                                     Some(r) => Value::text(r),
@@ -295,7 +299,12 @@ fn run(args: &[String]) -> u8 {
             fail += 1;
             continue;
         }
-        let out = match Command::new(imp).arg("verify").arg(&path).output() {
+        let out = match Command::new(imp)
+            .arg("verify")
+            .arg(&path)
+            .args(c.args)
+            .output()
+        {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("omni-conformance: cannot run `{imp}`: {e}");

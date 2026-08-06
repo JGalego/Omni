@@ -44,6 +44,14 @@ pub struct Case {
     /// The normative rule this case exercises, where one applies.
     pub rule: Option<&'static str>,
     pub why: &'static str,
+    /// Extra arguments the runner passes to the implementation for this case.
+    ///
+    /// Empty for every structural case, because a file that is malformed is
+    /// malformed at any depth. The `numeric/` suite is the exception: its
+    /// cases are structurally perfect and wrong only in their *values*, so
+    /// they ask for the validation level that evaluates. An implementation
+    /// whose default already evaluates may ignore the argument.
+    pub args: &'static [&'static str],
     pub bytes: Vec<u8>,
 }
 
@@ -115,6 +123,13 @@ fn case(
         expect,
         rule,
         why,
+        // The `numeric/` suite cannot be judged from the framing, so it is run
+        // at the level that evaluates. Everything else is judged from the bytes.
+        args: if category == "numeric" {
+            &["--level", "6"]
+        } else {
+            &[]
+        },
         bytes,
     }
 }
@@ -126,7 +141,267 @@ pub fn corpus() -> Vec<Case> {
     out.extend(invalid_framing());
     out.extend(invalid_encoding());
     out.extend(forward());
+    out.extend(numeric());
     out
+}
+
+// ---------------------------------------------------------------- numeric --
+
+/// `numeric/` — cases whose point is arithmetic rather than framing.
+///
+/// Every other suite can be judged from the bytes alone: a file is well-formed
+/// or it is not. These cannot. A reader that unpacks an `int4` in the wrong
+/// nibble order, rounds `bf16` away from even, or reads an MX block's scale as
+/// a float instead of an exponent produces a *valid container* full of wrong
+/// numbers, and no amount of structural checking notices.
+///
+/// So each case carries the publisher's own digest of what its tensors
+/// evaluate to (§04.3's `digest_materialized`), over subtrees that §04.7.6
+/// makes normative — no reductions, no plugins, nothing whose order is a
+/// choice. An implementation that computes something else fails its own file,
+/// which is the only way a corpus can test arithmetic through an exit code.
+fn numeric() -> Vec<Case> {
+    let mut out = Vec::new();
+    let hash = HashAlgo::Blake3_256;
+
+    // (name, dtype, values, why) — the values are chosen so that a wrong
+    // reading is a *different* number rather than a slightly different one.
+    let cases: Vec<(&'static str, DType, Vec<f64>, &'static str)> = vec![
+        (
+            "f32-f16-bf16",
+            DType::BF16,
+            vec![1.0, -2.5, 3.4028235e38, 1.0e-8, 0.0, -0.0],
+            "bf16 keeps f32's exponent range and eight bits of its mantissa; a \
+             reader that rounds through f16 loses the large value to infinity \
+             and the small one to zero",
+        ),
+        (
+            "round-half-to-even",
+            DType::F16,
+            // Exactly halfway between two f16 values, in both directions.
+            vec![2049.0, 2051.0, 2053.0, -2049.0],
+            "§04.3 says round-nearest-ties-to-even, and every one of these is a \
+             tie: rounding half away from zero gives four different numbers",
+        ),
+        (
+            "f16-subnormals",
+            DType::F16,
+            vec![6.0e-8, 5.96e-8, 1.0e-7, -6.0e-8],
+            "the subnormal range below 2⁻¹⁴, where flush-to-zero is a common \
+             shortcut and a detectable one",
+        ),
+        (
+            "f8e4m3-saturation",
+            DType::F8E4M3,
+            vec![448.0, 500.0, -448.0, 0.001953125],
+            "f8e4m3 has no infinity: §04.3 saturates to ±448 rather than \
+             producing a NaN, and the two readings differ on every overflow",
+        ),
+        (
+            "int4-packing",
+            DType::I4,
+            (0..16).map(|i| (i as f64) - 8.0).collect(),
+            "two signed 4-bit values per byte, low nibble first (§04.4): a \
+             reader that swaps them reads the tensor transposed within every \
+             byte",
+        ),
+        (
+            "e8m0-exponents",
+            DType::E8M0,
+            vec![1.0, 2.0, 0.5, 256.0, 0.00390625],
+            "the MX scale type is a bare power-of-two exponent (§05.2.8), not a \
+             float: read as one, every scale is wrong by orders of magnitude",
+        ),
+    ];
+
+    for (name, dtype, values, why) in cases {
+        let n = values.len() as u64;
+        let mut data = vec![0u8; dtype.packed_bytes(n) as usize];
+        for (i, v) in values.iter().enumerate() {
+            dtype.encode(&mut data, i as u64, *v, omni_core::dtype::Round::Rne);
+        }
+        // The digest is of the *encoded* bytes, which is what a reader that
+        // evaluated the expression and re-encoded it in the declared dtype
+        // must arrive at.
+        let want = hash.digest(&data);
+        let (objs, _) = ModelBuilder::new("omni/conformance/numeric")
+            .hash(hash)
+            .chunk_size(256)
+            .tensor(TensorSpec {
+                name: "values".into(),
+                shape: vec![n],
+                dtype: dtype.clone(),
+                axes: None,
+                semantic: "",
+                data: data.clone(),
+                layout: None,
+            })
+            .build();
+        // The declared digest goes onto the descriptor after the fact: the
+        // builder writes tensors, and this is the publisher's claim about what
+        // reading one produces.
+        let (objs, root) = with_materialized_digest(objs, hash, want);
+        let bytes = pack(
+            &objs,
+            &root,
+            &PackOptions {
+                hash,
+                log2_align: 12,
+                creator: "omni-conformance".into(),
+                reproducible: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        out.push(case(
+            "numeric",
+            name,
+            Expect::Accept,
+            Some("R-T08"),
+            why,
+            bytes,
+        ));
+    }
+
+    // And the negative: the same mechanism, with a digest that does not match
+    // what the tensor evaluates to. A reader that ignores the field passes this
+    // file and should not.
+    let dtype = DType::F32;
+    let data: Vec<u8> = (0..16u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let (objs, _) = ModelBuilder::new("omni/conformance/numeric")
+        .hash(hash)
+        .chunk_size(256)
+        .tensor(TensorSpec {
+            name: "values".into(),
+            shape: vec![16],
+            dtype,
+            axes: None,
+            semantic: "",
+            data,
+            layout: None,
+        })
+        .build();
+    let (objs, root) = with_materialized_digest(objs, hash, [0x5au8; 32]);
+    let bytes = pack(
+        &objs,
+        &root,
+        &PackOptions {
+            hash,
+            log2_align: 12,
+            creator: "omni-conformance".into(),
+            reproducible: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    out.push(case(
+        "numeric",
+        "materialized-digest-wrong",
+        Expect::Reject,
+        Some("R-T08"),
+        "the tensor declares a `digest_materialized` its own values do not \
+         produce. The container is structurally perfect, so this is the one \
+         case in the corpus that can only be caught by *evaluating*",
+        bytes,
+    ));
+    out
+}
+
+/// Rewrites every `TensorDesc` in a just-built graph to declare `digest`, and
+/// fixes up every object that pointed at one.
+///
+/// The builder does not take the field because a publisher computes it *after*
+/// deciding what the tensor is, which is the order this does it in — and
+/// changing a content-addressed object means every ref to it moves, so the
+/// table, the model and the manifest are rewritten in turn until nothing
+/// changes. Doing it by digest substitution rather than by rebuilding each
+/// object type is what keeps this honest: nothing here needs to know which
+/// fields hold refs.
+fn with_materialized_digest(
+    objs: Vec<Object>,
+    hash: HashAlgo,
+    digest: Digest,
+) -> (Vec<Object>, Digest) {
+    let mut map: Vec<(Digest, Digest)> = Vec::new();
+    let mut out: Vec<Object> = objs
+        .into_iter()
+        .map(|o| {
+            if o.otype != otype::TENSOR_DESC {
+                return o;
+            }
+            let before = o.digest(hash);
+            let mut v = omni_core::cbor::decode(&o.payload).expect("a just-built descriptor");
+            if let Value::Map(pairs) = &mut v {
+                pairs.retain(|(k, _)| k.as_str() != Some("digest_materialized"));
+                pairs.push((
+                    Value::text("digest_materialized"),
+                    Value::Bytes(digest.to_vec()),
+                ));
+                pairs.sort_by(|a, b| a.0.encode().cmp(&b.0.encode()));
+            }
+            let after = Object::structure(otype::TENSOR_DESC, &v);
+            map.push((before, after.digest(hash)));
+            after
+        })
+        .collect();
+
+    // Propagate: every object that named a moved digest moves too. The graph is
+    // four deep (desc → table → model → manifest), and the loop runs until a
+    // pass changes nothing rather than a fixed number of times.
+    while !map.is_empty() {
+        let mut next_map: Vec<(Digest, Digest)> = Vec::new();
+        for o in out.iter_mut() {
+            if o.otype == otype::BLOB {
+                continue;
+            }
+            let Ok(mut v) = omni_core::cbor::decode(&o.payload) else {
+                continue;
+            };
+            if substitute_refs(&mut v, &map) {
+                let before = o.digest(hash);
+                *o = Object::structure(o.otype, &v);
+                next_map.push((before, o.digest(hash)));
+            }
+        }
+        map = next_map;
+    }
+    let root = out
+        .iter()
+        .find(|o| o.otype == otype::MANIFEST)
+        .expect("a manifest")
+        .digest(hash);
+    (out, root)
+}
+
+/// Replaces any 32-byte digest in a value with its replacement.
+fn substitute_refs(v: &mut Value, map: &[(Digest, Digest)]) -> bool {
+    match v {
+        Value::Bytes(b) if b.len() == 32 => {
+            for (from, to) in map {
+                if b.as_slice() == from.as_slice() {
+                    *b = to.to_vec();
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(xs) => {
+            let mut any = false;
+            for x in xs {
+                any |= substitute_refs(x, map);
+            }
+            any
+        }
+        Value::Map(pairs) => {
+            let mut any = false;
+            for (_, x) in pairs {
+                any |= substitute_refs(x, map);
+            }
+            any
+        }
+        Value::Tag(_, inner) => substitute_refs(inner, map),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------- valid/minimal --
@@ -592,6 +867,7 @@ fn invalid_encoding() -> Vec<Case> {
                 // Rule IDs are `&'static str` in the spec; these are too.
                 rule: Some(rule),
                 why,
+                args: &[],
                 bytes: container_with_raw_root(payload.clone()),
             }
         })
@@ -735,6 +1011,62 @@ fn forward() -> Vec<Case> {
 
 /// Sanity-checks the corpus against this implementation's own reader, so a
 /// generator bug cannot ship a case that does not test what it claims.
+/// Whether every tensor that declares `digest_materialized` produces it.
+///
+/// Deterministic subtrees only, which is §04.7.6's own condition: an unpinned
+/// reduction order may legitimately differ, and treating that as invalid would
+/// make the field unusable on exactly the models it matters for.
+fn materialized_ok(c: &Container) -> bool {
+    use omni_core::tensor::{Materialized, TensorDesc, TensorTable};
+    struct Borrowed<'a>(&'a Container);
+    impl omni_core::store::Store for Borrowed<'_> {
+        fn hash(&self) -> HashAlgo {
+            self.0.header.hash
+        }
+        fn resolve(&self, d: &Digest) -> Result<Option<Vec<u8>>, omni_core::store::Error> {
+            match self.0.read(d) {
+                Ok(b) => Ok(Some(b)),
+                Err(omni_core::container::Error::NotFound(_)) => Ok(None),
+                Err(e) => Err(omni_core::store::Error::Corrupt(e.to_string())),
+            }
+        }
+    }
+    let store = Borrowed(c);
+    let ctx = omni_core::expr::Ctx::new(&store);
+    let Ok(manifest) = c.root() else { return true };
+    let Some(model) = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(|r| omni_core::expr::parse_ref_value(r).ok())
+    else {
+        return true;
+    };
+    let Ok(mv) = ctx.value(&model.1) else {
+        return true;
+    };
+    let Some(tref) = mv
+        .get("tensors")
+        .and_then(|r| omni_core::expr::parse_ref_value(r).ok())
+    else {
+        return true;
+    };
+    let Ok(table) = TensorTable::load(&ctx, &tref) else {
+        return true;
+    };
+    for r in table.tensors.values() {
+        let Ok(desc) = TensorDesc::load(&ctx, r) else {
+            continue;
+        };
+        if matches!(
+            desc.check_materialized(&ctx, c.header.hash),
+            Materialized::Mismatch { .. }
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn self_check(cases: &[Case]) -> Vec<String> {
     let mut problems = Vec::new();
     for c in cases {
@@ -748,6 +1080,12 @@ pub fn self_check(cases: &[Case]) -> Vec<String> {
                 // on them. The self-check has to agree with the CLI, or it
                 // would bless cases no implementation actually passes.
                 Ok(r) if !r.padding_ok || !r.alignment_ok => Expect::Reject,
+                // The `numeric/` suite is the one that cannot be judged from
+                // the framing, so the self-check evaluates too: a tensor that
+                // does not produce the digest it declares makes the file
+                // invalid (§04.3), and a reader that skips the field would
+                // otherwise bless a container full of wrong numbers.
+                Ok(_) if !materialized_ok(container) => Expect::Reject,
                 Ok(_) => Expect::Accept,
             },
         };

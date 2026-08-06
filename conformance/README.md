@@ -78,5 +78,16 @@ because one part of it is from the future.
 | `future-container-minor` | degrade | R-V01 | Minor versions are additive; a reader must not refuse a file for having a higher one. |
 | `unknown-segment-kind` | degrade | R-C05 | Segment framing carries its own length so unknown kinds can be skipped. |
 | `unknown-required-feature` | degrade | R-V02 | An unsupported required feature blocks execution, not inspection: indeterminate, not invalid. |
+## `numeric`
 
-39 cases in this suite.
+| Case | Expect | Rule | Why |
+|---|---|---|---|
+| `f32-f16-bf16` | accept | R-T08 | bf16 keeps f32's exponent range and eight bits of its mantissa; a reader that rounds through f16 loses the large value to infinity and the small one to zero |
+| `round-half-to-even` | accept | R-T08 | §04.3 says round-nearest-ties-to-even, and every one of these is a tie: rounding half away from zero gives four different numbers |
+| `f16-subnormals` | accept | R-T08 | the subnormal range below 2⁻¹⁴, where flush-to-zero is a common shortcut and a detectable one |
+| `f8e4m3-saturation` | accept | R-T08 | f8e4m3 has no infinity: §04.3 saturates to ±448 rather than producing a NaN, and the two readings differ on every overflow |
+| `int4-packing` | accept | R-T08 | two signed 4-bit values per byte, low nibble first (§04.4): a reader that swaps them reads the tensor transposed within every byte |
+| `e8m0-exponents` | accept | R-T08 | the MX scale type is a bare power-of-two exponent (§05.2.8), not a float: read as one, every scale is wrong by orders of magnitude |
+| `materialized-digest-wrong` | reject | R-T08 | the tensor declares a `digest_materialized` its own values do not produce. The container is structurally perfect, so this is the one case in the corpus that can only be caught by *evaluating* |
+
+46 cases in this suite.

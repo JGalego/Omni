@@ -1434,6 +1434,66 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
             "V6 derived     {} {checked} derived object(s) recomputed, {wrong} mismatched",
             if wrong > 0 { "✗" } else { "✓" }
         );
+
+        // §04.3's `digest_materialized`: the publisher's own digest of what an
+        // expression evaluates to. It is the only field in the format that lets
+        // two implementations find out they disagree about arithmetic, and it
+        // is normative only over deterministic subtrees (§04.7.6) — so an
+        // unpinned reduction that differs is *indeterminate* rather than wrong,
+        // and saying which is the whole value of the field.
+        if let Ok(table) = tensor_table(c) {
+            let store = Borrowed(c);
+            let ctx = Ctx::new(&store);
+            let (mut declared, mut agreed, mut diverged, mut unpinned) = (0, 0, 0, 0);
+            let mut first: Option<String> = None;
+            for (name, r) in &table.tensors {
+                let Ok(desc) = TensorDesc::load(&ctx, r) else {
+                    continue;
+                };
+                match desc.check_materialized(&ctx, c.header.hash) {
+                    omni_core::tensor::Materialized::NotDeclared => {}
+                    omni_core::tensor::Materialized::Matched(_) => {
+                        declared += 1;
+                        agreed += 1;
+                    }
+                    omni_core::tensor::Materialized::Mismatch { want, got } => {
+                        declared += 1;
+                        diverged += 1;
+                        first.get_or_insert(format!(
+                            "{name}: declares {}, evaluates to {}",
+                            short(c.header.hash, &want),
+                            short(c.header.hash, &got)
+                        ));
+                    }
+                    omni_core::tensor::Materialized::Indeterminate { .. } => {
+                        declared += 1;
+                        unpinned += 1;
+                    }
+                    omni_core::tensor::Materialized::Unevaluated(e) => {
+                        declared += 1;
+                        unpinned += 1;
+                        first.get_or_insert(format!("{name}: {e}"));
+                    }
+                }
+            }
+            if declared > 0 {
+                invalid += diverged;
+                indeterminate += unpinned;
+                pr!(
+                    "V6 arithmetic  {} {agreed}/{declared} tensor(s) evaluate to the digest they \
+declare{} (R-T08)",
+                    if diverged > 0 { "✗" } else { "✓" },
+                    if unpinned > 0 {
+                        format!(", {unpinned} not normative (§04.7.6: an unpinned reduction order)")
+                    } else {
+                        String::new()
+                    }
+                );
+                if let Some(f) = first {
+                    pr!("     {f}");
+                }
+            }
+        }
     }
 
     // --reproducible: §09.3's promise is narrow, and this is where the narrowness

@@ -254,6 +254,13 @@ implemented:
   be a half and `0.1` a double; and D7 is "registered tags only" rather than "no
   tags", so refusing every tag refuses a valid container, because §04.3's exact
   rationals are one
+- **A conformance suite that tests arithmetic**, not only framing. `numeric/`
+  is seven containers that are structurally perfect and can still be read
+  wrong: bf16's exponent range, ties-to-even at the f16 boundary, f16
+  subnormals, f8e4m3's saturation where an infinity would be, int4's nibble
+  order, e8m0's bare exponents — each carrying the publisher's own digest of
+  what its tensor evaluates to (§04.3), and one whose declared digest is a lie,
+  which a reader that ignores the field will pass and should not
 - **A Jinja2 → OMNI-CT translator** (`omni jinja`), because §06.9 replaces an
   executed Jinja string with a total language and whether that trade is
   affordable is an empirical question. It converts 14 of a 15-template corpus of
