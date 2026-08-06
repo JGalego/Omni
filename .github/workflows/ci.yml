@@ -569,7 +569,40 @@ jobs:
           set -e
           test "$rc" != 0
           grep -qi 'R-A01\|not present\|unmatched\|matched no' /tmp/wrong.txt
-          echo "a PEFT LoRA imports, attaches to its own base, and refuses another"
+
+          # And back out again: an adapter that can only be read is half a
+          # format. The factors have to come back byte for byte under the names
+          # PEFT uses, prefix included.
+          "$OMNI" export peft /tmp/lora.omni -o /tmp/lora-back | tee /tmp/peftx.txt
+          grep -q 'targets      q_proj, v_proj' /tmp/peftx.txt
+          python3 - <<'PY_RT'
+          import json, struct
+          def load(p):
+              raw = open(p, "rb").read()
+              n = struct.unpack("<Q", raw[:8])[0]
+              head = json.loads(raw[8:8 + n]); base = 8 + n
+              return {k: raw[base + v["data_offsets"][0]:base + v["data_offsets"][1]]
+                      for k, v in head.items() if k != "__metadata__"}
+          a = load("/tmp/lora/adapter_model.safetensors")
+          b = load("/tmp/lora-back/adapter_model.safetensors")
+          assert set(a) == set(b), f"names differ: {sorted(set(a) ^ set(b))}"
+          bad = [k for k in a if a[k] != b[k]]
+          assert not bad, f"{len(bad)} factor(s) differ: {bad[:3]}"
+          cfg = json.load(open("/tmp/lora-back/adapter_config.json"))
+          assert cfg["peft_type"] == "LORA", cfg
+          assert cfg["target_modules"] == ["q_proj", "v_proj"], cfg
+          # The guarantee OMNI adds over PEFT is the digest, and it survives the
+          # trip out rather than being dropped at the boundary.
+          assert len(cfg["omni_base_digest"]) == 64, cfg
+          print(f"{len(a)} LoRA factors round-tripped byte for byte")
+          PY_RT
+
+          # The exported adapter re-imports and still attaches to the same base.
+          "$OMNI" import peft /tmp/lora-back --base /tmp/lora-base.omni \
+            -o /tmp/lora-again.omni > /dev/null
+          "$OMNI" adapter check /tmp/lora-base.omni /tmp/lora-again.omni \
+            | grep -q attachable
+          echo "a PEFT LoRA imports, attaches, refuses another, and comes back out"
 
       # §13.5: the OCI mapping. The argument for it is parasitic adoption —
       # registries, mirrors, CDNs and signing already exist — so the layout has

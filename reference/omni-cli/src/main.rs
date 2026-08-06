@@ -134,6 +134,10 @@ VERBS:
                               expression per layer (§05.2.2, §05.2.3): the words
                               go in unchanged, and every layer is dequantized and
                               compared against the source before it is claimed
+    export  peft <adapter.omni> -o <dir>
+                              Write a LoRA back out as adapter_config.json plus
+                              adapter_model.safetensors, keeping the base digest
+                              §08.1 pinned it with
     export  gptq|awq <in.omni> -o <dir>
                               Write a packed checkpoint back out. Byte-exact for
                               a container imported from one: the words were never
@@ -4445,6 +4449,68 @@ fn single_safetensors(dir: &std::path::Path) -> std::io::Result<Option<std::path
     Ok(if found.len() == 1 { found.pop() } else { None })
 }
 
+/// `omni export peft` — write an adapter container back out as a PEFT LoRA.
+///
+/// The config is rebuilt from the `Adapter` object: the rank and alpha are its
+/// own fields and the target modules come from the attach globs. The base's
+/// *name* comes from `parents[]`, which is where the import put it — because a
+/// name is not an identity, and §08.1's digest goes out beside it rather than
+/// being dropped.
+fn cmd_export_peft(args: &[String], input: &str) -> R {
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        prr!("omni: export peft needs -o <dir>\n");
+        return Ok(2);
+    };
+    let c = Container::open(std::fs::read(input)?)?;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let Some(adapter) = adapter_of(&c)? else {
+        prr!("omni: {input} carries no Adapter object; there is no LoRA to write\n");
+        return Ok(3);
+    };
+    // The name PEFT wants, from where the import recorded it.
+    let manifest = c.root()?;
+    let base_name = omni_core::delta::parents(&manifest)
+        .ok()
+        .into_iter()
+        .flatten()
+        .find(|p| p.role == "base")
+        .and_then(|p| p.name);
+
+    let ex = omni_core::peft::export(&ctx, &adapter, base_name.as_deref())?;
+    let dir = std::path::Path::new(out);
+    std::fs::create_dir_all(dir)?;
+    let w = dir.join("adapter_model.safetensors");
+    let cfg = dir.join("adapter_config.json");
+    std::fs::write(&w, &ex.weights)?;
+    std::fs::write(&cfg, &ex.config)?;
+
+    pr!("exported {input} -> {out}");
+    pr!("  factors      {} tensor(s)", commas(ex.factors as u64));
+    pr!("  targets      {}", ex.targets.join(", "));
+    pr!(
+        "  base         {}  {}",
+        short(c.header.hash, &adapter.base.1),
+        match &base_name {
+            Some(n) => format!("named `{n}` by PEFT"),
+            None => "unnamed: the container recorded no name for it".into(),
+        }
+    );
+    pr!(
+        "  wrote        {}  {}",
+        w.display(),
+        human(ex.weights.len() as u64)
+    );
+    pr!("  wrote        {}", cfg.display());
+    // The digest is the guarantee OMNI added over PEFT, so it travels rather
+    // than being silently dropped at the boundary.
+    pr!(
+        "  kept         `omni_base_digest` in the config: PEFT names its base, \
+         OMNI pins it"
+    );
+    Ok(0)
+}
+
 /// `omni export gptq|awq` — write a container back out as a packed checkpoint.
 ///
 /// Byte-exact for a container that was imported from one, and that is structural
@@ -4516,10 +4582,14 @@ fn cmd_export(args: &[String]) -> R {
     if let Some(method) = omni_core::hfquant::Method::parse(format) {
         return cmd_export_hfquant(args, input, method);
     }
+    if format == "peft" {
+        return cmd_export_peft(args, input);
+    }
     if format != "safetensors" {
         prr!(
             "omni: no exporter for `{format}`. This build exports safetensors, \
-             gptq and awq; `docs/design/import-export.md` §5.2 lists the others\n"
+             gptq, awq and peft; `docs/design/import-export.md` §5.2 lists the \
+             others\n"
         );
         return Ok(2);
     }

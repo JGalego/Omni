@@ -764,6 +764,228 @@ fn base_table(c: &Container) -> Res<TensorTable> {
         .map_err(|e| Error::Core(e.to_string()))
 }
 
+// ---------------------------------------------------------------------- export --
+
+/// What a PEFT export produced.
+pub struct Exported {
+    pub weights: Vec<u8>,
+    pub config: Vec<u8>,
+    pub factors: usize,
+    /// Target module suffixes recovered from the attach rules.
+    pub targets: Vec<String>,
+}
+
+impl std::fmt::Debug for Exported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Exported {{ {} bytes, {} factor tensor(s), targets {:?} }}",
+            self.weights.len(),
+            self.factors,
+            self.targets
+        )
+    }
+}
+
+/// Writes an adapter container back out as a PEFT LoRA.
+///
+/// The two files PEFT wants are `adapter_config.json` and
+/// `adapter_model.safetensors`, and both are reconstructed from the `Adapter`
+/// object and its tensor table rather than from anything remembered: the rank and
+/// alpha are the adapter's own fields, and the target modules come from the attach
+/// rules' globs. What cannot be reconstructed is named rather than guessed.
+///
+/// The tensor names get PEFT's `base_model.model.` prefix put back, which is the
+/// exact inverse of what the import stripped.
+pub fn export(
+    ctx: &Ctx<'_>,
+    adapter: &crate::adapter::Adapter,
+    base_name: Option<&str>,
+) -> Res<Exported> {
+    use crate::adapter::Method as AdapterMethod;
+    if adapter.method != AdapterMethod::Lora {
+        return Err(Error::Unsupported(format!(
+            "this adapter is `{}`; PEFT's `adapter_model.safetensors` holds \
+             `lora_A`/`lora_B` factor pairs and has no form for another method",
+            adapter.method.name()
+        )));
+    }
+    let rank = adapter.rank.ok_or_else(|| {
+        Error::Malformed("the adapter declares no rank, and PEFT's `r` is required".into())
+    })?;
+    let alpha = adapter.alpha.unwrap_or(rank as f64);
+
+    let table = TensorTable::load(ctx, &adapter.tensors).map_err(|e| Error::Core(e.to_string()))?;
+    let names: Vec<&String> = if table.order.len() == table.tensors.len() {
+        table.order.iter().collect()
+    } else {
+        table.tensors.keys().collect()
+    };
+    let mut entries: Vec<(String, crate::dtype::DType, Vec<u64>, Vec<u8>)> = Vec::new();
+    for name in names {
+        let r = table
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Core(format!("`{name}` is in the order and not the table")))?;
+        let desc = TensorDesc::load(ctx, r).map_err(|e| Error::Core(e.to_string()))?;
+        let Expr::Literal { chunks, dtype, .. } = &desc.value else {
+            return Err(Error::Unsupported(format!(
+                "`{name}` is a `{}` expression; PEFT holds materialized factors, so \
+                 a derived one would have to be evaluated into bytes the source \
+                 never had",
+                desc.value.op()
+            )));
+        };
+        let shape = desc
+            .sizes()
+            .ok_or_else(|| Error::Core(format!("`{name}` has a symbolic shape")))?;
+        let bytes = ctx
+            .chunk_bytes(chunks)
+            .map_err(|e| Error::Core(e.to_string()))?;
+        entries.push((format!("{PREFIX}{name}"), dtype.clone(), shape, bytes));
+    }
+    if entries.is_empty() {
+        return Err(Error::Malformed(
+            "the adapter's tensor table is empty; there are no factors to write".into(),
+        ));
+    }
+
+    // The target modules, recovered from the attach globs. The import wrote
+    // `**.<target>.weight`, so this is the inverse — and a glob that does not
+    // have that shape is reported rather than turned into a plausible name.
+    let mut targets: Vec<String> = Vec::new();
+    for a in &adapter.attach {
+        {
+            let crate::adapter::Select::Glob(g) = &a.select else {
+                continue;
+            };
+            let core = g
+                .strip_prefix("**.")
+                .and_then(|r| r.strip_suffix(".weight"))
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "the attach rule selects `{g}`, and PEFT's `target_modules` \
+                         is a list of module suffixes — this glob is not one, so \
+                         writing it as a suffix would change which modules the \
+                         adapter claims"
+                    ))
+                })?;
+            if !targets.iter().any(|t| t == core) {
+                targets.push(core.to_string());
+            }
+        }
+    }
+    targets.sort();
+
+    let weights = write_safetensors(&entries)?;
+    let config = write_config(rank, alpha, adapter.dropout, &targets, adapter, base_name);
+    Ok(Exported {
+        weights,
+        config,
+        factors: entries.len(),
+        targets,
+    })
+}
+
+fn write_config(
+    rank: u64,
+    alpha: f64,
+    dropout: Option<f64>,
+    targets: &[String],
+    adapter: &crate::adapter::Adapter,
+    base_name: Option<&str>,
+) -> Vec<u8> {
+    use crate::json;
+    let mut p = vec![
+        ("peft_type", json::string("LORA")),
+        ("r", json::Value::U(rank)),
+        (
+            "lora_alpha",
+            if alpha.fract() == 0.0 && alpha >= 0.0 {
+                json::Value::U(alpha as u64)
+            } else {
+                json::Value::F(alpha)
+            },
+        ),
+        (
+            "target_modules",
+            json::Value::Array(targets.iter().map(|t| json::string(t.clone())).collect()),
+        ),
+        // Written explicitly rather than left out: PEFT's defaults for these are
+        // what make an adapter mean what it means, and a config that omits them
+        // is one a future PEFT could reinterpret.
+        ("bias", json::string("none")),
+        ("fan_in_fan_out", json::Value::Bool(false)),
+        ("use_dora", json::Value::Bool(false)),
+        ("use_rslora", json::Value::Bool(false)),
+    ];
+    p.push((
+        "lora_dropout",
+        match dropout {
+            Some(d) => json::Value::F(d),
+            None => json::Value::F(0.0),
+        },
+    ));
+    // §08.1 pins the base by digest. PEFT's field is a *name*, so the digest goes
+    // in as a comment-shaped key rather than being dropped: it is the guarantee
+    // OMNI added, and losing it silently would undo the one thing the import
+    // insisted on.
+    // §08.1 pins the base by digest and PEFT's field is a *name*, so the name is
+    // whatever the container's `parents[]` recorded — which is where the import
+    // put it, precisely because a name is not an identity.
+    p.push((
+        "base_model_name_or_path",
+        match base_name {
+            Some(n) => json::string(n.to_string()),
+            None => json::Value::Null,
+        },
+    ));
+    p.push((
+        "omni_base_digest",
+        json::string(crate::sha256::hex(&adapter.base.1)),
+    ));
+    json::object(p).encode().into_bytes()
+}
+
+fn write_safetensors(entries: &[(String, crate::dtype::DType, Vec<u64>, Vec<u8>)]) -> Res<Vec<u8>> {
+    use crate::json;
+    let mut header = Vec::new();
+    let mut at = 0u64;
+    for (name, dtype, shape, bytes) in entries {
+        let st = safetensors::name_of(dtype).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "`{name}` is {}, which safetensors has no name for",
+                dtype.label()
+            ))
+        })?;
+        header.push((
+            name.as_str(),
+            json::object(vec![
+                ("dtype", json::string(st)),
+                (
+                    "shape",
+                    json::Value::Array(shape.iter().map(|d| json::Value::U(*d)).collect()),
+                ),
+                (
+                    "data_offsets",
+                    json::Value::Array(vec![
+                        json::Value::U(at),
+                        json::Value::U(at + bytes.len() as u64),
+                    ]),
+                ),
+            ]),
+        ));
+        at += bytes.len() as u64;
+    }
+    let head = json::object(header).encode().into_bytes();
+    let mut out = (head.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&head);
+    for (_, _, _, bytes) in entries {
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1142,5 +1364,72 @@ mod tests {
             base_tensor_of("base_model.model.q_proj.lora_B.weight", &t),
             Some(("q_proj.weight".into(), "q_proj".into()))
         );
+    }
+
+    #[test]
+    fn a_peft_adapter_round_trips_back_to_peft() {
+        // Import a LoRA over a base, export it, and check the factors come back
+        // byte for byte under the names PEFT uses — prefix and all.
+        let base = base();
+        let (cfg, weights) = (config(""), weights(4, &["q_proj", "v_proj"]));
+        let im = import(&cfg, &weights, &base, &ImportOpts::default()).unwrap();
+        let hash = base.header.hash;
+        let mut mem = crate::store::MemoryStore::new(hash);
+        for o in &im.objects {
+            let _ = crate::store::WritableStore::put(&mut mem, &o.payload);
+        }
+        let ctx = Ctx::new(&mem);
+        let av = im
+            .objects
+            .iter()
+            .find(|o| o.otype == otype::ADAPTER)
+            .map(|o| crate::cbor::decode(&o.payload).unwrap())
+            .expect("an adapter object");
+        let adapter = crate::adapter::Adapter::from_value(&av).unwrap();
+
+        let ex = export(&ctx, &adapter, Some("acme/base")).unwrap();
+        let src = safetensors::File::parse(&weights).unwrap();
+        let back = safetensors::File::parse(&ex.weights).unwrap();
+        assert_eq!(
+            back.entries.len(),
+            src.entries.len(),
+            "factor count changed"
+        );
+        for e in &src.entries {
+            let got = back
+                .get(&e.name)
+                .unwrap_or_else(|| panic!("`{}` did not come back", e.name));
+            assert_eq!(got.shape, e.shape, "{}", e.name);
+            assert_eq!(back.tensor(got), src.tensor(e), "`{}` differs", e.name);
+        }
+
+        // The config is rebuilt from the adapter object, not remembered.
+        let c = crate::json::parse(&ex.config).unwrap();
+        assert_eq!(c.get("peft_type").unwrap().as_str(), Some("LORA"));
+        assert_eq!(c.get("r").unwrap().as_u64(), Some(4));
+        let targets: Vec<&str> = c
+            .get("target_modules")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(targets, vec!["q_proj", "v_proj"]);
+        // The name PEFT gave the base is a name; the digest OMNI pinned it with
+        // survives beside it rather than being dropped on the way out.
+        assert_eq!(
+            c.get("base_model_name_or_path").unwrap().as_str(),
+            Some("acme/base")
+        );
+        assert_eq!(
+            c.get("omni_base_digest").unwrap().as_str(),
+            Some(crate::sha256::hex(&base.header.root_digest).as_str())
+        );
+        // And the fields whose defaults define what a LoRA is are written out
+        // rather than left for a future PEFT to reinterpret.
+        for k in ["bias", "fan_in_fan_out", "use_dora", "use_rslora"] {
+            assert!(c.get(k).is_some(), "`{k}` should be explicit");
+        }
     }
 }
