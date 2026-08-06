@@ -1018,6 +1018,43 @@ jobs:
           grep -q 'dequantize' /tmp/pyq.txt
 
           echo "the C0 budget claim holds in a second language, standard library only"
+      # The other Python file in that directory is not a second reader — it is a
+      # binding, over the C ABI, so it gets everything the Rust implementation
+      # can do. Two things are worth proving about a ctypes binding: that the
+      # handle lifetimes hold (a tensor outliving its store, a DLPack capsule
+      # outliving every handle), and that DLPack is produced *correctly*, which
+      # is checked by unwrapping the capsule rather than by trusting a consumer.
+      - name: Python reaches the whole implementation through the C ABI
+        run: |
+          OMNI=reference/target/release/omni
+          export OMNI_BIN="$PWD/$OMNI"
+          cargo build --release -p omni-ffi --manifest-path reference/Cargo.toml
+
+          python3 bindings/python/test_omni_ffi.py 2>&1 | tee /tmp/pyffi.txt
+          grep -q '^OK' /tmp/pyffi.txt
+          # The binding and the from-specification reader share no code, so
+          # their agreeing on a tensor's bytes is worth more than either saying
+          # so alone.
+          grep -q 'tensors agree byte for byte across both readers' /tmp/pyffi.txt
+
+          # And from the command line, on a quantized model, which is the case
+          # the pure-Python reader cannot do at all.
+          "$OMNI" example --quantized /tmp/pyffi.omni > /dev/null
+          python3 bindings/python/omni_ffi.py /tmp/pyffi.omni | tee /tmp/pyffi2.txt
+          grep -q 'verify: VerifyReport(ok' /tmp/pyffi2.txt
+          grep -q "u4 \[32, 64\] packed literal" /tmp/pyffi2.txt
+          grep -q 'dequantize>' /tmp/pyffi2.txt
+          grep -q 'unmet: required feature .omni.tensor/expr.1' /tmp/pyffi2.txt
+
+          # A quantized weight comes out as numbers through the binding, which
+          # is the thing C0 cannot do and the reason the binding exists.
+          python3 bindings/python/omni_ffi.py /tmp/pyffi.omni \
+            model.layers.0.attn.q_proj.weight.bf16 | tee /tmp/pyffi3.txt
+          grep -q '2048 values' /tmp/pyffi3.txt
+          grep -q 'no stored bytes: bytes: indeterminate' /tmp/pyffi3.txt
+
+          echo "Python reaches the whole implementation through the C ABI"
+
 
       # §06.9 replaces an executed Jinja string with a total language. Whether
       # that trade is affordable is an empirical question, and the roadmap's

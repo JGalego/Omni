@@ -220,6 +220,9 @@ boundary, status codes identical to the CLI's exit codes, and DLPack out to
 PyTorch, JAX and NumPy without a copy. It is the one crate here that uses
 `unsafe`, because a C ABI cannot be written without it; the parser stays
 `#![forbid(unsafe_code)]`, which is the half of the codebase where it matters.
+[`bindings/python/omni_ffi.py`](bindings/python/omni_ffi.py) is the first binding
+over it — `ctypes`, so still no dependencies and no build step — and CI checks
+that it and the from-specification reader agree on every tensor's bytes.
 
 ## File extension and media types
 

@@ -215,17 +215,38 @@ with omni.writer("out.omni", reproducible=True) as wr:
   code migrates by changing one import.
 - Type stubs shipped; `mypy`-clean.
 
-**What exists today is not this.** PyO3 needs a dependency, and the reference
-implementation has none on purpose, so the binding above is a design and not a
-build. Two things that are built stand where it will:
+**What exists today is not this, but most of it is.** PyO3 needs a dependency,
+and the reference implementation has none on purpose. Three things are built:
 
-- [`reference/omni-ffi`](../../reference/omni-ffi), the C ABI of §3, which is
-  what a PyO3 — or `ctypes`, or `cffi` — binding would call. It already returns
-  DLPack, so `torch.from_dlpack` works today from any language that can call C.
+- [`reference/omni-ffi`](../../reference/omni-ffi), the C ABI of §3.
+- [`bindings/python/omni_ffi.py`](../../bindings/python/omni_ffi.py): a
+  **`ctypes` binding over that ABI**, standard library only, no build step and
+  no compiler on the user's machine. It reaches everything the Rust
+  implementation can do — compressed objects, expression evaluation, quantized
+  weights, capability negotiation — and implements `__dlpack__` /
+  `__dlpack_device__`, so `torch.from_dlpack(t)` and `np.from_dlpack(t)` work
+  and are zero-copy whenever `t.mapped` is true:
+
+  ```python
+  import omni_ffi
+
+  with omni_ffi.open("model.omni") as model:
+      w = model["model.embed_tokens.weight"]
+      print(w.dtype, w.shape, "zero copy" if w.mapped else "copied")
+      t = torch.from_dlpack(w)
+      plan = model.resolve(objective="min-memory")   # None caps = the C0 floor
+  ```
+
+  What it does not have that PyO3 would: the GIL is held across calls, and
+  there is a marshalling layer. For a reader that is a smaller cost than it
+  sounds, and `pip install` needing no wheel per platform is a real gain. No
+  writer either — that is the C ABI's missing half, not the binding's.
 - [`bindings/python/omni.py`](../../bindings/python/omni.py): a **C0 reader in
-  pure Python, no dependencies**, which reads a container, verifies every digest,
-  and hands back a literal tensor's bytes. No DLPack, no zero copy, no writer.
-  Its purpose is different from a fast binding's, and §5.1 is that purpose.
+  pure Python, no dependencies and no library**, which reads a container,
+  verifies every digest, and hands back a literal tensor's bytes. Its purpose is
+  different from a binding's — it is evidence, and §5.1 is that purpose. CI
+  checks the two Python files agree on every tensor's bytes, which is worth more
+  than either asserting it alone.
 
 ### 4.2 C++ (`omni.hpp`)
 
