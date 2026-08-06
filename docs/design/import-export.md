@@ -91,7 +91,7 @@ everything": it records what the importer *chose not to invent*.
 | **PyTorch DCP** | ● | ● | ◐ | ○ | — | — | ◐ | ● | — | ○ | ● |
 | **GGUF** | ● | ● | ● | ○⁷ | ◐¹⁴ | ● | ● | ○ | ◐⁸ | ○ | ● lossless (structural or opaque) |
 | **GGML (legacy)** | ● | ◐ | ● | ○ | ◐ | ○ | ◐ | ○ | ○ | ○ | ◐ |
-| **ONNX** | ● | ● | ◐⁹ | ● | ◐¹⁰ | ○ | ◐ | ○ | ○ | ◐ | ◐ (opset semantics preserved as dialect) |
+| **ONNX** | ● | ● | ◐⁹ | ● | ◐¹⁰ | ○ | ◐ | ○ | ○ | ○¹⁵ | ◐ (opset semantics preserved as dialect) |
 | **TensorFlow SavedModel** | ● | ● | ◐ | ● | ◐ | ○ | ◐ | ◐ | ○ | ○ | ◐ |
 | **Keras `.keras`** | ● | ● | ○ | ● | — | — | ◐ | ◐ | ○ | ○ | ◐ |
 | **Flax / JAX (msgpack, Orbax)** | ● | ● | ◐ | ○¹¹ | — | — | ◐ | ● | ◐ | ○ | ● |
@@ -121,12 +121,14 @@ Notes:
 ⁶ TorchScript archives carry a graph, imported as a `Foreign` blob plus best-effort IR;
 ⁷ GGUF has no graph: architecture is an enum. OMNI records `arch.family` + params and can synthesize a graph (§07.5);
 ⁸ GGUF LoRA files exist as a separate convention;
-⁹ ONNX QDQ nodes map onto `quantize`/`dequantize` cleanly; other quant conventions are opset-specific;
+⁹ ONNX QDQ nodes map onto `quantize`/`dequantize` cleanly *per tensor* — §05.1's closed `formula` enumeration is what makes `(x − zero_point) × scale` a mapping rather than a guess. Downgraded in practice for the per-axis and blocked forms, where saying which elements share a scale needs §05.1's block shape over an operand whose shape a dynamic graph does not fix, so those are carried rather than translated;
 ¹⁰ some ONNX models embed tokenizers as custom ops;
 ¹¹ JAX graphs are traced, not stored; `jaxpr`/StableHLO export imports as IR when present;
 ¹² TensorRT engines are compiled artifacts: weights are baked in and layer fusion is irreversible. Imported as an opaque `RuntimeCache` with `executable: true`, never as a canonical model;
 ¹³ Ollama uses OCI-ish manifests with digests;
 ¹⁴ downgraded from ● on evidence, when the importer was written: GGUF carries the vocabulary, the merges and the scores, but `tokenizer.ggml.pre` names a pre-tokenizer whose regexes live in llama.cpp's source rather than in the file, so the keys present do not determine where a token begins. What is importable is a decoder, not an encoder.
+¹⁵ corrected from ◐ when the importer was written: ONNX has no signature field
+at all. The ◐ was a guess about the format, and the format says nothing.
 
 ## 4 Notable import paths in detail
 
@@ -527,6 +529,123 @@ from those keys would decode correctly and encode differently from the model it
 shipped with, so the keys are preserved in the `Foreign` object and the gap is
 named in the fidelity report. The `chat_template` key, which *is*
 self-contained, goes through the §06.9 translator like any other.
+
+ONNX is the seventh and eighth rows, and the only one where the *graph* is the
+thing being imported rather than a table of weights:
+
+```console
+$ omni import onnx model.onnx -o model.omni
+$ omni export onnx model.omni -o back.onnx --allow-lossy
+```
+
+The protobuf wire format is implemented here, since a dependency-free crate has
+no library to call: seven kinds of field and a varint. Groups — wire types 3 and
+4, removed from proto3 — are refused rather than skipped, because a reader that
+skips a field it cannot find the end of reads everything after it from the wrong
+offset.
+
+**The line the mapping draws is the whole design.** §07.1's charge against ONNX
+is that a single abstraction level forces every backend to pattern-match
+`attention` back out of fifteen primitives. An importer can repeat that mistake
+in the other direction: `Relu` *is* `maximum(x, 0)`, exactly, and importing it
+that way would oblige the exporter to recognise the pair and fuse it back — a
+peephole matcher over the graph, which is the thing being complained about. So
+the rule is mechanical: **an ONNX op is translated only when one OMNI op means
+exactly what it means.** One table, read in both directions, twenty-four op types
+on it — the elementwise arithmetic, `MatMul`, `Transpose`, `Concat`, `Softmax`
+from opset 13, `Cast`, `Gather`, `CumSum`, `Reshape`, the five reductions,
+`Constant`, and the per-tensor QDQ pair.
+
+Everything else is **carried** in a compat dialect named after the ONNX domain it
+came from — `ai.onnx` for the default domain, `ai.onnx.ml` and `com.microsoft`
+for the rest — with its attributes intact. The dialect's version is the opset the
+file imported, which is the most faithful thing there is to record: ONNX versions
+its whole opset at once, so every op in one file shares one number, and §07.4.1's
+per-op versions exist precisely to avoid that. Spreading one opset number over
+per-op versions this build does not know would be inventing information.
+
+Carrying is not a failure, and §11.3 is the reason. A container full of
+`ai.onnx` ops verifies, copies, signs, deduplicates and round-trips byte for
+byte; `omni graph --verify` reports those ops **indeterminate** rather than
+invalid, which §15.1 makes normative; and the one operation that actually needs
+the semantics — execution — is refused by name. Each of those is a CI assertion
+rather than a claim.
+
+Several ops are *nearly* mappable and are carried instead, each for a stated
+reason, because "nearly" is where silent corruption lives:
+
+| Op | Why it is carried |
+|---|---|
+| `Relu`, `Identity`, `Gemm`, … | no single OMNI op means it |
+| `Slice`, `Pad` | ONNX's bounds may be negative or past the end and are clamped; `omni.tensor`'s must be in range, so normalizing them is a *lowering* that needs the operand's shape |
+| `MatMul` on a rank-1 operand | ONNX promotes it to a matrix and drops the added axis afterwards; `omni.tensor/matmul` takes rank ≥ 2 |
+| `Max`, `Min` with more than two operands | they are variadic in ONNX; chaining is a lowering |
+| `Softmax` before opset 13 | it flattens to two dimensions first, which is a reshape and a softmax |
+| `Reshape` whose target shape holds a `0` | a `0` means "copy this dimension from the operand" unless `allowzero` is set |
+| `Cast` with `saturate: 0` | an out-of-range cast then produces an infinity rather than the type's maximum, which §04.3's rounding modes do not name |
+| per-axis and blocked `QuantizeLinear` | which elements share a scale needs §05.1's block shape over a shape a dynamic graph does not fix |
+| anything whose shape is computed | a target shape or an axis list that is an operand rather than a constant is not an attribute an import can write |
+
+**Two independent shape functions, on every value.** ONNX files usually carry
+declared types for their intermediates, and OMNI has shape functions of its own.
+The import runs both and compares them: a disagreement about a dimension *both*
+state is an error naming the axis, not a warning, because one of the two readers
+is then wrong about what the model computes. Where OMNI has no shape function —
+every carried op — the file's declaration is used, and a value neither of them
+can type stops the import with the remedy named (run ONNX's shape inference, or
+`--no-graph` for the weights alone). Inventing a rank there would be inventing it
+for every op downstream.
+
+**External data is a second, weaker format inside the first.** Protobuf refuses
+to encode more than 2 GB, so ONNX moved weights into sibling files referenced by
+a path in a string. That is an untrusted path: resolution is the caller's
+decision, `omni import onnx` resolves it against the model's own directory, and a
+`location` that is absolute or contains `..` is refused before anything is opened
+(§12.4).
+
+Refused by name, each with its reason: `STRING`, `COMPLEX64` and `COMPLEX128`
+initializers; the `FNUZ` float8 variants, which differ from the ones §04.3 names
+by an exponent bias, so importing one as the other would change every value;
+subgraph attributes, which are regions in §07.3 and whose scope rules this build
+has not worked out how to translate; local functions; `TrainingInfoProto`; and
+sparse initializers, which §04.6 has a catalogue for and this build has not
+written the mapping to.
+
+**The export refuses more than it writes, and that is the point.** A container
+with no graph is not an ONNX file and says so — §07.5 makes the graph optional in
+OMNI precisely because most models ship without one. A `semantic`-level graph is
+refused with a pointer to `omni graph lower`, since an opset *is* the primitive
+level and choosing an abstraction level on the model's behalf is not an
+exporter's decision. And an op with no ONNX spelling stops the export with the
+list of them: that is not a lossy export and `--allow-lossy` does not cover it,
+because an op that cannot be written is the computation rather than lost
+metadata.
+
+Running that against this repository's own worked transformer is a measurement of
+what the ONNX opset costs. Lowered to primitives, 49 nodes map — `MatMul`,
+`Transpose`, `Reshape`, `Mul`, `Add`, `ReduceMean`, `Gather`, `Cast` — and three
+kinds do not: `omni.nn/attention` and `omni.nn/rope`, which are the semantic ops
+§07.2 exists to keep, and `omni.tensor/rsqrt`, which ONNX simply has no operator
+for.
+
+The round trip is byte-exact for a file this build imported, and the reason is
+structural rather than lucky: the ops and their attributes come back out of the
+graph, and everything OMNI-IR has no field for — producer strings, doc strings,
+node names, and the names ONNX gives the values OMNI-IR numbers — is preserved in
+a `Foreign` object and put back (I2). The one thing that object deliberately does
+*not* hold is the ops themselves, because an export that read those from it would
+be copying a file rather than translating a model. §5.3 still does not promise
+this round trip in general, and the reason is unchanged: a file whose tensors use
+the typed arrays rather than `raw_data`, or whose fields are not in ascending
+order, comes back with the same values in a different encoding.
+
+`tools/onnx-fixture.py` is the third implementation — Python, standard library
+only, written from the wire format and the operator specifications. It writes the
+file, parses back what the export wrote with its own reader, and computes what
+the graph should produce. CI checks all three: the container's tensors are bit
+identical to the bytes Python packed, the executed graph agrees with Python's
+arithmetic on every output, and the exported file is the same bytes as the
+imported one.
 
 Every other row of the matrix in §3 is unimplemented. A request to import one is
 refused by name, with a pointer to this document, rather than half-attempted.

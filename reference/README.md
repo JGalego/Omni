@@ -225,6 +225,53 @@ implemented:
   stated precisely rather than optimistically — see the module docs for why it
   comes from delta containers rather than from two independently packed files
   happening to slice the same way
+- **ONNX, both directions**, which is the row of the capability matrix that tests
+  §07 rather than §04: a safetensors file is tensors, a GGUF file is tensors plus
+  an architecture enum, and an ONNX file is a computation. The protobuf wire
+  format is read and written here — seven kinds of field and a varint, no
+  library — and the graph becomes OMNI-IR at the primitive level.
+
+  The interesting part is the line it draws. §07.1's charge against ONNX is that
+  its single abstraction level makes every backend pattern-match `attention` back
+  out of fifteen primitives, and an importer can repeat that mistake in reverse:
+  `Relu` *is* `maximum(x, 0)`, so importing it as two ops would make the export a
+  peephole matcher over the graph. So an ONNX op is translated only when **one
+  OMNI op means exactly what it means**, and one table is read in both
+  directions. Twenty-four op types are on it. Everything else is carried in a
+  compat dialect named after its ONNX domain, at the opset the file imported —
+  which is the most faithful thing there is to record, since ONNX versions its
+  whole opset at once and that is precisely what §07.4.1's per-op versions exist
+  to avoid.
+
+  Carrying rather than translating is not a failure, and §11.3 is why: CI checks
+  that a container full of `ai.onnx` ops still verifies, still copies, still
+  signs, still round-trips byte for byte, and refuses exactly one thing —
+  execution — naming the op it refuses. `omni graph --verify` reports those ops
+  **indeterminate**, because reporting them invalid would itself be a conformance
+  violation (§15.1).
+
+  Two checks make the claim measurable rather than stated. Every initializer is
+  re-read through the object graph and compared with the source (I4). And every
+  value the imported graph produces is typed by **both** shape functions —
+  OMNI's own and the one the file carries — with a disagreement about a concrete
+  dimension treated as an error rather than a warning, because one of the two
+  readers is then wrong about what the model computes.
+  `tools/onnx-fixture.py` is the third implementation, written in Python from the
+  protobuf wire format and the operator specifications: it writes the file, reads
+  back what the export wrote, and computes what the graph should produce. CI
+  checks that the container's tensors are bit-identical to what Python packed,
+  that the executed graph agrees with Python's arithmetic on every output, and
+  that the exported file is the same bytes as the imported one.
+
+  What the export refuses is worth as much as what it writes. A container with no
+  graph is not an ONNX file and says so. A `semantic`-level graph is refused with
+  a pointer to `omni graph lower`, because choosing an abstraction level is the
+  caller's decision. And an op with no ONNX spelling stops the export with the
+  *list* of them — not a lossy export, since an unwritable op is the computation
+  rather than lost metadata, and `--allow-lossy` does not cover it. Lowering this
+  repository's own worked transformer and exporting it is a measurement of what
+  that costs: 49 nodes map, and `omni.nn/attention`, `omni.nn/rope` and
+  `omni.tensor/rsqrt` — an op ONNX simply does not have — do not
 - **PEFT LoRA import**, as the §08 `Adapter` the capability matrix says it is.
   The thing OMNI adds is in the one required argument: PEFT names its base with a
   *string* and §08.1 pins it with a *digest*, so `--base` is not optional and the
@@ -393,13 +440,13 @@ What is **not** implemented, and is reported as such rather than faked:
   (§05.5), and a build with no calibration data would have to invent either the
   data or the scales. It is refused with what it would need
 - `omni mount` (§13.9), which needs FUSE
-- Every importer and exporter except safetensors, PyTorch, GGUF, PEFT, GPTQ,
-  AWQ and a whole Hugging Face repo.
+- Every importer and exporter except safetensors, PyTorch, GGUF, ONNX, PEFT,
+  GPTQ, AWQ and a whole Hugging Face repo.
   The capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
-  build implements seven of them; ONNX and EXL2 do not exist, and a
+  build implements eight of them; EXL2 does not exist, and a
   request for one is refused by name rather than half-attempted. Export covers
-  safetensors, GGUF, PEFT, GPTQ and AWQ — not PyTorch, because §12.10 clause 4
-  says never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
+  safetensors, GGUF, ONNX, PEFT, GPTQ and AWQ — not PyTorch, because §12.10
+  clause 4 says never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
   versions are refused for the reasons named above, and so are GGUF's `IQ*`
   types, whose codebooks are in llama.cpp's source rather than in the file
 - §12.10's confined child process for the pickle import. The restricted

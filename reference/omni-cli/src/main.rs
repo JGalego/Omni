@@ -152,6 +152,16 @@ VERBS:
                               --keep-opaque also attaches §05.2.4's opaque form
                               as a droppable RuntimeCache, doubling the
                               quantized bytes to buy zero-conversion mmap
+    import  onnx <in.onnx> -o <out.omni> [--name N] [--no-graph]
+                              An ONNX graph as OMNI-IR at the primitive level
+                              (§07.2). An op one OMNI op means exactly is
+                              translated; everything else is carried in a compat
+                              dialect named after its ONNX domain, at the opset
+                              the file imported, with its attributes intact —
+                              which §11.3 makes a validate-copy-sign-partially-
+                              run outcome rather than a failure. External data
+                              is read from beside the file, and a path that
+                              leaves that directory is refused
     import  peft <adapter-dir> --base <base.omni> -o <out.omni>
                               A PEFT LoRA as an §08 Adapter, pinned to that base
                               by digest rather than by the name PEFT gives it
@@ -173,6 +183,13 @@ VERBS:
                               container this build imported from one: the header
                               is the source's, key for key, and each tensor is
                               its stored fields re-interleaved
+    export  onnx <in.omni> [-o <out.onnx>] [--plan] [--allow-lossy]
+                              Write the graph back out as ONNX. Requires a graph
+                              at the primitive level, since that is what an
+                              opset is; an op with no ONNX spelling stops the
+                              export with the list of them, which is a different
+                              thing from lost metadata and not something
+                              --allow-lossy covers
     export  safetensors <in.omni> [-o <out.safetensors>] [--plan]
                               [--allow-lossy]
                               Emit into another format. --plan says what would
@@ -4239,6 +4256,9 @@ fn cmd_import(args: &[String]) -> R {
     if format == "gguf" {
         return cmd_import_gguf(args, input);
     }
+    if format == "onnx" {
+        return cmd_import_onnx(args, input);
+    }
     if let Some(method) = omni_core::hfquant::Method::parse(format) {
         return cmd_import_hfquant(args, input, method);
     }
@@ -4433,6 +4453,206 @@ structural expression's digest and droppable (§10.6)",
         );
     }
     pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni import onnx` — somebody else's graph, at OMNI's own level.
+///
+/// The line this draws is the point of the command: an ONNX op is *translated*
+/// only when one OMNI op means exactly what it means, and everything else is
+/// carried in a compat dialect with its attributes. Importing `Relu` as
+/// `maximum(x, 0)` would look tidier in the summary below and would make the
+/// export a pattern matcher over the graph, which is the thing §07.1 says is
+/// wrong with ONNX in the first place.
+fn cmd_import_onnx(args: &[String], input: &str) -> R {
+    use omni_core::onnx::{import, DirExternal, ImportOpts};
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let bytes = std::fs::read(input)?;
+    let opts = ImportOpts {
+        name: flag(args, "--name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("imported/{}", stem(input))),
+        source_path: input.to_string(),
+        hash: if flag(args, "--hash") == Some("sha256") {
+            HashAlgo::Sha256
+        } else {
+            HashAlgo::Blake3_256
+        },
+        chunk_size: flag(args, "--chunk")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 20),
+        license: flag(args, "--license").map(str::to_string),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+        graph: !args.iter().any(|a| a == "--no-graph"),
+    };
+    // §12.4: external data is resolved beside the model and nowhere else.
+    let ext = DirExternal {
+        dir: std::path::Path::new(input)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf(),
+    };
+    let imported = match import(&bytes, &opts, &ext) {
+        Ok(i) => i,
+        Err(e @ omni_core::onnx::Error::Unsupported(_)) => {
+            prr!("omni: {e}\n");
+            return Ok(4);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: opts.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+
+    let r = &imported.report;
+    pr!("imported {input} -> {out}");
+    pr!(
+        "  source       onnx opset {}, {}, {}",
+        imported.opset,
+        human(r.source_size),
+        short(opts.hash, &r.source_digest)
+    );
+    pr!(
+        "  tensors      {} re-read through the graph and compared with the source \
+({}) — I4",
+        commas(r.verified_tensors as u64),
+        human(r.verified_bytes)
+    );
+    if imported.module.is_some() {
+        let native: usize = imported.native.iter().map(|(_, n)| n).sum();
+        let carried: usize = imported.compat.iter().map(|(_, n, _)| n).sum();
+        pr!(
+            "  graph        {} node(s): {} translated, {} carried in a compat dialect",
+            commas((native + carried) as u64),
+            commas(native as u64),
+            commas(carried as u64)
+        );
+        for (op, n) in &imported.native {
+            pr!("     {:<18} ×{}", op, commas(*n as u64));
+        }
+        for (op, n, why) in &imported.compat {
+            pr!("     {:<18} ×{}  carried — {}", op, commas(*n as u64), why);
+        }
+    } else {
+        pr!("  graph        not imported (--no-graph)");
+    }
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni export onnx` — the graph back out, at the level an opset is.
+fn cmd_export_onnx(args: &[String], input: &str) -> R {
+    use omni_core::onnx::{export, plan};
+    let c = Container::open(std::fs::read(input)?)?;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let table = tensor_table(&c)?;
+    let manifest = c.root()?;
+    let module = graph_of(&c)?;
+
+    // E1: the plan first, with nothing written.
+    let p = match plan(&ctx, &manifest, &table, module.as_ref()) {
+        Ok(p) => p,
+        Err(e @ omni_core::onnx::Error::Unsupported(_)) => {
+            prr!("omni: {e}\n");
+            return Ok(4);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    pr!("{input} -> onnx (opset {})", p.opset);
+    pr!(
+        "  initializers {}, {} of payload",
+        commas(p.initializers.len() as u64),
+        human(p.bytes)
+    );
+    pr!(
+        "  nodes        {}",
+        commas(p.nodes.iter().map(|(_, _, n)| *n as u64).sum::<u64>())
+    );
+    for (op, domain, n) in &p.nodes {
+        pr!(
+            "     {:<18} ×{}{}",
+            op,
+            commas(*n as u64),
+            if domain.is_empty() {
+                String::new()
+            } else {
+                format!("  ({domain})")
+            }
+        );
+    }
+    pr!(
+        "  spelling     {}",
+        if p.from_onnx {
+            "the source file's own names, node for node (§I2)"
+        } else {
+            "composed here; this container did not come from ONNX"
+        }
+    );
+    if !p.writable() {
+        pr!(
+            "  unmapped     {} op kind(s) ONNX cannot spell:",
+            p.unmapped.len()
+        );
+        for (op, n) in &p.unmapped {
+            pr!("     {} ×{}", op, commas(*n as u64));
+        }
+    }
+    if p.lossless() {
+        pr!("  lossless     yes");
+    } else {
+        pr!(
+            "  lossless     no — {} thing(s) would be lost:",
+            p.loss.len()
+        );
+        for l in &p.loss {
+            pr!("     {} — {}", l.item, l.reason);
+        }
+    }
+    if args.iter().any(|a| a == "--plan") {
+        return Ok(if p.lossless() && p.writable() { 0 } else { 3 });
+    }
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    if !p.writable() {
+        // Not a lossy export: an op with no ONNX spelling is the computation,
+        // and there is nothing to consent to.
+        prr!(
+            "omni: the ops above have no ONNX equivalent, so there is no file to \
+write\n"
+        );
+        return Ok(4);
+    }
+    if !p.lossless() && !args.iter().any(|a| a == "--allow-lossy") {
+        prr!("omni: this export would lose the things listed above\n");
+        prr!("omni: pass --allow-lossy to write it anyway\n");
+        return Ok(1);
+    }
+    let (bytes, p) = export(&ctx, &manifest, &table, module.as_ref())?;
+    std::fs::write(out, &bytes)?;
+    pr!("wrote {out}  {}", human(bytes.len() as u64));
+    let report_path = format!("{out}.loss.json");
+    std::fs::write(
+        &report_path,
+        p.loss_report(&c.header.root_digest, c.header.hash),
+    )?;
+    pr!("wrote {report_path}");
     Ok(0)
 }
 
@@ -5160,6 +5380,9 @@ fn cmd_export(args: &[String]) -> R {
     }
     if format == "gguf" {
         return cmd_export_gguf(args, input);
+    }
+    if format == "onnx" {
+        return cmd_export_onnx(args, input);
     }
     if format != "safetensors" {
         prr!(

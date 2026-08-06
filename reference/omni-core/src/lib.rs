@@ -8,8 +8,8 @@
 //! OMNI-IR (§07) with a reference interpreter that executes it, a Jinja2 to
 //! OMNI-CT translator (§06.9), training state (§09), a WebAssembly plugin host
 //! (§11.6),
-//! streaming transport (§13), and safetensors, PyTorch, GGUF, PEFT, GPTQ and
-//! AWQ import — and, over those, a whole Hugging Face model directory as one
+//! streaming transport (§13), and safetensors, PyTorch, GGUF, ONNX, PEFT, GPTQ
+//! and AWQ import — and, over those, a whole Hugging Face model directory as one
 //! container.
 //!
 //! Deliberate constraints, mirroring the specification's own claims:
@@ -35,13 +35,14 @@
 //! Of §03.7's codecs, `zstd` (the MUST) and `deflate` are here; the MAY-level
 //! ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
-//! in `docs/design/import-export.md` §3, seven are implemented —
-//! [`safetensors`], [`pytorch`], [`gguf`], [`peft`], GPTQ and AWQ in
+//! in `docs/design/import-export.md` §3, eight are implemented —
+//! [`safetensors`], [`pytorch`], [`gguf`], [`onnx`], [`peft`], GPTQ and AWQ in
 //! [`hfquant`], and a whole Hugging Face repo in [`hf`] — and a request to
 //! import another is refused by name. All but PyTorch and the repo importer
 //! export as well as import; §12.10 clause 4 says never to re-emit pickle, and
 //! this build does not. GGUF's `IQ*` types are refused with their codebooks as
-//! the reason (§05.6 rule 1).
+//! the reason (§05.6 rule 1), and an ONNX op no single OMNI op means is carried
+//! in a compat dialect rather than approximated.
 //! See `docs/design/roadmap.md`.
 
 #![forbid(unsafe_code)]
@@ -69,6 +70,7 @@ pub mod json;
 pub mod layout;
 pub mod model;
 pub mod oci;
+pub mod onnx;
 pub mod pattern;
 pub mod peft;
 pub mod plan;

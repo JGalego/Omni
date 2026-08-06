@@ -152,8 +152,9 @@ shipped with. So none is built, the keys are preserved, and the capability matri
 row moved from ● to ◐ on the evidence rather than staying at the number it was
 first written with.
 
-That is seven rows of a 25-row capability matrix. ONNX and EXL2 do not
-exist, and the gate's actual asks are still untouched: no round-trip over 100 real
+That is seven rows of a 25-row capability matrix — eight with ONNX, which
+belongs to Phase 2's list rather than this one because it is a *graph* importer.
+EXL2 does not exist, and the gate's actual asks are still untouched: no round-trip over 100 real
 models, no delta-size study over 50 real pairs, and no differential test against
 `llama.cpp`'s own binary — the K-quant dequantization is checked against two
 independent implementations of the *format*, which is the part that can be done
@@ -171,7 +172,7 @@ Deliverables:
 - `omni-plugin`: WASM host with the restricted profile, fuel metering.
 - Tokenizer IR + conformance vectors + Jinja2 → OMNI-CT translator.
 - `omni graph synthesize` for registered families.
-- `omni-import-onnx`, `-export-onnx`.
+- `omni-import-onnx` ✅, `-export-onnx` ✅.
 - Capability negotiation and `omni plan`.
 
 **Gate 2:** ten architecture families (§07.8) expressed end-to-end and executed
@@ -225,12 +226,36 @@ analysis named. The one still refused calls `raise_exception`, and it should be:
 a total language has no failure form. The measurement is still of this
 repository's corpus rather than of a hub snapshot.
 
+**ONNX now imports and exports**, which is the deliverable this phase names and
+the first time OMNI-IR has had to absorb somebody else's graph rather than
+synthesize one. The mapping's rule is narrow on purpose: an ONNX op is translated
+only when one OMNI op means exactly what it means (twenty-four op types), and
+everything else is carried in a compat dialect named after its ONNX domain, at
+the opset the file imported. Importing `Relu` as `maximum(x, 0)` would have made
+the export a peephole matcher over the graph — the thing §07.1 criticises ONNX's
+backends for having to do — so it is carried instead. CI checks both halves: a
+file whose every node maps imports, verifies, *executes* against arithmetic done
+in Python, and exports byte for byte; a file whose nodes do not still verifies,
+copies, signs and round-trips, reports its ops **indeterminate** rather than
+invalid, and refuses exactly one thing — execution — by name. That is §11.3's
+forward-compatibility claim tested on a real format rather than a synthetic one.
+
+Two things it found are worth more than the row. **ONNX and OMNI now check each
+other's shape functions**: the import types every value both ways and treats a
+disagreement about a concrete dimension as an error, because one of the two
+readers is then wrong about the model. And **exporting this repository's own
+transformer measures what the opset costs**: lowered to primitives, 49 nodes map
+and three kinds do not — `omni.nn/attention` and `omni.nn/rope`, which are the
+semantic ops §07.2 exists to keep, and `omni.tensor/rsqrt`, which ONNX has no
+operator for.
+
 **Still not met:** the ten families are executed against arithmetic done in the
 tests rather than against PyTorch, the tokenizer vectors are this repository's
 rather than 200 real ones, and the translation figure is a percentage of a
-15-template corpus and not of the public snapshot the gate names. All three of
-those need corpora and a second framework to run; none of them needs more code
-here.
+15-template corpus and not of the public snapshot the gate names. ONNX's
+round-trip is checked against a fixture written from the format's own definition
+rather than against files a real exporter produced. All of those need corpora and
+a second framework to run; none of them needs more code here.
 
 ## Phase 3 — Prove the distribution layer (months 12–18)
 

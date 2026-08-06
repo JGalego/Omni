@@ -467,6 +467,130 @@ jobs:
                 f"{len(g)/1024/1024:.2f} MiB")
           PY_GIF
 
+      # §07 + import/export: ONNX is the row of the capability matrix that
+      # exercises the *graph* rather than the tensors, so this checks the two
+      # halves of the mapping separately — the ops one OMNI op means exactly,
+      # and the ops that are carried instead — and it checks them against a
+      # third implementation, in Python, written from the protobuf wire format
+      # and the operator specifications rather than from the Rust.
+      - name: An ONNX graph becomes OMNI-IR, runs, and comes back byte for byte
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+
+          python3 tools/onnx-fixture.py write /tmp/native.onnx /tmp/onnx.vals
+          "$OMNI" import onnx /tmp/native.onnx -o /tmp/native.omni | tee /tmp/onnx.txt
+
+          # Every node in this file is one OMNI op means exactly what it means,
+          # so nothing is carried and the graph is at the primitive level §07.2
+          # says an opset is.
+          grep -q '8 node(s): 8 translated, 0 carried in a compat dialect' /tmp/onnx.txt
+          grep -q '4 re-read through the graph and compared with the source' /tmp/onnx.txt
+          "$OMNI" inspect /tmp/native.omni | grep -q 'graph         primitive'
+
+          # I4, from the other side: the initializers, bit for bit, against the
+          # bytes Python packed.
+          python3 tools/onnx-fixture.py check "$OMNI" /tmp/native.omni /tmp/onnx.vals \
+            | tee /tmp/onnxvals.txt
+          test "$(grep -c 'agree bit-for-bit' /tmp/onnxvals.txt)" = 2
+
+          # Verification is one claim and execution is another: the graph
+          # type-checks against the tensors it names (R-I10), and then it
+          # computes what ONNX's own operator definitions say it should.
+          "$OMNI" graph /tmp/native.omni --verify | tee /tmp/onnxv.txt
+          grep -q '0 unchecked, 0 unknown' /tmp/onnxv.txt
+          "$OMNI" graph run /tmp/native.omni --tokens 1,2,3,4 | tee /tmp/onnxrun.txt
+          python3 tools/onnx-fixture.py check-run /tmp/onnxrun.txt /tmp/onnx.vals \
+            | tee /tmp/onnxrundiff.txt
+          test "$(grep -c 'value(s) agree' /tmp/onnxrundiff.txt)" = 5
+
+          # E2: the provenance object has no ONNX representation, so an export
+          # without consent writes nothing at all.
+          expect() {
+            local want=$1; shift
+            local got=0
+            "$@" >/dev/null 2>&1 || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          expect 1 "$OMNI" export onnx /tmp/native.omni -o /tmp/refused.onnx
+          test ! -f /tmp/refused.onnx
+
+          # And the round trip, checked structurally first and byte-wise second
+          # by a parser that shares nothing with the writer.
+          "$OMNI" export onnx /tmp/native.omni -o /tmp/back.onnx --allow-lossy \
+            | tee /tmp/onnxex.txt
+          grep -q "the source file's own names, node for node" /tmp/onnxex.txt
+          python3 tools/onnx-fixture.py compare /tmp/native.onnx /tmp/back.onnx \
+            | tee /tmp/onnxcmp.txt
+          grep -q 'structure identical' /tmp/onnxcmp.txt
+          grep -q 'bytes identical' /tmp/onnxcmp.txt
+          test -f /tmp/back.onnx.loss.json
+
+          # The other half of the mapping: four ops no single OMNI op means.
+          # §11.3's whole argument is that this is a *validate, copy, sign and
+          # partially run* outcome rather than a failure, so each of those is
+          # checked rather than asserted.
+          python3 tools/onnx-fixture.py compat /tmp/compat.onnx
+          "$OMNI" import onnx /tmp/compat.onnx -o /tmp/compat.omni | tee /tmp/compat.txt
+          grep -q '4 node(s): 0 translated, 4 carried in a compat dialect' /tmp/compat.txt
+          # The dialect is the ONNX domain at the opset the file imported, which
+          # is the most faithful thing there is to record: ONNX versions its
+          # whole opset at once, which is what §07.4.1 exists to avoid.
+          "$OMNI" graph /tmp/compat.omni --dialects | grep -q 'ai.onnx          v13 unknown'
+          "$OMNI" graph /tmp/compat.omni | grep -q 'ai.onnx/Relu@13'
+          # §15.1: an op from an unknown dialect is *indeterminate*, and
+          # reporting it as invalid would itself be a conformance violation.
+          "$OMNI" graph /tmp/compat.omni --verify | tee /tmp/compatv.txt
+          grep -q '4 unknown' /tmp/compatv.txt
+          grep -q 'indeterminate' /tmp/compatv.txt
+          expect 3 "$OMNI" graph /tmp/compat.omni --verify
+          # The container still verifies: every framing, integrity, reachability
+          # and tensor-semantics check passes, and the *only* findings are the
+          # four indeterminate ones — which is exactly the three-valued outcome
+          # §15.1 insists on, and why the exit status is 3 rather than 1.
+          "$OMNI" verify /tmp/compat.omni --level 6 > /tmp/compatverify.txt 2>&1 || true
+          cat /tmp/compatverify.txt
+          grep -q 'V3 integrity   ✓' /tmp/compatverify.txt
+          grep -q 'V4 graph       ✓' /tmp/compatverify.txt
+          grep -q 'V5 semantics   ✓' /tmp/compatverify.txt
+          grep -q 'indeterminate: 4 finding(s)' /tmp/compatverify.txt
+          expect 3 "$OMNI" verify /tmp/compat.omni --level 6
+          # Execution is the one thing it refuses, and it refuses by name.
+          "$OMNI" graph run /tmp/compat.omni --tokens 1,2,3,4 2>&1 | tee /tmp/compatrun.txt || true
+          grep -q 'ai.onnx/Relu@13' /tmp/compatrun.txt
+          expect 3 "$OMNI" graph run /tmp/compat.omni --tokens 1,2,3,4
+          # And it exports as itself, attributes intact.
+          "$OMNI" export onnx /tmp/compat.omni -o /tmp/compat-back.onnx --allow-lossy >/dev/null
+          python3 tools/onnx-fixture.py compare /tmp/compat.onnx /tmp/compat-back.onnx \
+            | grep -q 'bytes identical'
+
+          # The export direction, on a graph that never came from ONNX: the
+          # worked transformer example, whose level is `semantic`. An opset is
+          # primitives, so lowering is the caller's decision and an export that
+          # made it silently would be choosing an abstraction level on the
+          # model's behalf (§07.2).
+          "$OMNI" example --graph /tmp/semantic.omni >/dev/null
+          "$OMNI" export onnx /tmp/semantic.omni --plan 2>&1 | tee /tmp/semplan.txt || true
+          grep -q "the graph is at the \`semantic\` level" /tmp/semplan.txt
+          expect 4 "$OMNI" export onnx /tmp/semantic.omni -o /tmp/never.onnx --allow-lossy
+          test ! -f /tmp/never.onnx
+
+          # Lowered, most of it maps — and §5.2's actual ask is what happens to
+          # the rest: an op ONNX has no word for stops the export with the list
+          # of them, which is a different thing from lost metadata and is not
+          # something --allow-lossy covers.
+          "$OMNI" graph lower /tmp/semantic.omni -o /tmp/lowered.omni >/dev/null
+          "$OMNI" export onnx /tmp/lowered.omni --plan > /tmp/lowplan.txt 2>&1 || true
+          cat /tmp/lowplan.txt
+          grep -q 'omni.nn/attention@2' /tmp/lowplan.txt
+          grep -q 'omni.tensor/rsqrt@1' /tmp/lowplan.txt
+          grep -q 'MatMul' /tmp/lowplan.txt
+          expect 3 "$OMNI" export onnx /tmp/lowered.omni --plan
+          expect 4 "$OMNI" export onnx /tmp/lowered.omni -o /tmp/nope.onnx --allow-lossy
+          test ! -f /tmp/nope.onnx
+          echo "ONNX imports, executes, refuses and round-trips"
+
       # §05.2.4 + import/export: the claim is that a GGML block format is an
       # expression rather than a file type. What would make that claim false is
       # a value read the wrong way, and byte identity cannot see one — so the

@@ -102,9 +102,13 @@ no content addressing, no signatures, no adapters, no tokenizer, no
 quantization-as-transformation, no streaming.
 
 **OMNI's relationship:** OMNI-IR's multi-level design is a direct response to
-ONNX's frozen-abstraction problem. ONNX imports as a `primitive`-level graph in
-an `onnx`-compat dialect; export requires a graph and reports op-coverage gaps
-precisely.
+ONNX's frozen-abstraction problem. ONNX imports as a `primitive`-level graph:
+an op one OMNI op means exactly is translated, and everything else is carried in
+a compat dialect named after its ONNX domain — `ai.onnx` — at the opset the file
+imported, which is how an opset's monolithic version survives being read by a
+format with per-op ones. Export requires a graph at that level and reports
+op-coverage gaps precisely: it names the ops it cannot spell rather than emitting
+a file that is missing them.
 
 ### PyTorch `.pt` / `.pth` / `.bin`
 **Does well:** trivially convenient; stores anything Python can pickle,
