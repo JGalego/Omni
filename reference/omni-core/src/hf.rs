@@ -842,6 +842,19 @@ fn chat_template(b: &mut ModelBuilder, cfg: &json::Value, notes: &mut Vec<Note>)
             return None;
         }
     };
+    Some(chat_template_asset(b, translated, notes))
+}
+
+/// Turns a translated template into the §06.9 asset, with the AST as a blob.
+///
+/// Shared with the GGUF importer, whose chat template arrives as a metadata
+/// string rather than out of `tokenizer_config.json` but is the same Jinja and
+/// becomes the same object.
+pub(crate) fn chat_template_asset(
+    b: &mut ModelBuilder,
+    translated: crate::jinja::Translated,
+    notes: &mut Vec<Note>,
+) -> Value {
     // `translate` returns an already-parsed OMNI-CT template; its `source` is
     // the OMNI-CT the reviewer will read, not the Jinja that came in.
     let parsed = translated.template;
@@ -855,7 +868,7 @@ fn chat_template(b: &mut ModelBuilder, cfg: &json::Value, notes: &mut Vec<Note>)
     let ast = Object::blob(parsed.to_value().encode());
     let ast_digest = ast.digest(b.hash);
     b.extra_objects.push(ast);
-    Some(Value::map(vec![
+    Value::map(vec![
         ("t", Value::text("omni.tok/chat-template")),
         ("v", Value::U(1)),
         ("lang", Value::text(crate::ct::LANG)),
@@ -864,7 +877,7 @@ fn chat_template(b: &mut ModelBuilder, cfg: &json::Value, notes: &mut Vec<Note>)
             "compiled",
             Value::Array(vec![Value::U(0), Value::Bytes(ast_digest.to_vec())]),
         ),
-    ]))
+    ])
 }
 
 /// Imports a Hugging Face model directory.

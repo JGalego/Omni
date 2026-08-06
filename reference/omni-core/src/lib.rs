@@ -57,6 +57,7 @@ pub mod delta;
 pub mod dtype;
 pub mod ed25519;
 pub mod expr;
+pub mod gguf;
 pub mod hf;
 pub mod hfquant;
 pub mod interp;

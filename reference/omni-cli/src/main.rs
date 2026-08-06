@@ -139,6 +139,12 @@ VERBS:
                               §06.7 tokenizer, and the chat template translated
                               into OMNI-CT — or left out and named, if §06.9
                               cannot express it
+    import  gguf <in.gguf> -o <out.omni> [--name N] [--arch FAMILY]
+                              A GGUF file as one dequantize expression per
+                              tensor (§05.2.4). Every source byte is kept, cut
+                              into the fields of its block, so an export is the
+                              same file back; every block is dequantized twice
+                              and compared before the import is claimed
     import  peft <adapter-dir> --base <base.omni> -o <out.omni>
                               A PEFT LoRA as an §08 Adapter, pinned to that base
                               by digest rather than by the name PEFT gives it
@@ -155,6 +161,11 @@ VERBS:
                               Write a packed checkpoint back out. Byte-exact for
                               a container imported from one: the words were never
                               converted, so there is nothing to convert back
+    export  gguf <in.omni> -o <out.gguf> [--plan]
+                              Write a GGUF file back out. Byte-exact for a
+                              container this build imported from one: the header
+                              is the source's, key for key, and each tensor is
+                              its stored fields re-interleaved
     export  safetensors <in.omni> [-o <out.safetensors>] [--plan]
                               [--allow-lossy]
                               Emit into another format. --plan says what would
@@ -4112,14 +4123,18 @@ fn cmd_import(args: &[String]) -> R {
     if matches!(format.as_str(), "hf" | "huggingface" | "repo") {
         return cmd_import_hf(args, input);
     }
+    if format == "gguf" {
+        return cmd_import_gguf(args, input);
+    }
     if let Some(method) = omni_core::hfquant::Method::parse(format) {
         return cmd_import_hfquant(args, input, method);
     }
     if format != "safetensors" {
         prr!(
             "omni: no importer for `{format}`. This build imports safetensors, \
-             pytorch, hf, peft, gptq and awq; `docs/design/import-export.md` §3 \
-             lists what the others would need\n"
+             pytorch, hf, gguf, peft, gptq and awq; \
+             `docs/design/import-export.md` §3 lists what the others would \
+             need\n"
         );
         return Ok(2);
     }
@@ -4193,6 +4208,165 @@ fn cmd_import(args: &[String]) -> R {
         100.0 * packed.len() as f64 / r.source_size.max(1) as f64
     );
     pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni import gguf` — the format llama.cpp ships, read structurally.
+///
+/// The interesting part is what is *not* here: no conversion. A GGUF block goes
+/// into the container as its own fields, in its own bytes, and the arithmetic
+/// that reads it is one `dequantize` node from §05.1's closed set. That is what
+/// makes `omni export gguf` able to hand back the same file.
+fn cmd_import_gguf(args: &[String], input: &str) -> R {
+    use omni_core::gguf::{import, ImportOpts};
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let bytes = std::fs::read(input)?;
+    let opts = ImportOpts {
+        name: flag(args, "--name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("imported/{}", stem(input))),
+        source_path: input.to_string(),
+        hash: if flag(args, "--hash") == Some("sha256") {
+            HashAlgo::Sha256
+        } else {
+            HashAlgo::Blake3_256
+        },
+        chunk_size: flag(args, "--chunk")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 20),
+        license: flag(args, "--license").map(str::to_string),
+        arch: flag(args, "--arch").map(str::to_string),
+        max_verify_elems: flag(args, "--verify-elems")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 22),
+    };
+    let imported = match import(&bytes, &opts) {
+        Ok(i) => i,
+        // A type this build will not guess at is a refusal with a reason, not a
+        // crash and not a half-written container.
+        Err(e @ omni_core::gguf::Error::Unsupported(_)) => {
+            prr!("omni: {e}\n");
+            return Ok(4);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: opts.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+
+    let r = &imported.report;
+    pr!("imported {input} -> {out}");
+    pr!(
+        "  source       gguf, {}, {}",
+        human(r.source_size),
+        short(opts.hash, &r.source_digest)
+    );
+    pr!("  types");
+    for (t, n) in &imported.histogram {
+        pr!("     {:<8} {} tensor(s)", t.name(), commas(*n as u64));
+    }
+    pr!(
+        "  tensors      {} reassembled and compared with the source ({}) — I4",
+        commas(r.verified_tensors as u64),
+        human(r.verified_bytes)
+    );
+    pr!(
+        "  values       {} element(s) dequantized twice and compared, once \
+through the expression graph and once from the block layout",
+        commas(r.dequant_checked)
+    );
+    if r.unrepresented.is_empty() {
+        pr!("  unrepresented  nothing");
+    } else {
+        pr!("  unrepresented");
+        for n in &r.unrepresented {
+            pr!("     {} — {} ({})", n.item, n.reason, n.action);
+        }
+    }
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    for w in &r.warnings {
+        pr!("  warning      {w}");
+    }
+    pr!(
+        "  size         {} -> {} ({:.1} %)",
+        human(r.source_size),
+        human(packed.len() as u64),
+        100.0 * packed.len() as f64 / r.source_size.max(1) as f64
+    );
+    pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni export gguf` — the same file back, when it was the same file in.
+fn cmd_export_gguf(args: &[String], input: &str) -> R {
+    use omni_core::gguf::{export, plan};
+    let c = Container::open(std::fs::read(input)?)?;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let table = tensor_table(&c)?;
+    let manifest = c.root()?;
+
+    // E1: the plan first, with nothing written.
+    let p = plan(&ctx, &manifest, &table)?;
+    pr!("{input} -> gguf");
+    pr!(
+        "  tensors      {}, {} of payload",
+        commas(p.tensors.len() as u64),
+        human(p.bytes)
+    );
+    pr!(
+        "  header       {}",
+        if p.from_gguf {
+            "the source file's own, key for key (§I2)"
+        } else {
+            "composed here; this container did not come from GGUF"
+        }
+    );
+    if p.lossless() {
+        pr!("  lossless     yes");
+    } else {
+        pr!(
+            "  lossless     no — {} thing(s) would be lost:",
+            p.loss.len()
+        );
+        for l in &p.loss {
+            pr!("     {} — {}", l.item, l.reason);
+        }
+    }
+    if args.iter().any(|a| a == "--plan") {
+        return Ok(if p.lossless() { 0 } else { 3 });
+    }
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    if !p.lossless() && !args.iter().any(|a| a == "--allow-lossy") {
+        prr!("omni: this export would lose the things listed above\n");
+        prr!("omni: pass --allow-lossy to write it anyway\n");
+        return Ok(1);
+    }
+    let (bytes, p) = export(&ctx, &manifest, &table)?;
+    std::fs::write(out, &bytes)?;
+    pr!("wrote {out}  {}", human(bytes.len() as u64));
+    let report_path = format!("{out}.loss.json");
+    std::fs::write(
+        &report_path,
+        p.loss_report(&c.header.root_digest, c.header.hash),
+    )?;
+    pr!("wrote {report_path}");
     Ok(0)
 }
 
@@ -4850,11 +5024,14 @@ fn cmd_export(args: &[String]) -> R {
     if format == "peft" {
         return cmd_export_peft(args, input);
     }
+    if format == "gguf" {
+        return cmd_export_gguf(args, input);
+    }
     if format != "safetensors" {
         prr!(
             "omni: no exporter for `{format}`. This build exports safetensors, \
-             gptq, awq and peft; `docs/design/import-export.md` §5.2 lists the \
-             others\n"
+             gguf, gptq, awq and peft; `docs/design/import-export.md` §5.2 \
+             lists the others\n"
         );
         return Ok(2);
     }
