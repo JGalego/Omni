@@ -156,10 +156,14 @@ Jinja2 → OMNI-CT translation succeeds for ≥ 95 % of chat templates on a publ
 hub snapshot, with the failures analyzed and published. *If OMNI-CT cannot cover
 95 %, the language grows or the fallback story changes.*
 
-**Gate 2 status.** OMNI-IR parses, verifies, prints and rewrites; `omni.core` is
-frozen and `omni.tensor`/`omni.nn`/`omni.quant`/`omni.io` are defined with per-op
-versions; `graph synthesize` builds a decoder graph from `arch.params` and
-`graph lower` applies the shipped lowerings. The tokenizer IR and OMNI-CT run
+**Gate 2 status.** Not met: the gate wants ten architecture families and this
+build synthesizes **four** — `transformer.decoder`, `transformer.encoder`,
+`cnn.classifier` and `mlp` — with a fifth, Mamba/SSM, blocked on a specification
+gap rather than on code (see `ssm_scan` below). OMNI-IR parses, verifies, prints
+and rewrites; `omni.core` is frozen and
+`omni.tensor`/`omni.nn`/`omni.quant`/`omni.io` are defined with per-op versions;
+`graph synthesize` builds a graph from `arch.params` and `graph lower` applies
+the shipped lowerings. The tokenizer IR and OMNI-CT run
 their own conformance vectors. The WASM host of §11.6 exists and runs plugin
 expression ops under the restricted profile. **A reference interpreter now exists**
 (`omni graph run`): all of `omni.core` including its control flow, all 31
@@ -169,8 +173,16 @@ names it without defining it — the operand roles and the discretization rule a
 unstated, and different readings give different numbers — so the gap is recorded
 in §07.8 as specification work rather than papered over with a guess.
 
-Writing it paid for itself immediately, which is the argument for gates of this
-kind: **the synthesizer was emitting a graph that verified and computed the wrong
+The encoder is the same synthesizer as the decoder with one flag, which is the
+honest way to have both: the difference between them is not shape, it is
+*meaning*, and a copy would drift. The check that keeps it honest is in the
+interpreter rather than the verifier — an encoder's output at position 0 must
+move when a later token changes, and an encoder that emitted `causal: true` by
+accident would verify, run, produce finite numbers, and pass every other
+assertion in the file.
+
+Writing the interpreter paid for itself immediately, which is the argument for
+gates of this kind: **the synthesizer was emitting a graph that verified and computed the wrong
 thing.** It reshaped the projections to `[B·S, heads, head_dim]` and handed them
 to `attention`, whose last two axes are keys and head dimension — so the op was
 attending across the *heads of a single token* instead of across positions. Every

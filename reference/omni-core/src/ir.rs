@@ -4385,11 +4385,23 @@ pub mod binary {
 /// run` over real weights — because a synthesizer that emits a well-typed graph
 /// nobody has run is how `transformer.decoder` came to attend across heads
 /// instead of positions and pass verification while doing it.
-pub const FAMILIES: &[&str] = &["transformer.decoder", "cnn.classifier", "mlp"];
+pub const FAMILIES: &[&str] = &[
+    "transformer.decoder",
+    "transformer.encoder",
+    "cnn.classifier",
+    "mlp",
+];
 
 pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<Module, String> {
     match family {
-        "transformer.decoder" => synthesize_decoder(params, available),
+        "transformer.decoder" => synthesize_transformer(params, available, true),
+        // The one difference that matters is the mask, and it is a difference in
+        // *meaning* rather than in shape: without it every position sees the
+        // future, which is what a bidirectional encoder is for and what a
+        // decoder must never do. Everything else — the projections, the
+        // grouping, the norm — is the same graph, so it is the same
+        // synthesizer with the flag rather than a copy that can drift.
+        "transformer.encoder" => synthesize_transformer(params, available, false),
         "cnn.classifier" => synthesize_cnn(params, available),
         "mlp" => synthesize_mlp(params, available),
         other => Err(format!(
@@ -4417,7 +4429,11 @@ fn require(available: &[String], names: Vec<String>) -> Result<Vec<String>, Stri
     Ok(names)
 }
 
-fn synthesize_decoder(params: &Value, available: &[String]) -> Result<Module, String> {
+fn synthesize_transformer(
+    params: &Value,
+    available: &[String],
+    causal: bool,
+) -> Result<Module, String> {
     let get = |k: &str| -> Option<u64> { params.get(k).and_then(|v| v.as_u64()) };
     let hidden = get("hidden_size").ok_or("arch.params has no `hidden_size`")?;
     let layers = get("n_layers").ok_or("arch.params has no `n_layers`")?;
@@ -4476,7 +4492,11 @@ fn synthesize_decoder(params: &Value, available: &[String]) -> Result<Module, St
         name
     };
     let embed = need("model.embed_tokens.weight".into());
-    let lm_head = need("lm_head.weight".into());
+    // An encoder has no language-modelling head: its result is the hidden
+    // states, and a classifier or a retriever puts its own head on top. Asking
+    // for `lm_head.weight` and not finding it would refuse a perfectly good
+    // BERT.
+    let lm_head = causal.then(|| need("lm_head.weight".into()));
     let mut per_layer = Vec::new();
     for l in 0..layers {
         per_layer.push((
@@ -4673,7 +4693,7 @@ fn synthesize_decoder(params: &Value, available: &[String]) -> Result<Module, St
         let attn = fresh();
         let mut attn_op = Op::new("omni.nn", "attention", 2)
             .with_inputs(&[posed[0], posed[1], posed[2]])
-            .with_attr("causal", Value::Bool(true))
+            .with_attr("causal", Value::Bool(causal))
             .with_attr("kv_groups", Value::U(heads / kv_heads.max(1)))
             // The scale is written explicitly: a shipped lowering cannot know
             // the head dimension, and §07.10 wants nothing implicit in the
@@ -4756,29 +4776,38 @@ fn synthesize_decoder(params: &Value, available: &[String]) -> Result<Module, St
     // fabricated into a feed-forward block the weights do not describe: this
     // model has no FFN tensors, and inventing them would be exactly the
     // fabrication importer rule I1 forbids.
-    let hw = fresh();
-    ops.push(constant(&lm_head, vec![Dim::Dynamic, Dim::N(hidden)], hw));
-    let hwt = fresh();
-    let vocab = Dim::Dynamic;
-    ops.push(
-        Op::new("omni.tensor", "transpose", 1)
-            .with_inputs(&[hw])
-            .with_attr("perm", Value::Array(vec![Value::U(1), Value::U(0)]))
-            .with_output(
-                hwt,
-                Type::tensor(vec![Dim::N(hidden), vocab.clone()], dt.clone()),
-            ),
-    );
-    let logits = fresh();
-    ops.push(
-        Op::new("omni.tensor", "matmul", 1)
-            .with_inputs(&[h, hwt])
-            .with_output(
-                logits,
-                Type::tensor(vec![b.clone(), s.clone(), vocab.clone()], dt.clone()),
-            ),
-    );
-    ops.push(Op::new("omni.core", "return", 1).with_inputs(&[logits]));
+    let result = match &lm_head {
+        Some(name) => {
+            let hw = fresh();
+            ops.push(constant(name, vec![Dim::Dynamic, Dim::N(hidden)], hw));
+            let hwt = fresh();
+            let vocab = Dim::Dynamic;
+            ops.push(
+                Op::new("omni.tensor", "transpose", 1)
+                    .with_inputs(&[hw])
+                    .with_attr("perm", Value::Array(vec![Value::U(1), Value::U(0)]))
+                    .with_output(
+                        hwt,
+                        Type::tensor(vec![Dim::N(hidden), vocab.clone()], dt.clone()),
+                    ),
+            );
+            let logits = fresh();
+            ops.push(
+                Op::new("omni.tensor", "matmul", 1)
+                    .with_inputs(&[h, hwt])
+                    .with_output(
+                        logits,
+                        Type::tensor(vec![b.clone(), s.clone(), vocab.clone()], dt.clone()),
+                    ),
+            );
+            ops.push(Op::new("omni.core", "return", 1).with_inputs(&[logits]));
+            Type::tensor(vec![b.clone(), s.clone(), vocab], dt.clone())
+        }
+        None => {
+            ops.push(Op::new("omni.core", "return", 1).with_inputs(&[h]));
+            Type::tensor(vec![b.clone(), s.clone(), Dim::N(hidden)], dt.clone())
+        }
+    };
 
     let f = Function {
         params: vec![(
@@ -4791,10 +4820,7 @@ fn synthesize_decoder(params: &Value, available: &[String]) -> Result<Module, St
                 },
             ),
         )],
-        results: vec![Type::tensor(
-            vec![Dim::Sym("B".into()), Dim::Sym("S".into()), vocab],
-            dt.clone(),
-        )],
+        results: vec![result],
         attrs: vec![
             ("kind".into(), Value::text("forward")),
             ("activation".into(), Value::text(activation)),
@@ -4846,7 +4872,14 @@ fn synthesize_decoder(params: &Value, available: &[String]) -> Result<Module, St
         },
     ];
     m.attrs = vec![
-        ("family".into(), Value::text("transformer.decoder")),
+        (
+            "family".into(),
+            Value::text(if causal {
+                "transformer.decoder"
+            } else {
+                "transformer.encoder"
+            }),
+        ),
         ("synthesized".into(), Value::Bool(true)),
     ];
     m.functions = vec![("forward".into(), f)];
@@ -5949,6 +5982,78 @@ mod tests {
             ("n_heads", Value::U(4)),
         ]);
         assert!(synthesize("transformer.decoder", &bad, &names).is_err());
+    }
+
+    #[test]
+    fn an_encoder_is_the_same_graph_without_the_mask_and_without_the_head() {
+        let params = Value::map(vec![
+            ("hidden_size", Value::U(64)),
+            ("n_layers", Value::U(2)),
+            ("n_heads", Value::U(4)),
+            ("norm", Value::map(vec![("kind", Value::text("layer"))])),
+        ]);
+        let mut names = vec!["model.embed_tokens.weight".to_string()];
+        for l in 0..2 {
+            names.push(format!("model.layers.{l}.norm.weight"));
+            for p in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                names.push(format!("model.layers.{l}.attn.{p}.weight"));
+            }
+        }
+        // No `lm_head.weight` in the list: an encoder's result is its hidden
+        // states, and refusing a BERT for lacking a language-modelling head
+        // would be refusing it for being what it is.
+        let m = synthesize("transformer.encoder", &params, &names).expect("synthesizes");
+        assert_eq!(
+            m.attrs
+                .iter()
+                .find(|(k, _)| k == "family")
+                .map(|(_, v)| v.clone()),
+            Some(Value::text("transformer.encoder"))
+        );
+
+        // The mask is the whole difference, and it is asserted rather than
+        // assumed: an encoder that emitted `causal: true` would verify, run,
+        // and quietly be a decoder.
+        let attn: Vec<&Op> = m.functions[0]
+            .1
+            .body
+            .blocks
+            .iter()
+            .flat_map(|b| b.ops.iter())
+            .filter(|o| o.name == "attention")
+            .collect();
+        assert_eq!(attn.len(), 2, "one attention per layer");
+        for a in &attn {
+            assert_eq!(a.attr("causal"), Some(&Value::Bool(false)));
+        }
+
+        // The result is [B, S, hidden], not [B, S, vocab].
+        let out = &m.functions[0].1.results[0];
+        assert!(
+            format!("{out:?}").contains("N(64)"),
+            "the encoder should return hidden states: {out:?}"
+        );
+
+        let lookup = |name: &str| -> Option<(Vec<u64>, DType)> {
+            if name == "model.embed_tokens.weight" {
+                return Some((vec![256, 64], DType::BF16));
+            }
+            if name.ends_with("norm.weight") {
+                return Some((vec![64], DType::F32));
+            }
+            Some((vec![64, 64], DType::BF16))
+        };
+        let cx = Context {
+            tensor: Some(&lookup),
+            ..Default::default()
+        };
+        let r = verify(&m, &cx);
+        assert!(r.is_valid(), "{:?}", r.findings);
+        assert_eq!(r.unknown, 0);
+
+        // And the decoder built from the same weights still wants its head.
+        let e = synthesize("transformer.decoder", &params, &names).unwrap_err();
+        assert!(e.contains("lm_head.weight"), "{e}");
     }
 
     #[test]

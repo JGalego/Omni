@@ -396,7 +396,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-496 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+498 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -502,7 +502,13 @@ lowered without ops for building a mask — keeps its high-level form and is
 reported; that an approximate rewrite is refused unless allowed; that the §07.9
 binary encoding round-trips nested regions and ten thousand ops and refuses a
 truncated one; and that synthesis fails by naming the weight it wanted rather
-than by inventing one. And, for §09: that a
+than by inventing one. And, for the two transformer
+families: that an encoder emits `causal: false` on every attention op, returns
+hidden states rather than logits, and does not demand a language-modelling head
+— while a decoder built from the same weights still names `lm_head.weight` as
+missing; and, run over real weights, that the encoder's output at position 0
+*moves* when a later token changes, which is the only check that can tell an
+encoder from a decoder once both verify. And, for §09: that a
 training state and a shard map round-trip through canonical CBOR; that shards
 which leave a gap, overlap, name a mesh dimension that does not exist or disagree
 with its extent are each reported with their rule; that resharding four ranks to
@@ -688,7 +694,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 496 passed; 0 failed
+test result: ok. 498 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

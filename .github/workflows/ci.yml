@@ -865,7 +865,9 @@ jobs:
 
           # And the numbers themselves are checked in the unit tests, where a
           # decoder built from known weights has to produce a distribution over
-          # the vocabulary and logits at position 0 that no later token can move.
+          # the vocabulary and logits at position 0 that no later token can move —
+          # and, for the encoder, where position 0 *must* move when a later token
+          # changes, which is the only check that can tell the two apart at all.
           echo "the synthesized graph runs, is bounded, and says when its weights are not a model"
 
       # `docs/design/sdk.md` §3: the C ABI is "the binding substrate", and the
@@ -1220,6 +1222,18 @@ jobs:
           if grep -q 'chat_template (OMNI-CT)' /tmp/hf2.txt; then
             echo "::error::a template it cannot express was written anyway"; exit 1
           fi
+
+          # §07.5: a family this build has no synthesizer for is refused with the
+          # list, rather than approximated by the nearest one that would verify.
+          # `llama` is the family the config states; `transformer.decoder` is
+          # the family a *graph* would be synthesized for, and conflating them
+          # is how a synthesizer starts guessing.
+          set +e
+          "$OMNI" graph synthesize /tmp/hf.omni -o /tmp/nope.omni > /tmp/fam.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'transformer.decoder, transformer.encoder, cnn.classifier, mlp' /tmp/fam.txt
 
           echo "a Hugging Face repo imports as one container, with its tokenizer in it"
 

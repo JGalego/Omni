@@ -3894,6 +3894,79 @@ mod tests {
     /// result is checked as a probability distribution over the vocabulary,
     /// because that is the property a decoder's output has.
     #[test]
+    fn a_synthesized_encoder_is_bidirectional_where_the_decoder_is_not() {
+        // The mirror of the causality test below, and the only check that can
+        // tell an encoder from a decoder: the encoder's output at position 0
+        // *must* move when a later token changes. A synthesizer that emitted
+        // `causal: true` by accident would verify, run, produce finite numbers
+        // and pass every other assertion in this file.
+        let (hidden, heads, layers, vocab) = (8u64, 2u64, 2u64, 5u64);
+        let head_dim = hidden / heads;
+        let w = |name: &str, shape: &[u64], k: f64| -> (String, Tensor) {
+            let n = numel(shape);
+            let data: Vec<f64> = (0..n).map(|i| (i as f64 * k).sin() * 0.3 + 0.05).collect();
+            (
+                name.to_string(),
+                Tensor::new(shape.to_vec(), DType::F32, data),
+            )
+        };
+        let mut weights: Vec<(String, Tensor)> =
+            vec![w("model.embed_tokens.weight", &[vocab, hidden], 1.7)];
+        for l in 0..layers {
+            weights.push(w(&format!("model.layers.{l}.norm.weight"), &[hidden], 0.9));
+            for (i, p) in ["q_proj", "k_proj", "v_proj", "o_proj"].iter().enumerate() {
+                let _ = head_dim;
+                weights.push(w(
+                    &format!("model.layers.{l}.attn.{p}.weight"),
+                    &[hidden, hidden],
+                    1.1 + i as f64 * 0.3 + l as f64,
+                ));
+            }
+        }
+        let available: Vec<String> = weights.iter().map(|(n, _)| n.clone()).collect();
+        let params = Value::map(vec![
+            ("hidden_size", Value::U(hidden)),
+            ("n_layers", Value::U(layers)),
+            ("n_heads", Value::U(heads)),
+            ("activation", Value::text("gelu")),
+            (
+                "norm",
+                Value::map(vec![
+                    ("kind", Value::text("layer")),
+                    ("eps", Value::F64(1e-5)),
+                ]),
+            ),
+        ]);
+        let m = crate::ir::synthesize("transformer.encoder", &params, &available)
+            .expect("the synthesizer should build this");
+
+        let toks = |a: f64, b: f64, c: f64| {
+            Tensor::new(
+                vec![1, 3],
+                DType::Int {
+                    w: 32,
+                    signed: true,
+                },
+                vec![a, b, c],
+            )
+        };
+        let out = run(&m, &[toks(0.0, 2.0, 4.0)], &weights, &Limits::default())
+            .unwrap_or_else(|e| panic!("the synthesized encoder did not run: {e}"));
+        let h = &out.returned[0];
+        // Hidden states, not logits: [B, S, hidden].
+        assert_eq!(h.shape, vec![1, 3, hidden]);
+        assert!(h.data.iter().all(|x| x.is_finite()), "{:?}", h.data);
+
+        let out2 = run(&m, &[toks(0.0, 2.0, 1.0)], &weights, &Limits::default()).unwrap();
+        let moved = (0..hidden)
+            .any(|d| h.get(&[0, 0, d]).unwrap() != out2.returned[0].get(&[0, 0, d]).unwrap());
+        assert!(
+            moved,
+            "position 0 did not move when a later token changed: this graph is causal"
+        );
+    }
+
+    #[test]
     fn a_synthesized_decoder_graph_executes_end_to_end() {
         let (hidden, heads, kv_heads, layers, vocab) = (8u64, 2u64, 1u64, 2u64, 5u64);
         let head_dim = hidden / heads;
