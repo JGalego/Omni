@@ -150,9 +150,11 @@ versions; `graph synthesize` builds a decoder graph from `arch.params` and
 their own conformance vectors. The WASM host of §11.6 exists and runs plugin
 expression ops under the restricted profile. **A reference interpreter now exists**
 (`omni graph run`): all of `omni.core` including its control flow, all 31
-`omni.tensor` ops with a general `einsum`, `omni.quant`'s four, and the `omni.nn`
-ops a decoder needs. What it does not implement — `conv`, `pool`, `moe_route`,
-`ssm_scan`, `interpolate` — is refused by name rather than approximated.
+`omni.tensor` ops with a general `einsum`, `omni.quant`'s four, and all of
+`omni.nn` except one. The exception is `ssm_scan`, which is refused because §07
+names it without defining it — the operand roles and the discretization rule are
+unstated, and different readings give different numbers — so the gap is recorded
+in §07.8 as specification work rather than papered over with a guess.
 
 Writing it paid for itself immediately, which is the argument for gates of this
 kind: **the synthesizer was emitting a graph that verified and computed the wrong

@@ -2065,13 +2065,524 @@ impl State<'_> {
                 let d = dt(q);
                 Ok(vec![self.attention(op, q, k, v, ins.get(3), &d)?])
             }
+            "conv" => {
+                let (x, w) = (a(0)?, a(1)?);
+                let rank = x.shape.len().saturating_sub(2);
+                let spatial = |key: &str, default: i64| -> Res<Vec<u64>> {
+                    match op.attr(key) {
+                        Some(_) => int_list(op, key)?
+                            .into_iter()
+                            .map(|v| {
+                                u64::try_from(v).map_err(|_| {
+                                    Error::Type(format!("conv: `{key}` has a negative entry"))
+                                })
+                            })
+                            .collect(),
+                        None => Ok(vec![default as u64; rank]),
+                    }
+                };
+                let d = dt(x);
+                Ok(vec![self.conv(
+                    x,
+                    w,
+                    ins.get(2),
+                    &spatial("stride", 1)?,
+                    &spatial("padding", 0)?,
+                    &spatial("dilation", 1)?,
+                    int_attr_or(op, "groups", 1)?.max(1) as u64,
+                    false,
+                    &d,
+                )?])
+            }
+            "conv1d_causal" => {
+                // Causal means the padding is entirely on the left, so output
+                // position t sees inputs up to t and never past it. Stride and
+                // dilation are not attributes of this op: it exists to be the
+                // one whose padding cannot be got wrong.
+                let (x, w) = (a(0)?, a(1)?);
+                if x.shape.len() != 3 || w.shape.len() != 3 {
+                    return Err(Error::Type(format!(
+                        "conv1d_causal: x is {:?} and w is {:?}; both are \
+                         [batch, channels, length]",
+                        x.shape, w.shape
+                    )));
+                }
+                let d = dt(x);
+                Ok(vec![self.conv(
+                    x,
+                    w,
+                    ins.get(2),
+                    &[1],
+                    &[w.shape[2].saturating_sub(1)],
+                    &[1],
+                    int_attr_or(op, "groups", 1)?.max(1) as u64,
+                    true,
+                    &d,
+                )?])
+            }
+            "pool" => {
+                let x = a(0)?;
+                let kind = op
+                    .attr("kind")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Type("pool has no `kind`".into()))?
+                    .to_string();
+                let window: Vec<u64> = int_list(op, "window")?
+                    .into_iter()
+                    .map(|v| v.max(1) as u64)
+                    .collect();
+                let stride: Vec<u64> = match op.attr("stride") {
+                    Some(_) => int_list(op, "stride")?
+                        .into_iter()
+                        .map(|v| v.max(1) as u64)
+                        .collect(),
+                    // Non-overlapping by default, which is what every framework
+                    // does and what "no stride given" has to mean for the window
+                    // to partition the input.
+                    None => window.clone(),
+                };
+                let d = dt(x);
+                Ok(vec![self.pool(x, &kind, &window, &stride, &d)?])
+            }
+            "interpolate" => {
+                let x = a(0)?;
+                let mode = op
+                    .attr("mode")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Type("interpolate has no `mode`".into()))?
+                    .to_string();
+                let d = dt(x);
+                Ok(vec![self.interpolate(x, &mode, op.attr("scale"), &d)?])
+            }
+            "moe_route" => {
+                let (x, w) = (a(0)?, a(1)?);
+                let k = int_attr(op, "top_k")?;
+                if k <= 0 {
+                    return Err(Error::Type("moe_route: `top_k` must be positive".into()));
+                }
+                let normalize = matches!(op.attr("normalize"), Some(Value::Bool(true)));
+                let d = dt(x);
+                Ok(self.moe_route(x, w, k as u64, normalize, &d)?)
+            }
+            // `ssm_scan` is not refused for being hard. It is refused because
+            // §07 names it — "(associative scan)" — without saying what it
+            // computes: which operand is the state transition and which the
+            // input projection, whether the timestep is an operand or folded
+            // into `A`, and whether the discretization is zero-order hold or
+            // bilinear. Those choices produce different numbers from the same
+            // tensors. Every other op in this dialect either has a shape
+            // function pinning its operands or a definition that is standard
+            // across every framework; this one has neither, so implementing it
+            // would mean inventing the semantics and then checking my own
+            // invention. See `docs/spec/07-graph.md` §7.8.
+            "ssm_scan" => Err(Error::Unsupported(
+                "omni.nn/ssm_scan: §07 names this op but does not define it. The \
+                 operand order, whether the timestep is an operand, and the \
+                 discretization rule are all unstated, and different readings \
+                 give different numbers — so this is a gap in the specification \
+                 rather than a gap in this build, and filling it here would be \
+                 inventing a semantics and then agreeing with myself"
+                    .into(),
+            )),
             other => Err(Error::Unsupported(format!(
-                "omni.nn/{other}: this build interprets embedding, norm, activation, \
-                 rope and attention — the ops a decoder needs. `{other}` is a real \
-                 op of the dialect and is refused rather than approximated, because \
-                 a wrong answer here would look like a working model"
+                "omni.nn/{other}: not an op of this dialect at version {}",
+                op.version
             ))),
         }
+    }
+
+    /// N-dimensional convolution, and the causal 1-D case that shares it.
+    ///
+    /// `x` is `[batch, in_channels, spatial…]`, `w` is
+    /// `[out_channels, in_channels / groups, kernel…]`, and the optional third
+    /// operand is a per-output-channel bias. This is the cross-correlation every
+    /// framework calls convolution — the kernel is not flipped — which is worth
+    /// saying because the mathematical convolution *does* flip it.
+    #[allow(clippy::too_many_arguments)]
+    fn conv(
+        &mut self,
+        x: &Tensor,
+        w: &Tensor,
+        bias: Option<&Tensor>,
+        stride: &[u64],
+        padding: &[u64],
+        dilation: &[u64],
+        groups: u64,
+        causal: bool,
+        dtype: &DType,
+    ) -> Res<Tensor> {
+        if x.shape.len() < 3 || w.shape.len() != x.shape.len() {
+            return Err(Error::Type(format!(
+                "conv: x is {:?} and w is {:?}; both are [n, c, spatial…]",
+                x.shape, w.shape
+            )));
+        }
+        let sp = x.shape.len() - 2;
+        for (what, v) in [
+            ("stride", stride),
+            ("padding", padding),
+            ("dilation", dilation),
+        ] {
+            if v.len() != sp {
+                return Err(Error::Type(format!(
+                    "conv: `{what}` has {} entries for {sp} spatial dimension(s)",
+                    v.len()
+                )));
+            }
+        }
+        let (n, cin, cout) = (x.shape[0], x.shape[1], w.shape[0]);
+        if groups == 0 || cin % groups != 0 || cout % groups != 0 {
+            return Err(Error::Type(format!(
+                "conv: {cin} in and {cout} out channels do not divide into {groups} group(s)"
+            )));
+        }
+        if w.shape[1] != cin / groups {
+            return Err(Error::Type(format!(
+                "conv: the kernel takes {} input channel(s) and each group has {}",
+                w.shape[1],
+                cin / groups
+            )));
+        }
+        let kernel: Vec<u64> = w.shape[2..].to_vec();
+        let mut out_sp = Vec::with_capacity(sp);
+        for k in 0..sp {
+            // Causal padding is all on the left, so the output keeps the input's
+            // length; the symmetric case pads both sides.
+            let padded = x.shape[2 + k] + if causal { padding[k] } else { 2 * padding[k] };
+            let span = dilation[k] * (kernel[k] - 1) + 1;
+            if padded < span {
+                return Err(Error::Bounds(format!(
+                    "conv: a {span}-wide kernel does not fit {padded} on axis {k}"
+                )));
+            }
+            out_sp.push((padded - span) / stride[k] + 1);
+        }
+        let mut shape = vec![n, cout];
+        shape.extend_from_slice(&out_sp);
+        self.check_size(&shape)?;
+        // One unit of fuel per output element: a convolution is where a graph
+        // can ask for arbitrarily much work with very few ops.
+        self.spend(numel(&shape) / 64 + 1)?;
+
+        let per_group_out = cout / groups;
+        let per_group_in = cin / groups;
+        let mut data = Vec::with_capacity(numel(&shape) as usize);
+        let mut idx = vec![0u64; shape.len()];
+        for _ in 0..numel(&shape) {
+            let (b, oc) = (idx[0], idx[1]);
+            let g = oc / per_group_out;
+            let mut acc = 0.0;
+            let mut kidx = vec![0u64; sp];
+            let kn = numel(&kernel);
+            for _ in 0..kn {
+                // The input position this kernel tap reads, in each spatial axis.
+                let mut src = Vec::with_capacity(x.shape.len());
+                let mut inside = true;
+                for k in 0..sp {
+                    let p =
+                        (idx[2 + k] * stride[k] + kidx[k] * dilation[k]) as i64 - padding[k] as i64;
+                    if p < 0 || p as u64 >= x.shape[2 + k] {
+                        inside = false;
+                        break;
+                    }
+                    src.push(p as u64);
+                }
+                if inside {
+                    for ic in 0..per_group_in {
+                        let mut xi = vec![b, g * per_group_in + ic];
+                        xi.extend_from_slice(&src);
+                        let mut wi = vec![oc, ic];
+                        wi.extend_from_slice(&kidx);
+                        acc += x.at(&xi) * w.at(&wi);
+                    }
+                }
+                if kernel.is_empty() {
+                    break;
+                }
+                crate::expr::bump(&mut kidx, &kernel);
+            }
+            if let Some(bs) = bias {
+                acc += bs.data.get(oc as usize).copied().unwrap_or(0.0);
+            }
+            data.push(acc);
+            crate::expr::bump(&mut idx, &shape);
+        }
+        round_through(&Tensor::new(shape, dtype.clone(), data), dtype, Round::Rne)
+    }
+
+    /// `max` or `avg` pooling over the spatial axes of `[n, c, spatial…]`.
+    fn pool(
+        &mut self,
+        x: &Tensor,
+        kind: &str,
+        window: &[u64],
+        stride: &[u64],
+        dtype: &DType,
+    ) -> Res<Tensor> {
+        if x.shape.len() < 3 {
+            return Err(Error::Type(format!(
+                "pool: {:?} is not [n, c, spatial…]",
+                x.shape
+            )));
+        }
+        let sp = x.shape.len() - 2;
+        if window.len() != sp || stride.len() != sp {
+            return Err(Error::Type(format!(
+                "pool: a {}-wide window and {} stride(s) for {sp} spatial dimension(s)",
+                window.len(),
+                stride.len()
+            )));
+        }
+        if !matches!(kind, "max" | "avg") {
+            return Err(Error::Unsupported(format!(
+                "pool kind `{kind}`: this build does `max` and `avg`"
+            )));
+        }
+        let mut shape = vec![x.shape[0], x.shape[1]];
+        for k in 0..sp {
+            if x.shape[2 + k] < window[k] {
+                return Err(Error::Bounds(format!(
+                    "pool: a {}-wide window on an axis of extent {}",
+                    window[k],
+                    x.shape[2 + k]
+                )));
+            }
+            shape.push((x.shape[2 + k] - window[k]) / stride[k] + 1);
+        }
+        self.check_size(&shape)?;
+        let mut data = Vec::with_capacity(numel(&shape) as usize);
+        let mut idx = vec![0u64; shape.len()];
+        let wn = numel(window);
+        for _ in 0..numel(&shape) {
+            let mut acc = if kind == "max" {
+                f64::NEG_INFINITY
+            } else {
+                0.0
+            };
+            let mut widx = vec![0u64; sp];
+            for _ in 0..wn {
+                let mut src = vec![idx[0], idx[1]];
+                for k in 0..sp {
+                    src.push(idx[2 + k] * stride[k] + widx[k]);
+                }
+                let v = x.at(&src);
+                acc = if kind == "max" { acc.max(v) } else { acc + v };
+                if window.is_empty() {
+                    break;
+                }
+                crate::expr::bump(&mut widx, window);
+            }
+            data.push(if kind == "avg" { acc / wn as f64 } else { acc });
+            crate::expr::bump(&mut idx, &shape);
+        }
+        round_through(&Tensor::new(shape, dtype.clone(), data), dtype, Round::Rne)
+    }
+
+    /// Resampling over the spatial axes of `[n, c, spatial…]`.
+    ///
+    /// `nearest` and `linear` only. The half-pixel convention is the one every
+    /// framework's `align_corners=False` uses, and it is written out below
+    /// because the other convention shifts every output by half a sample and
+    /// both are called "linear".
+    fn interpolate(
+        &mut self,
+        x: &Tensor,
+        mode: &str,
+        scale: Option<&Value>,
+        dtype: &DType,
+    ) -> Res<Tensor> {
+        if x.shape.len() < 3 {
+            return Err(Error::Type(format!(
+                "interpolate: {:?} is not [n, c, spatial…]",
+                x.shape
+            )));
+        }
+        let sp = x.shape.len() - 2;
+        let factors: Vec<f64> = match scale {
+            Some(Value::Array(xs)) => xs
+                .iter()
+                .map(|v| match v {
+                    Value::F64(f) => Ok(*f),
+                    Value::U(n) => Ok(*n as f64),
+                    Value::I(n) => Ok(*n as f64),
+                    _ => Err(Error::Type("interpolate: a non-numeric `scale`".into())),
+                })
+                .collect::<Res<Vec<f64>>>()?,
+            Some(Value::F64(f)) => vec![*f; sp],
+            Some(Value::U(n)) => vec![*n as f64; sp],
+            Some(Value::I(n)) => vec![*n as f64; sp],
+            _ => return Err(Error::Type("interpolate has no `scale`".into())),
+        };
+        if factors.len() != sp {
+            return Err(Error::Type(format!(
+                "interpolate: {} scale(s) for {sp} spatial dimension(s)",
+                factors.len()
+            )));
+        }
+        if !matches!(mode, "nearest" | "linear") {
+            return Err(Error::Unsupported(format!(
+                "interpolate mode `{mode}`: this build does `nearest` and `linear`"
+            )));
+        }
+        let mut shape = vec![x.shape[0], x.shape[1]];
+        for (k, f) in factors.iter().enumerate() {
+            if *f <= 0.0 {
+                return Err(Error::Type(format!("interpolate: scale {f} on axis {k}")));
+            }
+            shape.push(((x.shape[2 + k] as f64) * f).floor().max(1.0) as u64);
+        }
+        self.check_size(&shape)?;
+        let mut data = Vec::with_capacity(numel(&shape) as usize);
+        let mut idx = vec![0u64; shape.len()];
+        for _ in 0..numel(&shape) {
+            let mut src = vec![idx[0], idx[1]];
+            let mut frac = Vec::with_capacity(sp);
+            for k in 0..sp {
+                // Half-pixel centres: output sample j maps to input coordinate
+                // (j + 0.5)/scale - 0.5, which is what keeps the resampled image
+                // in the same place rather than shifted by half a pixel.
+                let pos = ((idx[2 + k] as f64) + 0.5) / factors[k] - 0.5;
+                let lo = pos.floor().max(0.0);
+                src.push((lo as u64).min(x.shape[2 + k] - 1));
+                frac.push((pos - lo).clamp(0.0, 1.0));
+            }
+            data.push(match mode {
+                "nearest" => {
+                    let mut s = src.clone();
+                    for k in 0..sp {
+                        if frac[k] >= 0.5 {
+                            s[2 + k] = (s[2 + k] + 1).min(x.shape[2 + k] - 1);
+                        }
+                    }
+                    x.at(&s)
+                }
+                // Multilinear: 2^sp corners, weighted by the fractional part in
+                // each axis.
+                _ => {
+                    let mut acc = 0.0;
+                    for corner in 0..(1u32 << sp) {
+                        let mut s = src.clone();
+                        let mut wgt = 1.0;
+                        for k in 0..sp {
+                            if corner >> k & 1 == 1 {
+                                s[2 + k] = (s[2 + k] + 1).min(x.shape[2 + k] - 1);
+                                wgt *= frac[k];
+                            } else {
+                                wgt *= 1.0 - frac[k];
+                            }
+                        }
+                        if wgt != 0.0 {
+                            acc += wgt * x.at(&s);
+                        }
+                    }
+                    acc
+                }
+            });
+            crate::expr::bump(&mut idx, &shape);
+        }
+        round_through(&Tensor::new(shape, dtype.clone(), data), dtype, Round::Rne)
+    }
+
+    /// §07.8's MoE router: which experts a token goes to, and how much of each.
+    ///
+    /// `x` is `[…, d_model]` and `w` is the routing matrix, so the logits are
+    /// `x · w` and `w` is `[d_model, experts]`. When the two possible
+    /// orientations are distinguishable, the wrong one is an error naming both,
+    /// rather than a transpose applied on a guess.
+    fn moe_route(
+        &mut self,
+        x: &Tensor,
+        w: &Tensor,
+        k: u64,
+        normalize: bool,
+        dtype: &DType,
+    ) -> Res<Vec<Tensor>> {
+        if w.shape.len() != 2 || x.shape.is_empty() {
+            return Err(Error::Type(format!(
+                "moe_route: x is {:?} and the routing matrix is {:?}, which is rank 2",
+                x.shape, w.shape
+            )));
+        }
+        let d = x.shape[x.shape.len() - 1];
+        if w.shape[0] != d {
+            let hint = if w.shape[1] == d {
+                "; it is [experts, d_model], and this op takes [d_model, experts] \
+                 — transpose it in the graph where a reader can see it"
+            } else {
+                ""
+            };
+            return Err(Error::Type(format!(
+                "moe_route: x has {d} feature(s) and the routing matrix is {:?}{hint}",
+                w.shape
+            )));
+        }
+        let experts = w.shape[1];
+        if k > experts {
+            return Err(Error::Bounds(format!(
+                "moe_route: top_k {k} of {experts} expert(s)"
+            )));
+        }
+        let rows = x.numel() / d.max(1);
+        let mut shape = x.shape[..x.shape.len() - 1].to_vec();
+        shape.push(k);
+        self.check_size(&shape)?;
+        let mut weights = Vec::with_capacity((rows * k) as usize);
+        let mut indices = Vec::with_capacity((rows * k) as usize);
+        for r in 0..rows {
+            // Softmax over every expert first, then take the top k. Doing it the
+            // other way — softmax over only the chosen k — is a different
+            // routing, and `normalize` is what asks for that explicitly.
+            let mut logits: Vec<f64> = (0..experts)
+                .map(|e| {
+                    (0..d)
+                        .map(|i| x.data[(r * d + i) as usize] * w.data[(i * experts + e) as usize])
+                        .sum()
+                })
+                .collect();
+            let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut total = 0.0;
+            for l in logits.iter_mut() {
+                *l = (*l - m).exp();
+                total += *l;
+            }
+            for l in logits.iter_mut() {
+                *l /= total;
+            }
+            let mut order: Vec<usize> = (0..experts as usize).collect();
+            // Ties broken by expert index, so routing is a function of the input
+            // and not of the sort's internals.
+            order.sort_by(|a, b| {
+                logits[*b]
+                    .partial_cmp(&logits[*a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(b))
+            });
+            let chosen = &order[..k as usize];
+            let picked: f64 = chosen.iter().map(|e| logits[*e]).sum();
+            for e in chosen {
+                weights.push(if normalize && picked > 0.0 {
+                    logits[*e] / picked
+                } else {
+                    logits[*e]
+                });
+                indices.push(*e as f64);
+            }
+        }
+        Ok(vec![
+            round_through(
+                &Tensor::new(shape.clone(), dtype.clone(), weights),
+                dtype,
+                Round::Rne,
+            )?,
+            Tensor::new(
+                shape,
+                DType::Int {
+                    w: 32,
+                    signed: true,
+                },
+                indices,
+            ),
+        ])
     }
 
     /// §07's `attention`, interpreted rather than lowered.
@@ -3244,11 +3755,12 @@ mod tests {
     #[test]
     fn what_is_not_implemented_is_refused_by_name() {
         let x = f32t(&[1, 2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        // What is left once conv, conv1d_causal, pool, interpolate and moe_route
+        // were implemented: one op §07 names without defining, one that needs a
+        // network, an op of no dialect, and a dialect nobody has heard of.
         for (dialect, name, needle) in [
-            ("omni.nn", "conv", "omni.nn/conv"),
-            ("omni.nn", "moe_route", "moe_route"),
             ("omni.nn", "ssm_scan", "ssm_scan"),
-            ("omni.nn", "pool", "pool"),
+            ("omni.nn", "not_an_op", "omni.nn/not_an_op"),
             ("omni.io", "external", "external"),
             ("acme.secret", "op", "acme.secret/op"),
         ] {
@@ -3256,12 +3768,7 @@ mod tests {
             if name == "external" {
                 op = op.with_attr("id", Value::text("s3://weights"));
             }
-            if name == "pool" {
-                op = op
-                    .with_attr("kind", Value::text("max"))
-                    .with_attr("window", ints(&[2]));
-            }
-            let e = one_op(op, std::slice::from_ref(&x)).expect_err("{name} should be refused");
+            let e = one_op(op, std::slice::from_ref(&x)).expect_err("this op should be refused");
             assert!(
                 matches!(e, Error::Unsupported(_)),
                 "{dialect}/{name}: {e:?}"
@@ -3578,5 +4085,276 @@ mod tests {
                 "interpreted {a} against lowered {b}: §07.2 requires these to agree"
             );
         }
+    }
+    // ------------------------------------------------ the rest of omni.nn --
+
+    /// An `omni.nn` op over the given operands, with a declared result shape.
+    fn nn(name: &str, attrs: Vec<(&str, Value)>, args: &[Tensor], shape: &[u64]) -> Res<Tensor> {
+        let mut op = Op::new("omni.nn", name, 1).with_output(args.len() as u32, ty(shape));
+        for (k, v) in attrs {
+            op = op.with_attr(k, v);
+        }
+        one_op(op, args)
+    }
+
+    #[test]
+    fn a_convolution_is_a_cross_correlation_and_padding_is_where_it_says() {
+        // [1, 1, 5] over a 3-tap kernel [1, 0, -1]: a first-difference filter, so
+        // the answer is x[i] - x[i+2] at each valid position. Worked out here
+        // rather than read off the implementation.
+        let x = f32t(&[1, 1, 5], &[1.0, 2.0, 4.0, 8.0, 16.0]);
+        let w = f32t(&[1, 1, 3], &[1.0, 0.0, -1.0]);
+        let out = nn("conv", vec![], &[x.clone(), w.clone()], &[1, 1, 3]).unwrap();
+        assert_eq!(out.data, vec![1.0 - 4.0, 2.0 - 8.0, 4.0 - 16.0]);
+        // The kernel is *not* flipped: a true convolution would give the
+        // negatives of these, and every framework calls this one convolution.
+        assert_eq!(out.data[0], -3.0);
+
+        // Padding widens the output at both ends, and the pad is zeros.
+        let padded = nn(
+            "conv",
+            vec![("padding", ints(&[1]))],
+            &[x.clone(), w.clone()],
+            &[1, 1, 5],
+        )
+        .unwrap();
+        assert_eq!(padded.shape, vec![1, 1, 5]);
+        assert_eq!(padded.data[0], 0.0 - 2.0, "the left pad is a zero");
+        assert_eq!(padded.data[4], 8.0 - 0.0, "and so is the right");
+
+        // Stride and dilation, each changing the output the way they should.
+        let strided = nn(
+            "conv",
+            vec![("stride", ints(&[2]))],
+            &[x.clone(), w.clone()],
+            &[1, 1, 2],
+        )
+        .unwrap();
+        assert_eq!(strided.data, vec![1.0 - 4.0, 4.0 - 16.0]);
+        let dilated = nn(
+            "conv",
+            vec![("dilation", ints(&[2]))],
+            &[x.clone(), w.clone()],
+            &[1, 1, 1],
+        )
+        .unwrap();
+        assert_eq!(dilated.data, vec![1.0 - 16.0]);
+
+        // A bias is per output channel.
+        let biased = nn("conv", vec![], &[x, w, f32t(&[1], &[100.0])], &[1, 1, 3]).unwrap();
+        assert_eq!(biased.data, vec![97.0, 94.0, 88.0]);
+    }
+
+    #[test]
+    fn grouped_convolution_keeps_the_groups_apart() {
+        // Two channels, two groups, one output channel each: group 1's kernel
+        // must never see group 0's input, which is the whole point of groups.
+        let x = f32t(&[1, 2, 3], &[1.0, 2.0, 3.0, 10.0, 20.0, 30.0]);
+        let w = f32t(&[2, 1, 1], &[1.0, 2.0]);
+        let out = nn("conv", vec![("groups", Value::U(2))], &[x, w], &[1, 2, 3]).unwrap();
+        assert_eq!(out.data, vec![1.0, 2.0, 3.0, 20.0, 40.0, 60.0]);
+
+        // A grouping the channels do not divide into is an error, not a modulo.
+        let e = nn(
+            "conv",
+            vec![("groups", Value::U(3))],
+            &[f32t(&[1, 2, 3], &[0.0; 6]), f32t(&[2, 1, 1], &[0.0; 2])],
+            &[1, 2, 3],
+        )
+        .expect_err("2 channels, 3 groups");
+        assert!(e.to_string().contains("do not divide"), "{e}");
+    }
+
+    #[test]
+    fn a_causal_conv1d_never_reads_the_future() {
+        // The property, not the arithmetic: change the last input and every
+        // output before the last must be unmoved. A symmetric padding would
+        // fail this, which is why the op exists separately.
+        let w = f32t(&[1, 1, 3], &[1.0, 2.0, 4.0]);
+        let run = |last: f64| {
+            nn(
+                "conv1d_causal",
+                vec![],
+                &[f32t(&[1, 1, 4], &[1.0, 2.0, 3.0, last]), w.clone()],
+                &[1, 1, 4],
+            )
+            .unwrap()
+        };
+        let a = run(4.0);
+        let b = run(99.0);
+        assert_eq!(a.shape, vec![1, 1, 4], "causal padding keeps the length");
+        assert_eq!(a.data[..3], b.data[..3], "an earlier output saw the future");
+        assert_ne!(a.data[3], b.data[3], "and the last one should have moved");
+        // Position 0 sees only itself, through the kernel's last tap.
+        assert_eq!(a.data[0], 1.0 * 4.0);
+        // Position 1 sees inputs 0 and 1.
+        assert_eq!(a.data[1], 1.0 * 2.0 + 2.0 * 4.0);
+    }
+
+    #[test]
+    fn pooling_reduces_by_the_window_and_defaults_to_not_overlapping() {
+        let x = f32t(&[1, 1, 4], &[1.0, 3.0, 2.0, 8.0]);
+        let mx = nn(
+            "pool",
+            vec![("kind", Value::text("max")), ("window", ints(&[2]))],
+            std::slice::from_ref(&x),
+            &[1, 1, 2],
+        )
+        .unwrap();
+        assert_eq!(mx.data, vec![3.0, 8.0]);
+        let avg = nn(
+            "pool",
+            vec![("kind", Value::text("avg")), ("window", ints(&[2]))],
+            std::slice::from_ref(&x),
+            &[1, 1, 2],
+        )
+        .unwrap();
+        assert_eq!(avg.data, vec![2.0, 5.0]);
+        // An explicit stride of 1 overlaps, and gives one more output.
+        let overlap = nn(
+            "pool",
+            vec![
+                ("kind", Value::text("max")),
+                ("window", ints(&[2])),
+                ("stride", ints(&[1])),
+            ],
+            std::slice::from_ref(&x),
+            &[1, 1, 3],
+        )
+        .unwrap();
+        assert_eq!(overlap.data, vec![3.0, 3.0, 8.0]);
+        let e = nn(
+            "pool",
+            vec![("kind", Value::text("median")), ("window", ints(&[2]))],
+            &[x],
+            &[1, 1, 2],
+        )
+        .expect_err("median");
+        assert!(e.to_string().contains("pool kind `median`"), "{e}");
+    }
+
+    #[test]
+    fn interpolation_doubles_and_the_two_modes_differ() {
+        let x = f32t(&[1, 1, 2], &[0.0, 4.0]);
+        let near = nn(
+            "interpolate",
+            vec![("mode", Value::text("nearest")), ("scale", Value::U(2))],
+            std::slice::from_ref(&x),
+            &[1, 1, 4],
+        )
+        .unwrap();
+        assert_eq!(near.data, vec![0.0, 0.0, 4.0, 4.0]);
+        let lin = nn(
+            "interpolate",
+            vec![("mode", Value::text("linear")), ("scale", Value::U(2))],
+            std::slice::from_ref(&x),
+            &[1, 1, 4],
+        )
+        .unwrap();
+        // Half-pixel centres: the outputs sit at input coordinates
+        // -0.25, 0.25, 0.75, 1.25, clamped at the edges.
+        assert_eq!(lin.data, vec![0.0, 1.0, 3.0, 4.0]);
+        assert_ne!(near.data, lin.data);
+        // Scaling down is the same map in reverse, not a separate op.
+        let down = nn(
+            "interpolate",
+            vec![("mode", Value::text("nearest")), ("scale", Value::F64(0.5))],
+            &[f32t(&[1, 1, 4], &[1.0, 2.0, 3.0, 4.0])],
+            &[1, 1, 2],
+        )
+        .unwrap();
+        assert_eq!(down.shape, vec![1, 1, 2]);
+    }
+
+    #[test]
+    fn moe_routing_picks_the_top_experts_and_can_renormalize() {
+        // Three experts, one token. The routing matrix's columns are the
+        // experts, so a one-hot token picks out a column.
+        let x = f32t(&[1, 2], &[1.0, 0.0]);
+        let w = f32t(&[2, 3], &[0.0, 10.0, 5.0, 0.0, 0.0, 0.0]);
+        let op = Op::new("omni.nn", "moe_route", 1)
+            .with_inputs(&[0, 1])
+            .with_attr("top_k", Value::U(2))
+            .with_output(2, ty(&[1, 2]))
+            .with_output(
+                3,
+                Type::tensor(
+                    vec![Dim::N(1), Dim::N(2)],
+                    DType::Int {
+                        w: 32,
+                        signed: true,
+                    },
+                ),
+            );
+        let m = module(
+            vec![("x".into(), ty(&[1, 2])), ("w".into(), ty(&[2, 3]))],
+            vec![op, Op::new("omni.core", "return", 1).with_inputs(&[2, 3])],
+        );
+        let out = run(&m, &[x.clone(), w.clone()], &(), &Limits::default()).unwrap();
+        // Expert 1 has the largest logit, then expert 2.
+        assert_eq!(out.returned[1].data, vec![1.0, 2.0]);
+        // Weights are a softmax over *all* experts, so the chosen two do not
+        // sum to one.
+        let picked: f64 = out.returned[0].data.iter().sum();
+        assert!(picked < 1.0, "{picked} should leave mass on expert 0");
+
+        // `normalize` is what asks for them to sum to one.
+        let mut op2 = Op::new("omni.nn", "moe_route", 1)
+            .with_inputs(&[0, 1])
+            .with_attr("top_k", Value::U(2))
+            .with_attr("normalize", Value::Bool(true))
+            .with_output(2, ty(&[1, 2]));
+        op2.outputs.push((
+            3,
+            Type::tensor(
+                vec![Dim::N(1), Dim::N(2)],
+                DType::Int {
+                    w: 32,
+                    signed: true,
+                },
+            ),
+        ));
+        let m2 = module(
+            vec![("x".into(), ty(&[1, 2])), ("w".into(), ty(&[2, 3]))],
+            vec![op2, Op::new("omni.core", "return", 1).with_inputs(&[2, 3])],
+        );
+        let out2 = run(&m2, &[x.clone(), w], &(), &Limits::default()).unwrap();
+        let total: f64 = out2.returned[0].data.iter().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "normalized weights sum to {total}"
+        );
+
+        // The transposed routing matrix is a named error rather than a guess.
+        let e = nn(
+            "moe_route",
+            vec![("top_k", Value::U(1))],
+            &[x, f32t(&[3, 2], &[0.0; 6])],
+            &[1, 1],
+        )
+        .expect_err("transposed");
+        assert!(e.to_string().contains("[d_model, experts]"), "{e}");
+    }
+
+    #[test]
+    fn ssm_scan_is_a_specification_gap_and_says_so() {
+        // Refused not for being hard but for being undefined: §07 names the op
+        // without saying what it computes. The message has to make that
+        // distinction, or the next person implements a guess.
+        let e = nn(
+            "ssm_scan",
+            vec![],
+            &[
+                f32t(&[1, 2], &[1.0, 2.0]),
+                f32t(&[1, 2], &[1.0, 2.0]),
+                f32t(&[1, 2], &[1.0, 2.0]),
+            ],
+            &[1, 2],
+        )
+        .expect_err("undefined");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+        let m = e.to_string();
+        assert!(m.contains("does not define"), "{m}");
+        assert!(m.contains("discretization"), "{m}");
     }
 }

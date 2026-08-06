@@ -256,9 +256,17 @@ implemented:
   is what the IR form does; and the `omni.nn` ops a decoder needs — `embedding`,
   `norm`, `rope`, `activation` and `attention` with `causal`, `window`, `softcap`
   and grouped queries, which the shipped lowering declines and `graph synthesize`
-  emits. `conv`, `pool`, `moe_route`, `ssm_scan` and `interpolate` are refused by
-  name; a graph is bounded in ops, elements and loop iterations, because a graph
-  is untrusted input.
+  emits. `conv`, `conv1d_causal`, `pool`, `interpolate` and `moe_route` too, which
+  completes the dialect bar one op; a graph is bounded in ops, elements and loop
+  iterations, because a graph is untrusted input.
+
+  The one refusal left is `ssm_scan`, and it is a *specification* gap rather than
+  an implementation one: §07 registers the op's arity and its `delta_softplus`
+  attribute but never says which operand is the state transition, whether the
+  timestep is an operand, or whether the discretization is zero-order hold or
+  bilinear — readings that give different numbers from the same tensors. An
+  implementation that picked one would be checking its guess against itself, so
+  this build refuses it by name and §07.8 now records the gap.
 
   It earned its keep on the first run. **`graph synthesize` was emitting a graph
   that verified and computed the wrong thing:** the projections were reshaped to
@@ -341,7 +349,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-430 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+437 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -505,7 +513,15 @@ parent that `delta::parents` can actually read back, and attaches to that base
 binding each layer's own factors while touching nothing it did not train.
 
 And, for the interpreter, the tests that check what it *computes* rather than that
-it runs: that a causal attention's first position is exactly `v[0]` whatever the
+it runs: that a convolution is a cross-correlation and would give the negatives of
+its answers if the kernel were flipped; that padding puts zeros where it says and
+a group never sees another group's channels; that a causal 1-D convolution's
+earlier outputs do not move when a later input changes, which symmetric padding
+would fail; that pooling defaults to a non-overlapping window; that the two
+interpolation modes disagree and half-pixel centres put the samples where they
+belong; that MoE routing softmaxes over every expert before taking the top k, that
+`normalize` is what makes the chosen weights sum to one, and that a transposed
+routing matrix is a named error rather than a silent transpose; that a causal attention's first position is exactly `v[0]` whatever the
 scores are, and that removing the mask changes that, so the mask is load-bearing;
 that grouped queries share the kv heads they are supposed to and a grouping the
 shapes cannot support is an error rather than a modulo that produces numbers; that
@@ -579,7 +595,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 430 passed; 0 failed
+test result: ok. 437 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

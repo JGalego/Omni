@@ -220,7 +220,7 @@ plausible `omni.nn` covers everything. Sketches:
 |---|---|
 | Transformer (dense) | `scan` over layers or unrolled; `nn.attention`, `nn.norm`, `tensor.matmul` |
 | MoE | `nn.moe_route` produces routing weights + indices; `tensor.gather` over expert weights; ragged `map` region per expert. Expert weights are ordinary tensors with `blocklist` sparsity for partial fetch |
-| Mamba / SSM | `nn.ssm_scan` (associative scan), `nn.conv1d_causal`, `state` type for recurrent carry |
+| Mamba / SSM | `nn.ssm_scan` (associative scan) — **underspecified, see below** — `nn.conv1d_causal`, `state` type for recurrent carry |
 | RWKV | `core.scan` with an explicit recurrent state carry; WKV as a dialect op or as a composite |
 | CNN | `nn.conv`, `nn.pool`, `nn.norm` |
 | Diffusion / flow matching | The denoiser is a `Model`; the **sampler is a graph**: `core.while` over timesteps with a schedule tensor. Multi-model bundle (§01.7) holds text encoder + denoiser + VAE + scheduler graph |
@@ -230,6 +230,21 @@ plausible `omni.nn` covers everything. Sketches:
 | Video | temporal axis in shapes; `scan` over frames; state for caches |
 | RL policies | ordinary graph + `omni.io` observation/action typing; value and policy heads as separate functions in one module |
 | Retrieval-augmented | `omni.io` external-call op declared as an **effect**, so it is visible and refusable |
+
+> **Known gap: `nn.ssm_scan` is named but not defined.** Writing a reference
+> interpreter (`omni graph run`) surfaced this. The op's arity and attributes are
+> registered — three to five operands and `delta_softplus` — but nothing here says
+> which operand is the state transition and which the input projection, whether
+> the timestep is an operand or already folded into `A`, or whether the
+> discretization is zero-order hold or bilinear. Those readings produce different
+> numbers from the same tensors, so two conforming implementations could disagree
+> about what a Mamba model computes while both passing verification.
+>
+> Every other op in `omni.nn` is either pinned by a shape function or standard
+> across every framework. This one is neither, and the reference implementation
+> **refuses it by name** rather than picking a reading — an implementation that
+> guessed would then be checking its guess against itself. Defining it is
+> outstanding specification work, not outstanding implementation work.
 | **Unknown, 2040** | New dialect. Core unchanged. |
 
 The load-bearing claim is the last row, and it is supported by the fact that
