@@ -143,6 +143,78 @@ pub fn corpus() -> Vec<Case> {
     out.extend(forward());
     out.extend(numeric());
     out.extend(valid_features());
+    out.extend(roundtrip());
+    out
+}
+
+// -------------------------------------------------------------- roundtrip --
+
+/// `roundtrip/` — cases about the *writer*, not the reader.
+///
+/// Every other suite asks what an implementation does with bytes it is given.
+/// These ask whether the bytes it produces are the ones it should: unpack one of
+/// these into a directory store, pack it again with the options its header
+/// records, and the result must be identical, byte for byte (W1). A reader that
+/// merely accepts them proves nothing, which is why the corpus README states the
+/// stronger obligation and CI runs it through `omni unpack` and `omni pack`.
+///
+/// The two cases differ in what would break the identity: one has objects whose
+/// index order differs from their layout order, and one is compressed, so a
+/// writer that re-derived the order or re-compressed at a different level
+/// produces a valid container that is not this one.
+fn roundtrip() -> Vec<Case> {
+    let mut out = Vec::new();
+    let hash = HashAlgo::Blake3_256;
+    let opts = |codec| PackOptions {
+        hash,
+        log2_align: 12,
+        creator: "omni-conformance".into(),
+        reproducible: true,
+        codec,
+    };
+    // Several tensors of different sizes, so the index is sorted by digest and
+    // the payloads are not: a writer that emits objects in index order writes a
+    // valid container with different offsets.
+    let mut b = ModelBuilder::new("omni/conformance/roundtrip")
+        .hash(hash)
+        .chunk_size(128);
+    for (i, n) in [3u64, 17, 5, 11].iter().enumerate() {
+        b = b.tensor(TensorSpec {
+            name: format!("t{i}"),
+            shape: vec![*n, 4],
+            dtype: DType::F32,
+            axes: None,
+            semantic: "weight",
+            data: (0..n * 4 * 4).map(|k| (k % 251) as u8).collect(),
+            layout: None,
+        });
+    }
+    let (objs, root) = b.build();
+    out.push(case(
+        "roundtrip",
+        "object-order",
+        Expect::Accept,
+        Some("W1"),
+        "unpacking and repacking this must reproduce it byte for byte: the \
+         index is sorted by digest and the payloads are not, so a writer that \
+         re-derives one order from the other writes a different valid file",
+        pack(&objs, &root, &opts(omni_core::codec::Codec::Raw)).unwrap(),
+    ));
+    out.push(case(
+        "roundtrip",
+        "codec-level",
+        Expect::Accept,
+        Some("W1"),
+        "the same, compressed: identities are over the logical bytes (§01.2), \
+         so repacking must reproduce both the digests and the stored form the \
+         header describes",
+        pack(
+            &objs,
+            &root,
+            &opts(omni_core::codec::Codec::Zstd { level: 3 }),
+        )
+        .unwrap(),
+    ));
     out
 }
 

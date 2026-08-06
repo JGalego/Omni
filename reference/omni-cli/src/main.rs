@@ -77,6 +77,7 @@ VERBS:
                               Render the OMNI-CT chat template (§06.9);
                               --inputs lists the variables it reads
     pack    <dir.omnid> -o <file.omni> [--align N] [--codec ID[:level]]
+                              [--creator STRING]
                               Build a container from a directory store
     unpack  <file.omni> -o <dir.omnid>
                               Explode a container into a directory store
@@ -3752,6 +3753,14 @@ fn cmd_pack(args: &[String]) -> R {
             prr!("omni: {e}\n");
             return Ok(2);
         }
+    }
+    // W1's reproducibility is a promise about one writer: the same objects and
+    // the same options give the same bytes. The creator string is one of those
+    // options — it is in the header and the file UUID is derived from it — so
+    // reproducing a *file* rather than an equivalent one needs it stated. That
+    // is what `conformance/roundtrip` asks for.
+    if let Some(c) = flag(args, "--creator") {
+        opts.creator = c.to_string();
     }
     let bytes = pack(&objects, &root, &opts)?;
     std::fs::write(out, &bytes)?;

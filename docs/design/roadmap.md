@@ -94,7 +94,7 @@ Deliverables:
 - `omni-import-safetensors` ✅, `-pytorch` ✅, `-hf-repo` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf` ✅.
 - `omni-export-safetensors` ✅, `-gptq` ✅, `-awq` ✅, `-gguf` ✅.
 - `omni delta`, `omni adapter`, `omni convert`.
-- Conformance corpus: `numeric/` ✅, `valid/features` ✅, `roundtrip/`.
+- Conformance corpus: `numeric/` ✅, `roundtrip/` ✅, `valid/features` ✅.
 
 **Gate 1:** lossless round-trip for safetensors, GGUF, GPTQ, AWQ, PEFT, verified
 bit-exactly on ≥ 100 real models. A published delta-size study over ≥ 50 real

@@ -581,6 +581,25 @@ jobs:
           grep -q 'calibration set' /tmp/conv4.txt
           test ! -f /tmp/no.omni
 
+      # `roundtrip/` is about the writer rather than the reader: unpack one of
+      # these, pack it again with the options its header records, and the
+      # result must be the same bytes (W1). Accepting them proves nothing,
+      # which is why the corpus states the obligation and this runs it.
+      - name: A container survives being taken apart and put back together
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          for f in conformance/roundtrip/*.omni; do
+            extra=""
+            case "$f" in *codec-level*) extra="--codec zstd:3";; esac
+            rm -rf /tmp/rt.omnid
+            "$OMNI" unpack "$f" -o /tmp/rt.omnid >/dev/null
+            "$OMNI" pack /tmp/rt.omnid -o /tmp/rt.omni --creator omni-conformance $extra >/dev/null
+            if ! cmp "$f" /tmp/rt.omni; then
+              echo "::error::$f does not survive unpack/pack byte for byte"; exit 1
+            fi
+            echo "$f: identical after unpack and pack"
+          done
+
       # §15's R-T08 is the only rule that cannot be decided from a file's
       # framing, and the `numeric/` suite is what tests it: containers that are
       # structurally perfect and can still be read wrong.

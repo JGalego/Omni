@@ -97,5 +97,11 @@ because one part of it is from the future.
 | `chunked-tensor` | accept | R-T02 | one tensor over sixteen chunks: the chunk list's total must equal the sum of its parts and the tensor's stored size |
 | `quantized-expression` | accept | R-T04 | a weight that is an expression rather than a buffer (§05.1): int4 packed two per byte, one f16 scale per block of eight, and the zero-point subtracted before scaling |
 | `graph-semantic` | accept | R-I10 | a model that describes its own computation (§07): every `constant` in the graph names a tensor the table has, at the shape the graph expects |
+## `roundtrip`
 
-50 cases in this suite.
+| Case | Expect | Rule | Why |
+|---|---|---|---|
+| `object-order` | accept | W1 | unpacking and repacking this must reproduce it byte for byte: the index is sorted by digest and the payloads are not, so a writer that re-derives one order from the other writes a different valid file |
+| `codec-level` | accept | W1 | the same, compressed: identities are over the logical bytes (§01.2), so repacking must reproduce both the digests and the stored form the header describes |
+
+52 cases in this suite.
