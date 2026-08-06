@@ -375,6 +375,11 @@ What is **not** implemented, and is reported as such rather than faked:
 - A registry *client*: §13.5's mapping is implemented and writes a pushable
   layout, but the push itself needs bearer-token auth and chunked blob uploads
   against a live registry, which is a client rather than a format concern
+- `omni convert --requantize`. `--cast` is here — it converts, measures the
+  error it introduced, records the recipe as provenance and can re-read its own
+  output to check it — but requantizing is a *search over a calibration set*
+  (§05.5), and a build with no calibration data would have to invent either the
+  data or the scales. It is refused with what it would need
 - `omni mount` (§13.9), which needs FUSE
 - Every importer and exporter except safetensors, PyTorch, GGUF, PEFT, GPTQ,
   AWQ and a whole Hugging Face repo.

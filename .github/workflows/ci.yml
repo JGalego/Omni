@@ -539,6 +539,48 @@ jobs:
           grep -q 'IQ2_XXS' /tmp/iq.txt
           test ! -f /tmp/iq.omni
 
+      # §4 of `cli.md` shows `omni convert` doing two things. One is arithmetic
+      # and is here; the other is a search over a calibration set and is
+      # refused. The check is that the arithmetic is measured rather than
+      # asserted, and that the refusal names what it would need.
+      - name: A conversion measures what it costs, and refuses what it cannot know
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          python3 tools/gguf-fixture.py write /tmp/conv.gguf /tmp/conv.vals
+          "$OMNI" import gguf /tmp/conv.gguf -o /tmp/conv.omni >/dev/null
+
+          "$OMNI" convert /tmp/conv.omni --cast f16 -o /tmp/conv-f16.omni --verify \
+            | tee /tmp/conv1.txt
+          grep -q 'cast         10 tensor(s) to f16' /tmp/conv1.txt
+          grep -q 'worst error' /tmp/conv1.txt
+          # Every element re-read out of the written container and compared
+          # against the cast of the source, not against itself.
+          grep -q '5,760 element(s) re-read' /tmp/conv1.txt
+          "$OMNI" verify /tmp/conv-f16.omni --level 6 | grep -q '^valid'
+
+          # §08.3's selectors, not a second glob dialect: `*` does not cross a
+          # dot, so the two named tensors keep their own dtype.
+          "$OMNI" convert /tmp/conv.omni --cast f8e4m3 --except 'q6_k.*,q2_k.*' \
+            -o /tmp/conv-f8.omni --verify | tee /tmp/conv2.txt
+          grep -q 'cast         8 tensor(s)' /tmp/conv2.txt
+          grep -q 'kept         2 tensor(s)' /tmp/conv2.txt
+
+          # The recipe is in the container, because a conversion that does not
+          # say what it did is a conversion nobody can check.
+          "$OMNI" dump /tmp/conv-f8.omni --provenance | tee /tmp/conv3.txt
+          grep -q 'omni.prov/convert' /tmp/conv3.txt
+          grep -q 'max_abs_error' /tmp/conv3.txt
+
+          # And the transformation that needs data this build does not have is
+          # refused by name, with the reason.
+          set +e
+          "$OMNI" convert /tmp/conv.omni --requantize gptq:4:128 -o /tmp/no.omni > /tmp/conv4.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 2
+          grep -q 'calibration set' /tmp/conv4.txt
+          test ! -f /tmp/no.omni
+
       # §08 + import: a PEFT LoRA is safetensors plus a config, and the thing OMNI
       # adds is that the base is pinned by digest rather than named by a string.
       - name: A PEFT LoRA imports as an adapter pinned to its base

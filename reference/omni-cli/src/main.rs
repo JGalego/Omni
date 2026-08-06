@@ -62,6 +62,8 @@ VERBS:
     ls      <file> [--full]   List objects in the index; --full prints whole
                               digests, which is what a URL or a --object needs
     dump    <file> --header   Annotated hexdump of the 128-byte file header
+    dump    <file> --provenance   The import or conversion reports the container
+                              carries; exit 3 when it carries none
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
     cat     <file> --tensor <name> [--hex] [--limit N] [--raw] [--with <file>]
                               Evaluate a tensor's expression and print elements;
@@ -200,6 +202,15 @@ VERBS:
                               Sign a manifest and embed the attestation
     sign    --verify <file> --key <pubkey-hex>[,<hex>…] [--require any|all|k:N]
                               V7: authenticity against a trust policy
+    convert <in.omni> --cast DTYPE [--except GLOB,GLOB] [--verify]
+                      -o <out.omni>
+                              Cast every tensor to another dtype, except the
+                              ones named, measuring the error it introduces and
+                              recording the recipe. Globs are §08.3's selectors,
+                              where `*` does not cross a `.` and `**` does.
+                              --verify re-reads the result and compares.
+                              --requantize is refused: it needs a calibration
+                              set (§05.5), not a flag
     delta   <base.omni> <tuned.omni> -o <delta.omni> [--max-err E]
                               Express one model as a delta over another (§08.6)
     adapter make  <base.omni> -o <lora.omni> [--rank R] [--alpha A]
@@ -271,6 +282,7 @@ fn main() -> ExitCode {
         "plan" => run(&args, cmd_plan),
         "keygen" => cmd_keygen(&args),
         "sign" => cmd_sign(&args),
+        "convert" => cmd_convert(&args),
         "delta" => cmd_delta(&args),
         "adapter" => cmd_adapter(&args),
         "bench" => cmd_bench(&args),
@@ -1938,6 +1950,26 @@ fn flags_str(f: u8) -> String {
 fn cmd_dump(c: &Container, args: &[String]) -> R {
     if args.iter().any(|a| a == "--header") {
         return dump_header(c);
+    }
+    // The reports every importer and conversion attaches. They are printed by
+    // this verb because every one of those commands says so on the way out, and
+    // a pointer to a verb that does not exist is a documentation bug that only
+    // the reader ever finds.
+    if args.iter().any(|a| a == "--provenance") {
+        let mut found = 0usize;
+        for e in c.index.iter().filter(|e| e.otype == otype::PROVENANCE) {
+            if found > 0 {
+                pr!();
+            }
+            pr!("; Provenance object {}", hex(&e.digest));
+            pr!("{}", c.get_value(&e.digest)?.diag());
+            found += 1;
+        }
+        if found == 0 {
+            pr!("; no Provenance objects: this container records no import or conversion");
+            return Ok(3);
+        }
+        return Ok(0);
     }
     if let Some(i) = args.iter().position(|a| a == "--object") {
         let want = args
@@ -6777,6 +6809,330 @@ fn cmd_sign(args: &[String]) -> R {
 /// expressions over the base's chunk objects, which live in the base container.
 /// That is what makes a delta small, and `omni verify` reports it as incomplete
 /// rather than invalid.
+/// `omni convert` — a model-to-model transformation, and the only one this
+/// build does without asking for data it does not have.
+///
+/// §4 of `docs/design/cli.md` shows two: `--cast`, which is arithmetic, and
+/// `--requantize`, which is a *search* over a calibration set. The first is
+/// here. The second is refused by name with what it would need, because a
+/// quantizer without calibration data either invents the data or invents the
+/// scales, and §05.5 exists precisely so that "which calibration set produced
+/// this?" has an answer.
+fn cmd_convert(args: &[String]) -> R {
+    use omni_core::pattern::glob_match;
+
+    let Some(input) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    if let Some(spec) = flag(args, "--requantize") {
+        prr!(
+            "omni: --requantize {spec} needs a calibration set, and this build has \
+             none to offer it. Quantizing is a measurement (§05.5): the scales \
+             depend on activations, the activations depend on the data, and the \
+             container records which data it was — so a `--calib` this build \
+             invented would be recorded as provenance and be false. `omni \
+             convert --cast` is the transformation that needs no data\n"
+        );
+        return Ok(2);
+    }
+    let (Some(target), Some(out)) = (
+        flag(args, "--cast"),
+        flag(args, "-o").or(flag(args, "--out")),
+    ) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let Some(want) = DType::from_alias(target) else {
+        prr!("omni: `{target}` is not a dtype alias (§04.3); try f32, bf16, f16, f8e4m3\n");
+        return Ok(2);
+    };
+    // §08.3's selector semantics rather than a second glob dialect: `*` stays
+    // within a name segment and `**` crosses dots, so `model.**` and
+    // `*.norm.*` mean here what they mean to an adapter.
+    let except: Vec<&str> = flag(args, "--except")
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let c = Container::open(std::fs::read(input)?)?;
+    let hash = c.header.hash;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let table = tensor_table(&c)?;
+    let manifest = c.root()?;
+    let name = flag(args, "--name")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}-{}", stem(input), want.label()));
+    let mut b = ModelBuilder::new(name).hash(hash);
+
+    // Order matters for reproducibility, so the table's own order is kept.
+    let mut names: Vec<String> = table
+        .order
+        .iter()
+        .filter(|n| table.tensors.contains_key(*n))
+        .cloned()
+        .collect();
+    for n in table.tensors.keys() {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
+
+    let (mut cast, mut kept, mut before, mut after) = (0usize, 0usize, 0u64, 0u64);
+    let mut worst: Option<(String, f64, f64)> = None;
+    for tname in &names {
+        let r = &table.tensors[tname];
+        let desc = TensorDesc::load(&ctx, r)?;
+        let excluded = except.iter().any(|g| glob_match(g, tname));
+        let shape = match omni_core::expr::concrete(&desc.shape) {
+            Some(s) => s,
+            // A symbolic extent has no fixed number of elements to convert, and
+            // guessing one would be inventing a shape.
+            None => {
+                kept += 1;
+                carry_tensor(&mut b, &c, tname, &desc, r, hash)?;
+                continue;
+            }
+        };
+        if excluded || desc.dtype == want {
+            kept += 1;
+            before += stored_of(&desc, &shape);
+            after += stored_of(&desc, &shape);
+            carry_tensor(&mut b, &c, tname, &desc, r, hash)?;
+            continue;
+        }
+
+        // Materialized rather than expressed: `--cast` is asked for when the
+        // *bytes* should be the target dtype. The lazy form — a `cast` node
+        // over the original — costs no storage and is what the algebra already
+        // does for free (§04.1), so it needs no verb.
+        let t = desc.value.eval(&ctx)?;
+        let numel: u64 = shape.iter().product();
+        let mut data = vec![0u8; want.packed_bytes(numel) as usize];
+        for (i, v) in t.data.iter().enumerate() {
+            if !want.encode(&mut data, i as u64, *v, omni_core::dtype::Round::Rne) {
+                prr!(
+                    "omni: `{tname}` has a value {v} that {} cannot represent, and \
+                     writing something else in its place is what this verb must not \
+                     do\n",
+                    want.label()
+                );
+                return Ok(1);
+            }
+        }
+        // The error this cast introduced, measured rather than assumed: the
+        // bytes are read back through the target dtype and compared.
+        let (mut abs, mut rel) = (0.0f64, 0.0f64);
+        for (i, v) in t.data.iter().enumerate() {
+            let got = want.decode(&data, i as u64).unwrap_or(f64::NAN);
+            if v.is_nan() && got.is_nan() {
+                continue;
+            }
+            let d = (got - v).abs();
+            abs = abs.max(d);
+            if *v != 0.0 {
+                rel = rel.max(d / v.abs());
+            }
+        }
+        if worst.as_ref().is_none_or(|(_, a, _)| abs > *a) {
+            worst = Some((tname.clone(), abs, rel));
+        }
+        before += stored_of(&desc, &shape);
+        after += want.packed_bytes(numel);
+        cast += 1;
+        b = b.tensor(TensorSpec {
+            name: tname.clone(),
+            shape,
+            dtype: want.clone(),
+            axes: desc.axes.clone(),
+            semantic: "",
+            data,
+            layout: None,
+        });
+    }
+
+    // The recipe, in the container (I3's argument applies to a conversion as
+    // much as to an import): what was converted, what was left alone, and how
+    // far the values moved.
+    let recipe = Value::map(vec![
+        ("t", Value::text("omni.prov/convert")),
+        ("v", Value::U(1)),
+        (
+            "source",
+            Value::map(vec![
+                ("path", Value::text(input.clone())),
+                ("digest", Value::Bytes(c.header.root_digest.to_vec())),
+            ]),
+        ),
+        ("op", Value::text("cast")),
+        ("target", want.to_value()),
+        (
+            "except",
+            Value::Array(except.iter().map(|g| Value::text(*g)).collect()),
+        ),
+        ("cast", Value::U(cast as u64)),
+        ("kept", Value::U(kept as u64)),
+        (
+            "max_abs_error",
+            Value::F64(worst.as_ref().map(|(_, a, _)| *a).unwrap_or(0.0)),
+        ),
+        (
+            "max_rel_error",
+            Value::F64(worst.as_ref().map(|(_, _, r)| *r).unwrap_or(0.0)),
+        ),
+        // Said out loud because the DAG cannot say it: a materialized cast has
+        // no `approx` node to carry R-T06's marker, so the loss lives here.
+        (
+            "note",
+            Value::text(
+                "a materialized cast: the values in this container are the cast \
+                 values, so the lossy step is in this record rather than in the \
+                 expression graph",
+            ),
+        ),
+    ]);
+    b = b.asset("provenance", otype::PROVENANCE, recipe);
+    if let Some(arch) = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+        .and_then(|d| c.get_value(&d).ok())
+        .and_then(|m| m.get("arch").cloned())
+    {
+        b.extra.push(("arch".into(), arch));
+    }
+
+    let (objects, root) = b.build();
+    let bytes = pack(
+        &objects,
+        &root,
+        &PackOptions {
+            hash,
+            log2_align: c.header.log2_align,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &bytes)?;
+
+    pr!("converted {input} -> {out}");
+    pr!(
+        "  cast         {} tensor(s) to {}",
+        commas(cast as u64),
+        want.label()
+    );
+    pr!(
+        "  kept         {} tensor(s){}",
+        commas(kept as u64),
+        if except.is_empty() {
+            String::new()
+        } else {
+            format!(" (--except {})", except.join(", "))
+        }
+    );
+    if let Some((tname, abs, rel)) = &worst {
+        pr!("  worst error  {abs:.3e} absolute, {rel:.3e} relative, in `{tname}`");
+    }
+    pr!(
+        "  tensor bytes {} -> {} ({:.1} %)",
+        human(before),
+        human(after),
+        100.0 * after as f64 / before.max(1) as f64
+    );
+    pr!("  recipe       attached as a Provenance object");
+
+    // --verify: read the written container back and check every converted
+    // tensor against the values it was built from. A conversion that cannot be
+    // re-read is not a conversion (§05.6 rule 3 applies the same idea to
+    // quantized imports).
+    if args.iter().any(|a| a == "--verify") {
+        let back = Container::open(bytes.clone())?;
+        let bstore = Borrowed(&back);
+        let bctx = Ctx::new(&bstore);
+        let btable = tensor_table(&back)?;
+        let mut checked = 0u64;
+        for tname in &names {
+            let (Some(orig), Some(new)) = (table.get(tname), btable.get(tname)) else {
+                prr!("omni: `{tname}` did not survive the conversion\n");
+                return Ok(1);
+            };
+            let od = TensorDesc::load(&ctx, orig)?;
+            let nd = TensorDesc::load(&bctx, new)?;
+            let (ot, nt) = (od.value.eval(&ctx)?, nd.value.eval(&bctx)?);
+            if ot.data.len() != nt.data.len() {
+                prr!("omni: `{tname}` changed length\n");
+                return Ok(1);
+            }
+            for (a, x) in ot.data.iter().zip(&nt.data) {
+                // The value the target dtype can hold, obtained the same way
+                // the conversion obtained it: through the dtype's own encoding.
+                let mut one = vec![0u8; nd.dtype.packed_bytes(1) as usize];
+                nd.dtype
+                    .encode(&mut one, 0, *a, omni_core::dtype::Round::Rne);
+                let want_v = nd.dtype.decode(&one, 0).unwrap_or(f64::NAN);
+                if want_v != *x && !(want_v.is_nan() && x.is_nan()) {
+                    prr!(
+                        "omni: `{tname}` reads back as {x} where casting the source \
+                         gives {want_v}\n"
+                    );
+                    return Ok(1);
+                }
+                checked += 1;
+            }
+        }
+        pr!(
+            "  verified     {} element(s) re-read and compared with the cast of the source",
+            commas(checked)
+        );
+    }
+    Ok(0)
+}
+
+/// A tensor carried through a conversion unchanged: the descriptor as it was,
+/// and every object it reaches, so the new container is self-contained.
+fn carry_tensor(
+    b: &mut ModelBuilder,
+    c: &Container,
+    name: &str,
+    desc: &TensorDesc,
+    r: &(u16, Digest),
+    hash: HashAlgo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Borrowed(c);
+    let w = omni_core::store::walk(&store, r.0, &r.1)?;
+    for (d, otype) in &w.objects {
+        // The descriptor itself is rebuilt by the builder; everything below it
+        // — chunk lists, chunks, codebooks — is copied verbatim.
+        if d == &r.1 {
+            continue;
+        }
+        if let Ok(Some(bytes)) = omni_core::store::Store::resolve(&store, d) {
+            b.extra_objects.push(omni_core::Object {
+                otype: *otype,
+                payload: bytes,
+                oflags: omni_core::container::oflags::CRITICAL
+                    | omni_core::container::oflags::SAFE_TO_COPY,
+                stored: None,
+            });
+        }
+    }
+    let _ = hash;
+    b.derived.push((name.to_string(), desc.clone()));
+    Ok(())
+}
+
+/// The stored bytes of a tensor as its descriptor declares them.
+fn stored_of(desc: &TensorDesc, shape: &[u64]) -> u64 {
+    desc.layout
+        .stored_bytes(shape, &desc.dtype)
+        .unwrap_or_else(|| desc.dtype.packed_bytes(shape.iter().product()))
+}
+
 fn cmd_delta(args: &[String]) -> R {
     use omni_core::delta::{analyze, literal_of, Kind, Options, Parent, Report};
 
