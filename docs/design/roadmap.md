@@ -172,10 +172,20 @@ boundary between sequences.
 — `transformer.decoder`, `cnn.classifier` and `mlp`, each of which CI *executes*
 rather than merely emits, because a graph nobody has run is how the decoder came
 to attend across heads instead of positions and verify while doing it. The
-tokenizer vectors are this repository's rather than 200 real ones, and no
-Jinja2 → OMNI-CT translator exists, so the 95 % figure is untested. The coverage
-numbers in this gate are the point of it, and only the interpreter half of the
-first one now has a value.
+tokenizer vectors are this repository's rather than 200 real ones. **A
+Jinja2 → OMNI-CT translator now exists** (`omni jinja`) and converts 10 of a
+15-template corpus of real model families — a percentage of that corpus and not
+of the hub, which the verb says out loud so the two are not confused. What it
+produced that is worth more than the percentage: three of its four blockers are
+gaps in §06.9 rather than in the templates, and each has a named fix (a loop
+variable, a slice form, two more standard-library entries). The fourth kind —
+`raise_exception`, `namespace`, `{% macro %}`, `strftime_now` — wants exactly the
+capabilities §06.9 exists to remove, and should keep being refused. §06.9 now
+records all of it.
+
+The coverage numbers in this gate are the point of it. Two of them now have
+values against local corpora and none against the public snapshots the gate
+actually names.
 
 ## Phase 3 — Prove the distribution layer (months 12–18)
 

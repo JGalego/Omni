@@ -140,6 +140,11 @@ VERBS:
                               be lost without writing; a lossy export needs
                               --allow-lossy, and the loss report is written
                               beside the artifact (§1.2)
+    jinja   <template.jinja> [--coverage]
+                              Translate a Jinja2 chat template into OMNI-CT
+                              (§06.9), or measure the built-in corpus. A
+                              construct with no total form is refused by name
+                              and position rather than approximated
     log     <file.omni> [--with <prev.omni>]…
                               The checkpoint chain: step, loss, and what each
                               one costs over its parent (§09.6)
@@ -213,6 +218,7 @@ fn main() -> ExitCode {
         "deps" => run(&args, cmd_deps),
         "tokenize" => run(&args, cmd_tokenize),
         "render" => run(&args, cmd_render),
+        "jinja" => cmd_jinja(&args),
         "pack" => cmd_pack(&args),
         "unpack" => cmd_unpack(&args),
         "repack" => cmd_repack(&args),
@@ -1610,6 +1616,80 @@ fn chat_template_of(
     Ok(Some(omni_core::ct::ChatTemplate::from_value(
         &c.get_value(&d)?,
     )?))
+}
+
+/// `omni jinja` — translate a Jinja2 chat template into OMNI-CT, or measure the
+/// corpus.
+///
+/// The refusals are the point. §06.9 replaces an executed Jinja string with a
+/// total language, and the only way to know whether that trade is affordable is
+/// to try it on real templates and read what comes back.
+fn cmd_jinja(args: &[String]) -> R {
+    use omni_core::jinja;
+    if args.iter().any(|a| a == "--coverage") {
+        let c = jinja::coverage();
+        pr!(
+            "corpus: {} of {} translated ({:.0} %)",
+            c.translated.len(),
+            c.total,
+            c.rate() * 100.0
+        );
+        for name in &c.translated {
+            pr!("  ✓ {name}");
+        }
+        for (name, why) in &c.refused {
+            pr!("  ✗ {name}  {why}");
+        }
+        if !c.refused.is_empty() {
+            // The list worth acting on: a construct blocking several families is
+            // a case for growing §06.9, one blocking a single family is a case
+            // for changing that template.
+            pr!();
+            pr!("blocked by:");
+            for (construct, n) in c.blockers() {
+                pr!("  {n} x  {construct}");
+            }
+        }
+        pr!();
+        pr!(
+            "Gate 2 asks for 95 % of a public hub snapshot. This is a {}-template \
+             corpus in `omni_core::jinja::CORPUS`, so the figure above is a \
+             percentage of that and not of the hub.",
+            c.total
+        );
+        return Ok(if c.refused.is_empty() { 0 } else { 3 });
+    }
+    let Some(path) = args.get(1) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let src = std::fs::read_to_string(path)?;
+    match jinja::translate(&src) {
+        Ok(t) => {
+            let printed = jinja::print(&t.template.nodes);
+            pr!("{printed}");
+            if !t.rewrites.is_empty() {
+                // As OMNI-CT comments, so the whole output is still a valid
+                // template: a caller can redirect it to a file and the caveats
+                // travel with the thing they are about.
+                prr!("\n{{# rewritten, not carried across literally:\n");
+                for r in &t.rewrites {
+                    prr!("     {r}\n");
+                }
+                prr!("#}}\n");
+            }
+            let vars: Vec<String> = t.template.free_vars().into_iter().collect();
+            prr!("{{# free variables: {} #}}\n", vars.join(", "));
+            Ok(0)
+        }
+        Err(e) => {
+            prr!("omni: {path} does not translate\n");
+            prr!("      {e}\n");
+            // Indeterminate, not invalid: the template is fine Jinja, and
+            // OMNI-CT is what has no form for it.
+            Ok(3)
+        }
+    }
 }
 
 /// `omni render` — render the container's chat template (§06.9).

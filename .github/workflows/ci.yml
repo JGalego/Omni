@@ -877,6 +877,58 @@ jobs:
 
           echo "the C0 budget claim holds in a second language, standard library only"
 
+      # §06.9 replaces an executed Jinja string with a total language. Whether
+      # that trade is affordable is an empirical question, and the roadmap's
+      # Gate 2 puts a number on it — 95 % of a hub snapshot. This measures what
+      # can be measured here, and the refusals are the output worth having: a
+      # construct that blocks several families is a case for growing §06.9.
+      - name: Jinja chat templates translate into OMNI-CT, and the rest are named
+        run: |
+          OMNI=reference/target/release/omni
+          set +e
+          "$OMNI" jinja --coverage > /tmp/cov.txt 2>&1
+          rc=$?
+          set -e
+          cat /tmp/cov.txt
+          # 3 = indeterminate: some templates did not translate, which is the
+          # honest state and not a build failure.
+          test "$rc" = 3
+          grep -qE 'corpus: [0-9]+ of [0-9]+ translated' /tmp/cov.txt
+          grep -q 'blocked by:' /tmp/cov.txt
+          # The figure is a percentage of a small corpus, and the verb has to say
+          # so rather than let it be read as the hub number Gate 2 asks for.
+          grep -q 'not of the hub' /tmp/cov.txt
+          # The single biggest blocker is a gap in §06.9's own grammar.
+          grep -q 'loop\.\*' /tmp/cov.txt
+
+          # A real template translates, and the result is OMNI-CT rather than the
+          # Jinja it came from: the filter became a call.
+          cat > /tmp/one.jinja <<'JINJA'
+          {% for m in messages %}{{ m['role'] | upper }}{% endfor %}
+          JINJA
+          "$OMNI" jinja /tmp/one.jinja > /tmp/one.ct 2>&1
+          cat /tmp/one.ct
+          grep -q 'upper(m\["role"\])' /tmp/one.ct
+          grep -q 'free variables: messages' /tmp/one.ct
+          # The whole output is itself a valid template — the caveats are OMNI-CT
+          # comments, so they travel with the thing they are about.
+          "$OMNI" jinja /tmp/one.jinja > /tmp/one2.ct 2>&1
+          cmp /tmp/one.ct /tmp/one2.ct
+
+          # And a construct with no total form is refused by name and position,
+          # with exit 3 — the template is fine Jinja; OMNI-CT is what lacks a
+          # form for it.
+          cat > /tmp/macro.jinja <<'JINJA'
+          {% macro f() %}{% endmacro %}
+          JINJA
+          set +e
+          "$OMNI" jinja /tmp/macro.jinja > /tmp/macro.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 3
+          grep -q 'macro' /tmp/macro.txt
+          echo "Jinja translates where §06.9 has a form, and names the gap where it does not"
+
       # §05's central claim is that quantization is a transformation and not a
       # file type: a GPTQ or AWQ weight is `dequantize(packed_words, scheme)` and
       # needs no new mechanism. The test of that claim is not that the importer

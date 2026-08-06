@@ -56,7 +56,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, safetensors, PEFT, GPTQ and AWQ import, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PEFT, GPTQ and AWQ import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
@@ -247,6 +247,17 @@ implemented:
   be a half and `0.1` a double; and D7 is "registered tags only" rather than "no
   tags", so refusing every tag refuses a valid container, because §04.3's exact
   rationals are one
+- **A Jinja2 → OMNI-CT translator** (`omni jinja`), because §06.9 replaces an
+  executed Jinja string with a total language and whether that trade is
+  affordable is an empirical question. It converts 10 of a 15-template corpus of
+  real families, and the refusals carry the construct, the reason and the byte
+  offset — a maintainer can act on `` `loop.*` at byte 284 `` and cannot act on
+  "translation failed". Three of the four blockers turned out to be gaps in
+  §06.9 itself (no loop variable, no slice form, two missing standard-library
+  entries); the fourth wants deliberate failure, mutable loop state, recursion or
+  the clock, which are the four things the section exists to remove. Whitespace
+  control is carried across, because `{%- … -%}` decides whether a prompt has a
+  leading newline and a tokenizer notices
 - **Three synthesizable architecture families**, not one: `transformer.decoder`,
   `cnn.classifier` and `mlp`. Each is *executed* in the tests over known weights
   and compared against arithmetic done in the test — the mlp against its own
@@ -356,7 +367,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-440 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+447 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -602,7 +613,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 440 passed; 0 failed
+test result: ok. 447 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

@@ -298,6 +298,28 @@ automatically in the overwhelming majority of cases; the `jinja_compat` field
 carries a Jinja2 rendering for runtimes that still want it, clearly marked as the
 *derived* form.
 
+> **Measured, and "the overwhelming majority" is not yet earned.** A translator
+> exists (`omni jinja`, `omni_core::jinja`), and over a 15-template corpus of real
+> model families it converts **10**. That is a percentage of a small corpus rather
+> than of a hub snapshot, but the *blockers* it names are the ones a hub snapshot
+> would name too, and three of the four are gaps in this section rather than in
+> the templates:
+>
+> | blocked by | families | what would close it |
+> |---|---:|---|
+> | `loop.index0`, `loop.first`, `loop.last` | 2 | a loop variable in `{% for %}`. OMNI-CT binds none, and a template that separates the last message from the rest has nothing to translate to. This is the single most common refusal and the clearest candidate for the grammar to grow |
+> | `messages[1:]` | 1 | a slice form. Splitting a system message off the front is the standard idiom, and there is no total-language reason to withhold it |
+> | `\| capitalize`, `\| title` | 2 | two entries in the standard library. Both are pure and total, so the only thing keeping them out is that nobody added them |
+>
+> The fourth kind of refusal is *not* a gap and should stay: `raise_exception`,
+> `namespace`, `{% macro %}` and `strftime_now` each want a capability §06.9
+> exists to remove — deliberate failure, mutable state that outlives a loop,
+> recursion, and the clock. A template using one of those has to change, and the
+> translator names which.
+>
+> The roadmap's Gate 2 asks for 95 % of a public hub snapshot with the failures
+> analysed and published. The analysis machinery is here; the snapshot is not.
+
 `vectors` (message list → expected prompt string) make template regressions
 detectable by `omni verify --template`.
 
