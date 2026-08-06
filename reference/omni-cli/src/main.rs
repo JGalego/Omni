@@ -134,6 +134,10 @@ VERBS:
                               expression per layer (§05.2.2, §05.2.3): the words
                               go in unchanged, and every layer is dequantized and
                               compared against the source before it is claimed
+    export  gptq|awq <in.omni> -o <dir>
+                              Write a packed checkpoint back out. Byte-exact for
+                              a container imported from one: the words were never
+                              converted, so there is nothing to convert back
     export  safetensors <in.omni> [-o <out.safetensors>] [--plan]
                               [--allow-lossy]
                               Emit into another format. --plan says what would
@@ -4441,6 +4445,67 @@ fn single_safetensors(dir: &std::path::Path) -> std::io::Result<Option<std::path
     Ok(if found.len() == 1 { found.pop() } else { None })
 }
 
+/// `omni export gptq|awq` — write a container back out as a packed checkpoint.
+///
+/// Byte-exact for a container that was imported from one, and that is structural
+/// rather than lucky: the import stored the packed words verbatim and expressed
+/// the dequantization over them, so this finds those literals again. The config
+/// is *reconstructed* from the container — bit width from the packed dtype, group
+/// size from the scale grid, act-order from whether the scale is gathered,
+/// checkpoint format from whether the `+1` node is there — so a container that
+/// lost its provenance still exports correctly.
+fn cmd_export_hfquant(args: &[String], input: &str, method: omni_core::hfquant::Method) -> R {
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        prr!("omni: export {} needs -o <dir>\n", method.name());
+        return Ok(2);
+    };
+    let c = Container::open(std::fs::read(input)?)?;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let table = tensor_table(&c)?;
+    let ex = omni_core::hfquant::export(&ctx, &table, method)?;
+
+    let dir = std::path::Path::new(out);
+    std::fs::create_dir_all(dir)?;
+    let weights = dir.join("model.safetensors");
+    let config = dir.join(ex.config_name);
+    std::fs::write(&weights, &ex.weights)?;
+    std::fs::write(&config, &ex.config)?;
+
+    pr!("exported {input} -> {out}");
+    pr!("  format       {}", method.name());
+    pr!(
+        "  layers       {} quantized, {} tensor(s) written unchanged",
+        commas(ex.layers.len() as u64),
+        commas(ex.plain as u64)
+    );
+    for l in ex.layers.iter().take(4) {
+        pr!(
+            "     {}  [{}, {}]  {}-bit, {} group(s) of {}{}",
+            l.prefix,
+            l.out_features,
+            l.in_features,
+            l.bits,
+            l.groups,
+            l.group_size,
+            if l.act_order { ", act-order" } else { "" }
+        );
+    }
+    if ex.layers.len() > 4 {
+        pr!("     … {} more", ex.layers.len() - 4);
+    }
+    pr!(
+        "  wrote        {}  {}",
+        weights.display(),
+        human(ex.weights.len() as u64)
+    );
+    pr!("  wrote        {}", config.display());
+    // Said plainly because §5.3 claims it: the packed words were never converted,
+    // so this is the same bytes back rather than a re-quantization.
+    pr!("  lossless     the packed words are the ones that came in, unconverted");
+    Ok(0)
+}
+
 /// `omni export` — emit into another format, refusing to lie about what was lost.
 fn cmd_export(args: &[String]) -> R {
     use omni_core::safetensors::{export, plan};
@@ -4448,10 +4513,13 @@ fn cmd_export(args: &[String]) -> R {
         eprint!("{USAGE}");
         return Ok(2);
     };
+    if let Some(method) = omni_core::hfquant::Method::parse(format) {
+        return cmd_export_hfquant(args, input, method);
+    }
     if format != "safetensors" {
         prr!(
-            "omni: no exporter for `{format}`. This build exports safetensors; \
-             `docs/design/import-export.md` §5.2 lists the others\n"
+            "omni: no exporter for `{format}`. This build exports safetensors, \
+             gptq and awq; `docs/design/import-export.md` §5.2 lists the others\n"
         );
         return Ok(2);
     }

@@ -1060,7 +1060,45 @@ jobs:
           # g_idx was checked to be the ascending grouping rather than ignored.
           grep -q 'g_idx — checked to equal i/16' /tmp/gptq-imp.txt
 
-          # And now the claim itself: export the dequantized weights and compare
+          # §5.3 claims a lossless round-trip for these two rows, so it is run:
+          # import, export, and compare against the file that went in. Byte
+          # equality of the tensors is the weaker half; the stronger one is that
+          # re-importing the exported file builds the *identical* tensor table,
+          # which sorting the tensors on the way out would quietly break.
+          for m in gptq awq; do
+            "$OMNI" export "$m" "/tmp/$m.omni" -o "/tmp/$m-back" | tee "/tmp/$m-exp.txt"
+            grep -q 'lossless     the packed words are the ones that came in' \
+              "/tmp/$m-exp.txt"
+            python3 - "$m" <<'PY_RT'
+          import json, struct, sys
+          m = sys.argv[1]
+          def load(p):
+              raw = open(p, "rb").read()
+              n = struct.unpack("<Q", raw[:8])[0]
+              head = json.loads(raw[8:8 + n]); base = 8 + n
+              return {k: (v["dtype"], tuple(v["shape"]),
+                          raw[base + v["data_offsets"][0]:base + v["data_offsets"][1]])
+                      for k, v in head.items() if k != "__metadata__"}
+          a = load(f"/tmp/{m}-model/model.safetensors")
+          b = load(f"/tmp/{m}-back/model.safetensors")
+          missing = set(a) - set(b)
+          extra = set(b) - set(a)
+          assert not missing, f"{m}: lost {sorted(missing)}"
+          assert not extra, f"{m}: invented {sorted(extra)}"
+          bad = [k for k in a if a[k] != b[k]]
+          assert not bad, f"{m}: {len(bad)} tensor(s) differ: {bad[:3]}"
+          print(f"{m}: {len(a)} tensors round-tripped byte for byte")
+          PY_RT
+            # E4: the same object graph, not merely the same bytes.
+            "$OMNI" import "$m" "/tmp/$m-back" -o "/tmp/$m-again.omni" > /dev/null
+            t1=$("$OMNI" ls "/tmp/$m.omni" --full | grep TensorTable | awk '{print $1}')
+            t2=$("$OMNI" ls "/tmp/$m-again.omni" --full | grep TensorTable | awk '{print $1}')
+            test -n "$t1"
+            test "$t1" = "$t2"
+            echo "$m: re-import builds the identical tensor table $t1"
+          done
+
+          # And now the other claim: export the dequantized weights and compare
           # them with the arithmetic Python did, byte for byte.
           for m in gptq awq; do
             "$OMNI" export safetensors "/tmp/$m.omni" -o "/tmp/$m-deq.safetensors" \

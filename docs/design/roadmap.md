@@ -92,7 +92,7 @@ Deliverables:
   structural mappings.
 - Sparsity schemes.
 - `omni-import-safetensors` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
-- `omni-export-safetensors` ✅, `-gguf`.
+- `omni-export-safetensors` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
 - `omni delta`, `omni adapter`, `omni convert`.
 - Conformance corpus: `numeric/`, `roundtrip/`, `valid/features`.
 

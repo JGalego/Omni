@@ -48,6 +48,7 @@ $ ./target/release/omni import peft ./lora --base w.omni -o lora.omni  # a LoRA,
 $ ./target/release/omni graph run m.omni --tokens 1,2,3   # execute the §07 graph
 $ ./target/release/omni import gptq ./model-gptq -o m.omni    # §05.2.2, as expressions
 $ ./target/release/omni import awq ./model-awq -o m.omni      # §05.2.3
+$ ./target/release/omni export gptq m.omni -o ./out-gptq      # byte-exact back
 $ ./target/release/omni serve model.omni --port 8080    # §13.4.3 object server
 $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with oras
 ```
@@ -295,6 +296,18 @@ implemented:
   a later token could move position 0's logits is what found it. That is the
   difference between verifying a graph and executing one, and it is the whole
   argument for writing an interpreter
+- **GPTQ and AWQ export**, which closes §5.3's lossless round-trip claim for two
+  rows of the matrix. It is byte-exact for a structural reason: the import never
+  converted anything, so exporting is finding the same literals again. CI imports,
+  exports and compares tensor by tensor — then re-imports and checks the
+  **identical tensor table** comes back, which is the check with teeth, because
+  sorting the tensors on the way out keeps every byte and still builds a different
+  graph. The config is reconstructed from the container rather than remembered:
+  bit width from the packed dtype, group size from the scale grid, act-order from
+  whether the scale is gathered, `checkpoint_format` from whether the `+1` node is
+  in the expression — so a container that lost its provenance still exports
+  correctly. A container whose layers disagree about any of those is refused,
+  because a format whose config states them once has no faithful form for it
 - **GPTQ and AWQ import**, which is where §05's claim gets tested: quantization is
   a transformation and not a file type, so a packed 4-bit weight becomes
   `permute(dequantize(reshape(permute(qweight)), scheme))` and needs nothing new
@@ -352,10 +365,10 @@ What is **not** implemented, and is reported as such rather than faked:
 - Every importer and exporter except safetensors, PEFT, GPTQ and AWQ. The
   capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
   build implements four of them; GGUF, PyTorch, ONNX and EXL2 do not exist, and a
-  request for one is refused by name rather than half-attempted. Export is
-  narrower still: safetensors only, so a GPTQ import can be dequantized out but
-  not written back as GPTQ. 3-bit GPTQ and AWQ's `gemv`/`marlin` versions are
-  refused for the reasons named above
+  request for one is refused by name rather than half-attempted. Export covers
+  safetensors, GPTQ and AWQ — not PEFT, so an imported adapter can be inspected
+  and attached but not written back out. 3-bit GPTQ and AWQ's `gemv`/`marlin`
+  versions are refused for the reasons named above
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
@@ -367,7 +380,7 @@ See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
 ## Tests
 
-447 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+453 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -613,7 +626,7 @@ container-level test runs under both mandatory digest algorithms.
 
 ```console
 $ cargo test
-test result: ok. 447 passed; 0 failed
+test result: ok. 453 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

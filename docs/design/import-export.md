@@ -345,11 +345,32 @@ refused for a different reason: its values straddle the 32-bit word boundary, so
 it is not a `packed` layout at all. AWQ's `gemv` and `marlin` versions interleave
 differently from `gemm` and are refused by name.
 
-Export back to GPTQ and AWQ does not exist yet, so §5.3's lossless round-trip
-claim for these two rows is *not* demonstrated. What is demonstrated is that the
-import is lossless: every source tensor is in the container, byte for byte, except
-an ascending `g_idx`, which is checked to be `i / group_size` and left out because
-`group_size` already says it.
+**Export exists, and §5.3's lossless round-trip claim for these two rows is
+demonstrated rather than asserted.** `omni export gptq|awq` writes the checkpoint
+back out, and it is byte-exact for a structural reason rather than a lucky one:
+the import never converted anything, so exporting is a matter of finding the same
+literals again. CI imports, exports, and compares tensor by tensor against the
+file that went in — and then goes further, re-importing the result and checking it
+builds the **identical tensor table**. That second check is the one with teeth:
+sorting the tensors on the way out keeps every byte and still produces a different
+graph, because §04.2's load order is information the source file carried.
+
+The config is *reconstructed* from the container rather than remembered — bit
+width from the packed dtype, group size from the scale grid, act-order from
+whether the scale is gathered, and `checkpoint_format` from whether the `+1` node
+is in the expression. A container that has been through `omni delta` or had its
+provenance stripped still exports correctly, because none of that lives in the
+provenance.
+
+An ascending `g_idx` is the one tensor the import does not store, since
+`group_size` already says it; the export recomputes it, which is writing down a
+fact the container kept in a smaller form rather than inventing a tensor.
+
+One thing is refused rather than approximated: a container whose layers disagree
+about bit width, group size, act-order or checkpoint format. That is representable
+in OMNI and not in a format whose config states each of those once, and writing a
+config that is right for the first layer would be the quietest possible
+corruption.
 
 Every other row of the matrix in §3 is unimplemented. A request to import one is
 refused by name, with a pointer to this document, rather than half-attempted.

@@ -1154,6 +1154,508 @@ fn round_through(x: f64, d: &DType) -> f64 {
     }
 }
 
+// ---------------------------------------------------------------------- export --
+
+/// One quantized layer, recovered from the container.
+#[derive(Debug)]
+pub struct Recovered {
+    pub prefix: String,
+    pub in_features: u64,
+    pub out_features: u64,
+    pub group_size: u64,
+    pub groups: u64,
+    pub bits: u32,
+    pub act_order: bool,
+    /// Whether the expression adds one to the stored zero point, which is
+    /// AutoGPTQ's original checkpoint format.
+    pub zeros_verbatim: bool,
+}
+
+/// What an export produced: the safetensors bytes and the config beside them.
+pub struct Exported {
+    pub weights: Vec<u8>,
+    pub config: Vec<u8>,
+    pub config_name: &'static str,
+    pub layers: Vec<Recovered>,
+    /// Tensors written back unchanged.
+    pub plain: usize,
+}
+
+impl std::fmt::Debug for Exported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Exported {{ {} bytes, {} quantized layer(s), {} plain }}",
+            self.weights.len(),
+            self.layers.len(),
+            self.plain
+        )
+    }
+}
+
+/// Writes a container back out as a GPTQ or AWQ checkpoint.
+///
+/// This is the other half of `import`, and the reason it can be byte-exact is
+/// structural rather than lucky: the import never converted anything. The packed
+/// 32-bit words went into the container as literals and the dequantization is an
+/// expression over them, so exporting is a matter of finding those literals again
+/// and writing them back under the names the format uses. §5.3's "lossless
+/// round-trip" for these two rows is a consequence of that decision, not an extra
+/// effort.
+///
+/// The config is **reconstructed from the container**, not remembered: the bit
+/// width comes from the packed dtype, the group size from the scale grid, the
+/// act-order flag from whether the scale is gathered, and the checkpoint format
+/// from whether the expression carries the `+1` node. A container that has been
+/// through `omni delta` or had its provenance stripped still exports correctly,
+/// because none of that is where the information lives.
+pub fn export(ctx: &Ctx<'_>, table: &TensorTable, method: Method) -> Res<Exported> {
+    // Every literal a tensor's expression reads, with its declared shape, dtype
+    // and layout — which is all that is needed to tell qweight from scales.
+    let mut layers: Vec<Recovered> = Vec::new();
+    let mut entries: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
+    let mut plain = 0usize;
+
+    // In the table's own load order (§04.2), not alphabetically. That order came
+    // from the source file and is information the container kept; sorting here
+    // would quietly discard it, and a re-import would then build a different
+    // table from the same tensors.
+    let names: Vec<&String> = if table.order.len() == table.tensors.len() {
+        table.order.iter().collect()
+    } else {
+        table.tensors.keys().collect()
+    };
+    for name in names {
+        let r = table
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Core(format!("`{name}` is in the order and not the table")))?;
+        let desc = TensorDesc::load(ctx, r).map_err(|e| Error::Core(e.to_string()))?;
+        let is_quant = desc.role.as_deref() == Some("quantized");
+        if !is_quant {
+            // An ordinary tensor: written back as its own bytes.
+            let Expr::Literal { chunks, dtype, .. } = &desc.value else {
+                return Err(Error::Unsupported(format!(
+                    "`{name}` is a `{}` expression and not a quantized layer; this \
+                     exporter writes packed layers and plain literals, and a third \
+                     kind would need materializing into bytes the source format \
+                     never had",
+                    desc.value.op()
+                )));
+            };
+            let shape = desc
+                .sizes()
+                .ok_or_else(|| Error::Core(format!("`{name}` has a symbolic shape")))?;
+            let bytes = ctx
+                .chunk_bytes(chunks)
+                .map_err(|e| Error::Core(e.to_string()))?;
+            entries.push((name.clone(), dtype.clone(), shape, bytes));
+            plain += 1;
+            continue;
+        }
+
+        let prefix = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| {
+                Error::Core(format!(
+                    "`{name}` is a quantized layer but is not named `<layer>.weight`"
+                ))
+            })?
+            .to_string();
+        let rec = recover(ctx, &desc, &prefix, method, &mut entries)?;
+        layers.push(rec);
+    }
+
+    if layers.is_empty() {
+        return Err(Error::Malformed(format!(
+            "no quantized layer in this container; there is nothing to write as a \
+             {} checkpoint",
+            method.name()
+        )));
+    }
+    // One config for the file, so every layer has to agree about the things a
+    // config states once. A container mixing bit widths is representable in OMNI
+    // and not in these formats, and saying so beats writing a config that is
+    // right for the first layer.
+    let first = &layers[0];
+    for l in &layers[1..] {
+        for (what, a, b) in [
+            ("bits", first.bits as u64, l.bits as u64),
+            ("group_size", first.group_size, l.group_size),
+            (
+                "desc_act",
+                u64::from(first.act_order),
+                u64::from(l.act_order),
+            ),
+            (
+                "checkpoint_format",
+                u64::from(first.zeros_verbatim),
+                u64::from(l.zeros_verbatim),
+            ),
+        ] {
+            if a != b {
+                return Err(Error::Unsupported(format!(
+                    "`{}` and `{}` disagree about `{what}` ({a} and {b}); a {} \
+                     config states it once for the whole file, so this container \
+                     has no faithful {} form",
+                    first.prefix,
+                    l.prefix,
+                    method.name(),
+                    method.name()
+                )));
+            }
+        }
+    }
+
+    let weights = write_safetensors(&entries)?;
+    let config = write_config(method, first);
+    Ok(Exported {
+        weights,
+        config,
+        config_name: match method {
+            Method::Gptq => "quantize_config.json",
+            Method::Awq => "config.json",
+        },
+        layers,
+        plain,
+    })
+}
+
+/// Pulls one quantized layer's source tensors back out of its expression.
+///
+/// The literals are identified by their declared shape and layout rather than by
+/// walking the expression's exact shape: a `packed` three-dimensional literal is
+/// `qweight` or `qzeros` and the two differ in their first extent, a
+/// two-dimensional float is `scales`, and a one-dimensional integer is `g_idx`.
+/// Matching on structure would break the moment a rewrite reassociated the tree;
+/// matching on what the tensors *are* does not.
+fn recover(
+    ctx: &Ctx<'_>,
+    desc: &TensorDesc,
+    prefix: &str,
+    method: Method,
+    entries: &mut Vec<(String, DType, Vec<u64>, Vec<u8>)>,
+) -> Res<Recovered> {
+    let shape = desc
+        .sizes()
+        .ok_or_else(|| Error::Core(format!("`{prefix}` has a symbolic shape")))?;
+    if shape.len() != 2 {
+        return Err(Error::Core(format!(
+            "`{prefix}` is {shape:?}; a quantized linear weight is [out, in]"
+        )));
+    }
+    let (out_features, in_features) = (shape[0], shape[1]);
+
+    // The literals are located through the `dequantize` node rather than by
+    // guessing from shapes: `qweight` is what it dequantizes and `qzeros` is
+    // inside its scheme, and at a group size of one those two have identical
+    // shapes — so any rule based on shape alone is ambiguous exactly where it
+    // matters. Within each subtree there is one literal of each kind, which is
+    // robust to a rewrite reassociating the tree around it.
+    let deq = find_dequantize(&desc.value).ok_or_else(|| {
+        Error::Core(format!(
+            "`{prefix}` is marked quantized but its value has no `dequantize`"
+        ))
+    })?;
+    let Expr::Dequantize { x, scheme } = deq else {
+        unreachable!("find_dequantize returns a dequantize")
+    };
+
+    let packed_in = |e: &Expr| -> Res<Option<Packed>> {
+        let mut found = None;
+        let mut all = Vec::new();
+        collect_literals(e, &mut all)?;
+        for leaf in &all {
+            if let Expr::Literal {
+                chunks,
+                shape,
+                layout: Layout::Packed { elems_per_word, .. },
+                ..
+            } = leaf
+            {
+                let sizes = crate::expr::concrete(shape).ok_or_else(|| {
+                    Error::Core(format!("`{prefix}` reads a symbolic packed literal"))
+                })?;
+                let bytes = ctx
+                    .chunk_bytes(chunks)
+                    .map_err(|e| Error::Core(e.to_string()))?;
+                found = Some((sizes, bytes, 32 / *elems_per_word));
+            }
+        }
+        Ok(found)
+    };
+    let dense_in = |e: &Expr, want_rank: usize| -> Res<Option<Dense>> {
+        let mut found = None;
+        let mut all = Vec::new();
+        collect_literals(e, &mut all)?;
+        for leaf in &all {
+            if let Expr::Literal {
+                chunks,
+                dtype,
+                shape,
+                layout,
+            } = leaf
+            {
+                if matches!(layout, Layout::Packed { .. }) {
+                    continue;
+                }
+                let sizes = crate::expr::concrete(shape)
+                    .ok_or_else(|| Error::Core(format!("`{prefix}` reads a symbolic literal")))?;
+                if sizes.len() != want_rank {
+                    continue;
+                }
+                let bytes = ctx
+                    .chunk_bytes(chunks)
+                    .map_err(|e| Error::Core(e.to_string()))?;
+                found = Some((dtype.clone(), sizes, bytes));
+            }
+        }
+        Ok(found)
+    };
+
+    let qweight = packed_in(x)?;
+    let scale_expr = match scheme.get("scale") {
+        Some(v) => Some(Expr::from_value(v).map_err(|e| Error::Core(e.to_string()))?),
+        None => None,
+    };
+    let zero_expr = match scheme.get("zero") {
+        Some(v) => Some(Expr::from_value(v).map_err(|e| Error::Core(e.to_string()))?),
+        None => None,
+    };
+    let qzeros = match &zero_expr {
+        Some(z) => packed_in(z)?.map(|(sizes, bytes, _)| (sizes, bytes)),
+        None => None,
+    };
+    let scales = match &scale_expr {
+        Some(sc) => dense_in(sc, 2)?,
+        None => None,
+    };
+    // The act-order permutation is the gather index inside the scale, and it is
+    // the one one-dimensional literal there.
+    let g_idx = match &scale_expr {
+        Some(sc) => dense_in(sc, 1)?,
+        None => None,
+    };
+
+    let (qw_shape, qw_bytes, bits) = qweight.ok_or_else(|| {
+        Error::Core(format!(
+            "`{prefix}` has no packed weight among its literals"
+        ))
+    })?;
+    let (sc_dtype, sc_shape, sc_bytes) = scales
+        .ok_or_else(|| Error::Core(format!("`{prefix}` has no scales among its literals")))?;
+    let groups = sc_shape[0];
+    if groups == 0 || in_features % groups != 0 {
+        return Err(Error::Core(format!(
+            "`{prefix}`: {groups} group(s) do not divide {in_features} input features"
+        )));
+    }
+    let group_size = in_features / groups;
+    let epw = 32 / bits as u64;
+
+    // `+1` in the tree means the stored zero point is one below the true one,
+    // which is what AutoGPTQ's original format does. Its presence is the only
+    // record of that convention, and it is enough.
+    let zeros_verbatim = !has_plus_one(&desc.value);
+    // A gathered scale is act-order: the group of a row comes from `g_idx`
+    // rather than from dividing the row index.
+    let act_order = g_idx.is_some();
+
+    // Write the source tensors back under the names the format uses.
+    let i32t = DType::I32;
+    entries.push((
+        format!("{prefix}.qweight"),
+        i32t.clone(),
+        match method {
+            Method::Gptq => vec![in_features / epw, out_features],
+            Method::Awq => vec![in_features, out_features / epw],
+        },
+        qw_bytes,
+    ));
+    let _ = qw_shape;
+    if let Some((_, bytes)) = qzeros {
+        entries.push((
+            format!("{prefix}.qzeros"),
+            i32t.clone(),
+            vec![groups, out_features / epw],
+            bytes,
+        ));
+    }
+    entries.push((
+        format!("{prefix}.scales"),
+        sc_dtype,
+        vec![groups, out_features],
+        sc_bytes,
+    ));
+    match g_idx {
+        Some((dtype, sizes, bytes)) => {
+            entries.push((format!("{prefix}.g_idx"), dtype, sizes, bytes));
+        }
+        // An ascending `g_idx` was checked and not stored on import, because
+        // `group_size` already says it. Recomputing it is not inventing a tensor:
+        // it is writing down, in the form the source format wants, a fact the
+        // container kept in a smaller one. AWQ has no `g_idx` at all.
+        None if method == Method::Gptq => {
+            let mut bytes = Vec::with_capacity(in_features as usize * 4);
+            for i in 0..in_features {
+                bytes.extend_from_slice(&((i / group_size) as i32).to_le_bytes());
+            }
+            entries.push((format!("{prefix}.g_idx"), i32t, vec![in_features], bytes));
+        }
+        None => {}
+    }
+
+    Ok(Recovered {
+        prefix: prefix.to_string(),
+        in_features,
+        out_features,
+        group_size,
+        groups,
+        bits,
+        act_order,
+        zeros_verbatim,
+    })
+}
+
+/// A packed literal recovered from an expression: its shape, its bytes, and the
+/// bit width its `elems_per_word` implies.
+type Packed = (Vec<u64>, Vec<u8>, u32);
+/// A dense literal recovered from an expression: dtype, shape, bytes.
+type Dense = (DType, Vec<u64>, Vec<u8>);
+
+/// The first `dequantize` in a tree, which is where a quantized layer's operands
+/// live.
+fn find_dequantize(e: &Expr) -> Option<&Expr> {
+    if matches!(e, Expr::Dequantize { .. }) {
+        return Some(e);
+    }
+    e.children().into_iter().find_map(find_dequantize)
+}
+
+/// Every `literal` an expression reads, including the ones inside a
+/// `dequantize` scheme.
+///
+/// §05.1 puts `scale`, `zero` and `order` in the scheme as *expressions*, and
+/// the scheme is a CBOR value rather than a child node — so a walk over child
+/// expressions alone silently misses them.
+fn collect_literals(e: &Expr, out: &mut Vec<Expr>) -> Res<()> {
+    if matches!(e, Expr::Literal { .. }) {
+        out.push(e.clone());
+    }
+    if let Expr::Dequantize { scheme, .. } | Expr::Quantize { scheme, .. } = e {
+        for key in ["scale", "zero", "order", "scale_zero", "scale_scale"] {
+            if let Some(v) = scheme.get(key) {
+                let sub = Expr::from_value(v).map_err(|err| {
+                    Error::Core(format!("a scheme's `{key}` is not an expression: {err}"))
+                })?;
+                collect_literals(&sub, out)?;
+            }
+        }
+    }
+    for c in e.children() {
+        collect_literals(c, out)?;
+    }
+    Ok(())
+}
+
+/// Whether the tree adds a constant one anywhere — AutoGPTQ's zero-point offset.
+///
+/// The node is inside the scheme's `zero`, not among the expression's children,
+/// so this looks there too. Missing it would report every v1 checkpoint as v2 and
+/// shift every weight by one quantization step on the way back out.
+fn has_plus_one(e: &Expr) -> bool {
+    if let Expr::Bin {
+        op: crate::expr::BinOp::Add,
+        b,
+        ..
+    } = e
+    {
+        if let Expr::Full { value, .. } = b.as_ref() {
+            if value.as_f64() == 1.0 {
+                return true;
+            }
+        }
+    }
+    if let Expr::Dequantize { scheme, .. } | Expr::Quantize { scheme, .. } = e {
+        for key in ["zero", "scale"] {
+            if let Some(sub) = scheme.get(key).and_then(|v| Expr::from_value(v).ok()) {
+                if has_plus_one(&sub) {
+                    return true;
+                }
+            }
+        }
+    }
+    e.children().iter().any(|c| has_plus_one(c))
+}
+
+fn write_config(method: Method, l: &Recovered) -> Vec<u8> {
+    use crate::json;
+    let inner = vec![
+        ("bits", json::Value::U(l.bits as u64)),
+        ("group_size", json::Value::U(l.group_size)),
+        ("quant_method", json::string(method.name())),
+    ];
+    let v = match method {
+        Method::Gptq => {
+            let mut p = inner;
+            p.push(("desc_act", json::Value::Bool(l.act_order)));
+            p.push(("sym", json::Value::Bool(true)));
+            p.push((
+                "checkpoint_format",
+                json::string(if l.zeros_verbatim { "gptq_v2" } else { "gptq" }),
+            ));
+            json::object(p)
+        }
+        Method::Awq => {
+            let mut p = inner;
+            p.push(("zero_point", json::Value::Bool(true)));
+            p.push(("version", json::string("gemm")));
+            json::object(vec![("quantization_config", json::object(p))])
+        }
+    };
+    v.encode().into_bytes()
+}
+
+/// Writes safetensors from named byte buffers.
+fn write_safetensors(entries: &[(String, DType, Vec<u64>, Vec<u8>)]) -> Res<Vec<u8>> {
+    use crate::json;
+    let mut header = Vec::new();
+    let mut at = 0u64;
+    for (name, dtype, shape, bytes) in entries {
+        let st = safetensors::name_of(dtype).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "`{name}` is {}, which safetensors has no name for",
+                dtype.label()
+            ))
+        })?;
+        header.push((
+            name.as_str(),
+            json::object(vec![
+                ("dtype", json::string(st)),
+                (
+                    "shape",
+                    json::Value::Array(shape.iter().map(|d| json::Value::U(*d)).collect()),
+                ),
+                (
+                    "data_offsets",
+                    json::Value::Array(vec![
+                        json::Value::U(at),
+                        json::Value::U(at + bytes.len() as u64),
+                    ]),
+                ),
+            ]),
+        ));
+        at += bytes.len() as u64;
+    }
+    let head = json::object(header).encode().into_bytes();
+    let mut out = (head.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&head);
+    for (_, _, _, bytes) in entries {
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1778,6 +2280,216 @@ mod tests {
         assert!(
             im.report.verified_tensors > 0,
             "the bytes are still checked"
+        );
+    }
+    // ----------------------------------------------------- the round trip --
+
+    /// Imports, exports, and compares — the whole of §5.3's claim for these two
+    /// rows, checked rather than asserted.
+    fn round_trip(method: Method, cfg: Vec<u8>, f: &Fixture) -> (Vec<u8>, Exported) {
+        let im = import(&cfg, &f.weights, method, &ImportOpts::default()).unwrap();
+        let hash = HashAlgo::default();
+        let mut mem = crate::store::MemoryStore::new(hash);
+        for o in &im.objects {
+            let _ = crate::store::WritableStore::put(&mut mem, &o.payload);
+        }
+        let ctx = Ctx::new(&mem);
+        let tref = im
+            .objects
+            .iter()
+            .find(|o| o.otype == otype::TENSOR_TABLE)
+            .map(|o| (otype::TENSOR_TABLE, o.digest(hash)))
+            .unwrap();
+        let table = TensorTable::load(&ctx, &tref).unwrap();
+        let ex = export(&ctx, &table, method)
+            .unwrap_or_else(|e| panic!("{} export failed: {e}", method.name()));
+        (f.weights.clone(), ex)
+    }
+
+    #[test]
+    fn a_gptq_checkpoint_round_trips_byte_for_byte() {
+        let f = fixture(
+            Method::Gptq,
+            16,
+            8,
+            8,
+            Some((0..16).map(|i| i / 8).collect()),
+        );
+        let (src, ex) = round_trip(Method::Gptq, gptq_config(4, 8, vec![]), &f);
+
+        // Every tensor the source had, with the same bytes. Compared tensor by
+        // tensor rather than file by file, because safetensors' header is a JSON
+        // map and two writers can order it differently while meaning the same
+        // thing — that difference is not a loss, and calling it one would be as
+        // wrong as missing a real one.
+        let a = safetensors::File::parse(&src).unwrap();
+        let b = safetensors::File::parse(&ex.weights).unwrap();
+        let names_a: Vec<&str> = a.entries.iter().map(|e| e.name.as_str()).collect();
+        for e in &a.entries {
+            let got = b
+                .get(&e.name)
+                .unwrap_or_else(|| panic!("`{}` did not survive the round trip", e.name));
+            assert_eq!(got.shape, e.shape, "{}", e.name);
+            assert_eq!(got.dtype, e.dtype, "{}", e.name);
+            assert_eq!(b.tensor(got), a.tensor(e), "`{}` differs", e.name);
+        }
+        // And nothing invented: the same names out as in.
+        let names_b: Vec<&str> = b.entries.iter().map(|e| e.name.as_str()).collect();
+        let mut sa: Vec<&str> = names_a.clone();
+        let mut sb: Vec<&str> = names_b.clone();
+        sa.sort_unstable();
+        sb.sort_unstable();
+        assert_eq!(sa, sb, "the tensor sets differ");
+
+        // The config is reconstructed from the container rather than remembered,
+        // so it has to come back saying the same things.
+        let cfg = crate::json::parse(&ex.config).unwrap();
+        assert_eq!(cfg.get("bits").unwrap().as_u64(), Some(4));
+        assert_eq!(cfg.get("group_size").unwrap().as_u64(), Some(8));
+        assert_eq!(cfg.get("quant_method").unwrap().as_str(), Some("gptq"));
+        assert_eq!(cfg.get("desc_act").unwrap().as_bool(), Some(false));
+        // The `+1` node in the expression is the only record of AutoGPTQ's
+        // original zero-point convention, and it survives.
+        assert_eq!(
+            cfg.get("checkpoint_format").unwrap().as_str(),
+            Some("gptq"),
+            "the v1 offset should be recovered from the expression"
+        );
+        assert_eq!(ex.layers.len(), 1);
+        assert_eq!(ex.plain, 1, "the norm tensor came back too");
+    }
+
+    #[test]
+    fn an_awq_checkpoint_round_trips_and_keeps_its_interleave() {
+        let f = fixture(Method::Awq, 8, 8, 8, None);
+        let (src, ex) = round_trip(Method::Awq, awq_config(4, 8, vec![]), &f);
+        let a = safetensors::File::parse(&src).unwrap();
+        let b = safetensors::File::parse(&ex.weights).unwrap();
+        for e in &a.entries {
+            let got = b
+                .get(&e.name)
+                .unwrap_or_else(|| panic!("`{}` missing", e.name));
+            assert_eq!(b.tensor(got), a.tensor(e), "`{}` differs", e.name);
+        }
+        // AWQ has no g_idx, and the exporter must not invent one.
+        assert!(
+            b.get("l.g_idx").is_none(),
+            "AWQ has no g_idx and one was written anyway"
+        );
+        let cfg = crate::json::parse(&ex.config).unwrap();
+        let q = cfg.get("quantization_config").unwrap();
+        assert_eq!(q.get("quant_method").unwrap().as_str(), Some("awq"));
+        assert_eq!(q.get("version").unwrap().as_str(), Some("gemm"));
+    }
+
+    #[test]
+    fn act_order_survives_the_round_trip_as_act_order() {
+        // A non-ascending g_idx is stored, used as a gather, and has to come back
+        // both as the tensor and as `desc_act: true`.
+        let g_idx: Vec<u32> = (0..16).map(|i| u32::from(i < 8)).collect();
+        let f = fixture(Method::Gptq, 16, 8, 8, Some(g_idx.clone()));
+        let (src, ex) = round_trip(Method::Gptq, gptq_config(4, 8, vec![]), &f);
+        let a = safetensors::File::parse(&src).unwrap();
+        let b = safetensors::File::parse(&ex.weights).unwrap();
+        assert_eq!(
+            b.tensor(b.get("l.g_idx").expect("g_idx should be written")),
+            a.tensor(a.get("l.g_idx").unwrap()),
+            "the act-order permutation changed"
+        );
+        let cfg = crate::json::parse(&ex.config).unwrap();
+        assert_eq!(cfg.get("desc_act").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn the_v2_convention_comes_back_as_v2() {
+        // The two checkpoint formats differ by one node in the expression, and
+        // that node is what the exporter reads. Getting this backwards would
+        // shift every weight by one quantization step on the way out.
+        let f = fixture(Method::Gptq, 16, 8, 8, None);
+        let (_, ex) = round_trip(
+            Method::Gptq,
+            gptq_config(4, 8, vec![("checkpoint_format", json::string("gptq_v2"))]),
+            &f,
+        );
+        let cfg = crate::json::parse(&ex.config).unwrap();
+        assert_eq!(
+            cfg.get("checkpoint_format").unwrap().as_str(),
+            Some("gptq_v2")
+        );
+    }
+
+    #[test]
+    fn a_container_a_config_cannot_describe_is_refused() {
+        // Two layers quantized differently is representable in OMNI and not in a
+        // format whose config states the bit width once. Writing a config that is
+        // right for the first layer would be the quietest possible corruption.
+        let mut entries: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
+        let _ = &mut entries;
+        let a = fixture(Method::Gptq, 16, 8, 8, None);
+        let b = fixture(Method::Gptq, 16, 8, 16, None);
+        // Import each separately, then put both tables in one store: the check is
+        // on the exporter, so the container is built to trip it.
+        let hash = HashAlgo::default();
+        let ia = import(
+            &gptq_config(4, 8, vec![]),
+            &a.weights,
+            Method::Gptq,
+            &ImportOpts::default(),
+        )
+        .unwrap();
+        let ib = import(
+            &gptq_config(4, 16, vec![]),
+            &b.weights,
+            Method::Gptq,
+            &ImportOpts::default(),
+        )
+        .unwrap();
+        let mut mem = crate::store::MemoryStore::new(hash);
+        for o in ia.objects.iter().chain(ib.objects.iter()) {
+            let _ = crate::store::WritableStore::put(&mut mem, &o.payload);
+        }
+        let ctx = Ctx::new(&mem);
+        let tref = |im: &Imported| {
+            im.objects
+                .iter()
+                .find(|o| o.otype == otype::TENSOR_TABLE)
+                .map(|o| (otype::TENSOR_TABLE, o.digest(hash)))
+                .unwrap()
+        };
+        let ta = TensorTable::load(&ctx, &tref(&ia)).unwrap();
+        let tb = TensorTable::load(&ctx, &tref(&ib)).unwrap();
+        let mut merged = ta.clone();
+        for (name, r) in &tb.tensors {
+            merged.tensors.insert(format!("second.{name}"), *r);
+        }
+        let e = export(&ctx, &merged, Method::Gptq).expect_err("mixed group sizes");
+        assert!(e.to_string().contains("group_size"), "{e}");
+        assert!(e.to_string().contains("states it once"), "{e}");
+    }
+    #[test]
+    fn a_re_import_builds_the_identical_tensor_table() {
+        // E4 is stronger than byte equality of the tensors: import, export and
+        // import again has to produce the *same object graph*, or the round trip
+        // is only nearly closed. Load order is what makes the difference —
+        // sorting the tensors on the way out would keep every byte and still
+        // build a different table.
+        let f = fixture(Method::Gptq, 16, 8, 8, None);
+        let cfg = gptq_config(4, 8, vec![]);
+        let hash = HashAlgo::default();
+        let table_of = |weights: &[u8]| -> Digest {
+            let im = import(&cfg, weights, Method::Gptq, &ImportOpts::default()).unwrap();
+            im.objects
+                .iter()
+                .find(|o| o.otype == otype::TENSOR_TABLE)
+                .map(|o| o.digest(hash))
+                .unwrap()
+        };
+        let first = table_of(&f.weights);
+        let (_, ex) = round_trip(Method::Gptq, cfg.clone(), &f);
+        assert_eq!(
+            table_of(&ex.weights),
+            first,
+            "the round trip kept every byte and still built a different table"
         );
     }
 }
