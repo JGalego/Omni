@@ -142,7 +142,219 @@ pub fn corpus() -> Vec<Case> {
     out.extend(invalid_encoding());
     out.extend(forward());
     out.extend(numeric());
+    out.extend(valid_features());
     out
+}
+
+// ---------------------------------------------------------- valid/features --
+
+/// `valid/features` — containers that are valid *and* use something optional.
+///
+/// The `degrade` suite tests what a reader does with a feature from the future.
+/// This one tests the opposite failure: a reader that refuses a feature the
+/// format defines today, because its author only ever tried the minimal case.
+/// Every file here must be accepted outright — not degraded — and each uses one
+/// mechanism the minimal corpus never exercises.
+fn valid_features() -> Vec<Case> {
+    let mut out = Vec::new();
+    let hash = HashAlgo::Blake3_256;
+    let opts = |codec| PackOptions {
+        hash,
+        log2_align: 12,
+        creator: "omni-conformance".into(),
+        reproducible: true,
+        codec,
+    };
+
+    // 1. A compressed container. §03.7 makes `zstd` the one codec a reader MUST
+    //    support, and compression is a property of the stored copy: every
+    //    object digest here is the digest of the *logical* bytes, so a reader
+    //    that verified the compressed bytes instead fails.
+    let (objs, root) = base_objects(hash, 256);
+    out.push(case(
+        "valid/features",
+        "codec-zstd",
+        Expect::Accept,
+        Some("R-C05"),
+        "segments compressed with the codec §03.7 marks MUST; identities are \
+         over the logical bytes, so decompression is required to check them",
+        pack(
+            &objs,
+            &root,
+            &opts(omni_core::codec::Codec::Zstd { level: 3 }),
+        )
+        .unwrap(),
+    ));
+
+    // 2. A tensor split across several chunks. A 40 GB tensor is never one
+    //    object, and a reader that assumes a literal is one blob works
+    //    perfectly until the first real model.
+    let (objs, root) = ModelBuilder::new("omni/conformance/features")
+        .hash(hash)
+        .chunk_size(64)
+        .tensor(TensorSpec {
+            name: "w".into(),
+            shape: vec![64, 4],
+            dtype: DType::F32,
+            axes: None,
+            semantic: "weight",
+            data: (0..64 * 4 * 4).map(|i| (i % 251) as u8).collect(),
+            layout: None,
+        })
+        .build();
+    out.push(case(
+        "valid/features",
+        "chunked-tensor",
+        Expect::Accept,
+        Some("R-T02"),
+        "one tensor over sixteen chunks: the chunk list's total must equal the \
+         sum of its parts and the tensor's stored size",
+        pack(&objs, &root, &opts(omni_core::codec::Codec::Raw)).unwrap(),
+    ));
+
+    // 3. A quantized weight: the expression form of §05, with the packed words
+    //    stored verbatim and the arithmetic in a `dequantize` node. A reader
+    //    that only understands `literal` must still open, list and verify this
+    //    file — it is the shape of every quantized model in the wild.
+    let mut b = ModelBuilder::new("omni/conformance/features")
+        .hash(hash)
+        .chunk_size(256);
+    // 32 int4 values, two per byte, with an f16 scale per block of 8.
+    let packed: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(17)).collect();
+    let q = b.literal(
+        &packed,
+        DType::U4,
+        &[4, 8],
+        omni_core::layout::Layout::Packed {
+            elems_per_word: 2,
+            word_bits: 8,
+            bit_order: omni_core::layout::BitOrder::LsbFirst,
+            order: omni_core::layout::Order::RowMajor,
+        },
+    );
+    let mut scales = vec![0u8; 8];
+    for (i, v) in [1.0f64, 0.5, 0.25, 2.0].iter().enumerate() {
+        DType::F16.encode(&mut scales, i as u64, *v, omni_core::dtype::Round::Rne);
+    }
+    let s = b.literal(
+        &scales,
+        DType::F16,
+        &[4, 1],
+        omni_core::layout::Layout::default(),
+    );
+    let value = omni_core::expr::Expr::Dequantize {
+        x: Box::new(q),
+        scheme: Value::map(vec![
+            ("scheme", Value::text("affine")),
+            ("formula", Value::text("affine-sub")),
+            ("out", DType::F32.to_value()),
+            ("axis", Value::U(1)),
+            ("block", Value::Array(vec![Value::U(1), Value::U(8)])),
+            ("scale", s.to_value()),
+            (
+                "zero",
+                omni_core::expr::Expr::Full {
+                    value: omni_core::expr::Scalar::Int(8),
+                    dtype: DType::U8,
+                    shape: omni_core::expr::dims(&[1, 1]),
+                }
+                .to_value(),
+            ),
+        ]),
+    };
+    let (objs, root) = b
+        .derived(
+            "w",
+            omni_core::tensor::TensorDesc {
+                shape: omni_core::expr::dims(&[4, 8]),
+                dtype: DType::F32,
+                layout: omni_core::layout::Layout::default(),
+                value,
+                semantic: Some("weight".into()),
+                role: Some("quantized".into()),
+                axes: None,
+                device_hint: None,
+                materialize: omni_core::tensor::Materialize::Lazy,
+                stats: None,
+                digest_materialized: None,
+            },
+        )
+        .build();
+    out.push(case(
+        "valid/features",
+        "quantized-expression",
+        Expect::Accept,
+        Some("R-T04"),
+        "a weight that is an expression rather than a buffer (§05.1): int4 \
+         packed two per byte, one f16 scale per block of eight, and the \
+         zero-point subtracted before scaling",
+        pack(&objs, &root, &opts(omni_core::codec::Codec::Raw)).unwrap(),
+    ));
+
+    // 4. A model that carries its own graph (§07.5). The tensor names in it are
+    //    checked against the tensor table by R-I10, so this file is also a test
+    //    that a reader can tell a graph that matches its weights from one that
+    //    does not.
+    let sizes = [4u64, 3, 2];
+    let mut b = ModelBuilder::new("omni/conformance/features")
+        .hash(hash)
+        .chunk_size(256)
+        .arch(
+            "mlp",
+            vec![(
+                "hidden_sizes",
+                Value::Array(sizes.iter().map(|n| Value::U(*n)).collect()),
+            )],
+        );
+    let mut names = Vec::new();
+    for i in 0..sizes.len() - 1 {
+        let (fan_in, fan_out) = (sizes[i], sizes[i + 1]);
+        let name = format!("mlp.layers.{i}.weight");
+        b = b.tensor(TensorSpec {
+            name: name.clone(),
+            shape: vec![fan_out, fan_in],
+            dtype: DType::F32,
+            axes: None,
+            semantic: "weight",
+            data: (0..fan_in * fan_out * 4).map(|k| (k % 251) as u8).collect(),
+            layout: None,
+        });
+        names.push(name);
+    }
+    let params = Value::map(vec![(
+        "hidden_sizes",
+        Value::Array(sizes.iter().map(|n| Value::U(*n)).collect()),
+    )]);
+    let module = omni_core::ir::synthesize("mlp", &params, &names).expect("synthesizes");
+    let (objs, root) = b.graph(module, Vec::new()).build();
+    out.push(case(
+        "valid/features",
+        "graph-semantic",
+        Expect::Accept,
+        Some("R-I10"),
+        "a model that describes its own computation (§07): every `constant` in \
+         the graph names a tensor the table has, at the shape the graph expects",
+        pack(&objs, &root, &opts(omni_core::codec::Codec::Raw)).unwrap(),
+    ));
+    out
+}
+
+/// The minimal graph's objects, for cases that only vary the packing.
+fn base_objects(hash: HashAlgo, chunk: usize) -> (Vec<Object>, Digest) {
+    ModelBuilder::new("omni/conformance")
+        .hash(hash)
+        .chunk_size(chunk)
+        .arch("test", vec![("hidden_size", Value::U(8))])
+        .tensor(TensorSpec {
+            name: "w".into(),
+            shape: vec![8, 8],
+            dtype: DType::F32,
+            axes: None,
+            semantic: "weight",
+            data: (0..8 * 8 * 4).map(|i| (i % 251) as u8).collect(),
+            layout: None,
+        })
+        .build()
 }
 
 // ---------------------------------------------------------------- numeric --

@@ -89,5 +89,13 @@ because one part of it is from the future.
 | `int4-packing` | accept | R-T08 | two signed 4-bit values per byte, low nibble first (§04.4): a reader that swaps them reads the tensor transposed within every byte |
 | `e8m0-exponents` | accept | R-T08 | the MX scale type is a bare power-of-two exponent (§05.2.8), not a float: read as one, every scale is wrong by orders of magnitude |
 | `materialized-digest-wrong` | reject | R-T08 | the tensor declares a `digest_materialized` its own values do not produce. The container is structurally perfect, so this is the one case in the corpus that can only be caught by *evaluating* |
+## `valid/features`
 
-46 cases in this suite.
+| Case | Expect | Rule | Why |
+|---|---|---|---|
+| `codec-zstd` | accept | R-C05 | segments compressed with the codec §03.7 marks MUST; identities are over the logical bytes, so decompression is required to check them |
+| `chunked-tensor` | accept | R-T02 | one tensor over sixteen chunks: the chunk list's total must equal the sum of its parts and the tensor's stored size |
+| `quantized-expression` | accept | R-T04 | a weight that is an expression rather than a buffer (§05.1): int4 packed two per byte, one f16 scale per block of eight, and the zero-point subtracted before scaling |
+| `graph-semantic` | accept | R-I10 | a model that describes its own computation (§07): every `constant` in the graph names a tensor the table has, at the shape the graph expects |
+
+50 cases in this suite.

@@ -260,7 +260,12 @@ implemented:
   subnormals, f8e4m3's saturation where an infinity would be, int4's nibble
   order, e8m0's bare exponents — each carrying the publisher's own digest of
   what its tensor evaluates to (§04.3), and one whose declared digest is a lie,
-  which a reader that ignores the field will pass and should not
+  which a reader that ignores the field will pass and should not. `valid/features`
+  is the opposite test — four containers that are valid *and* use something
+  optional (a compressed segment, a tensor over sixteen chunks, a quantized
+  weight as an expression, a model carrying its own graph), because a reader
+  that refuses a feature the format defines today fails differently from one
+  that mishandles a feature from tomorrow
 - **A Jinja2 → OMNI-CT translator** (`omni jinja`), because §06.9 replaces an
   executed Jinja string with a total language and whether that trade is
   affordable is an empirical question. It converts 14 of a 15-template corpus of
