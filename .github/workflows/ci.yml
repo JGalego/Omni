@@ -501,6 +501,24 @@ jobs:
           cmp /tmp/fixture.gguf /tmp/back.gguf
           echo "gguf round trip: $(stat -c%s /tmp/fixture.gguf) bytes, identical"
 
+          # §05.2.4's other representation: the blocks verbatim, as a cache the
+          # export checks rather than trusts (§10.6 rule 2).
+          "$OMNI" import gguf /tmp/fixture.gguf -o /tmp/opaque.omni --keep-opaque \
+            | tee /tmp/ggufop.txt
+          grep -q '10 block cache(s) attached' /tmp/ggufop.txt
+          "$OMNI" export gguf /tmp/opaque.omni -o /tmp/opaque.gguf | tee /tmp/ggufop2.txt
+          grep -q '10 cache(s) agreed with the structural form' /tmp/ggufop2.txt
+          cmp /tmp/fixture.gguf /tmp/opaque.gguf
+          # Rule 1: the caches are droppable, and dropping them leaves the same
+          # model — same root digest, same tensors, smaller file.
+          "$OMNI" strip /tmp/opaque.omni -o /tmp/stripped.omni --caches | tee /tmp/ggufop3.txt
+          grep -q '10 object(s) removed' /tmp/ggufop3.txt
+          grep -q 'every digest unchanged (R-N01)' /tmp/ggufop3.txt
+          test "$(stat -c%s /tmp/stripped.omni)" -lt "$(stat -c%s /tmp/opaque.omni)"
+          # Same model: the file it exports is still the file that came in.
+          "$OMNI" export gguf /tmp/stripped.omni -o /tmp/stripped.gguf >/dev/null
+          cmp /tmp/fixture.gguf /tmp/stripped.gguf
+
           # A type whose codebook is not in the file is refused by name, with
           # its own exit code, rather than guessed at (§05.6 rule 1).
           python3 - <<'PY_IQ'

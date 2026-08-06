@@ -1331,6 +1331,14 @@ pub struct ImportOpts {
     /// The largest tensor to dequantize whole for the I4 check, in elements.
     /// What it skipped is reported rather than implied.
     pub max_verify_elems: u64,
+    /// Also attach §05.2.4's *opaque* form: each quantized tensor's blocks,
+    /// verbatim, as a `RuntimeCache` a runtime can map without conversion.
+    ///
+    /// Off by default because it doubles the stored bytes of every quantized
+    /// tensor, and the structural form already preserves them. §05.2.4 says a
+    /// well-formed import produces the structural form as canonical and *may*
+    /// attach the opaque one; this is the may.
+    pub opaque_cache: bool,
 }
 
 impl Default for ImportOpts {
@@ -1343,6 +1351,7 @@ impl Default for ImportOpts {
             license: None,
             arch: None,
             max_verify_elems: 1 << 22,
+            opaque_cache: false,
         }
     }
 }
@@ -1490,8 +1499,57 @@ pub fn import(bytes: &[u8], opts: &ImportOpts) -> Res<Imported> {
         });
     }
 
+    // §05.2.4's second representation, when it was asked for.
+    let mut caches: Vec<Object> = Vec::new();
+    if opts.opaque_cache {
+        for (t, entry) in imported.iter().zip(&f.tensors) {
+            if !t.ty.is_quantized() {
+                continue;
+            }
+            let raw = f.tensor(entry)?;
+            let (be, bb) = t.ty.block().expect("quantized");
+            let payload = b.chunk_list(raw);
+            // §05.2.4: the cache is keyed by the structural expression's
+            // digest, so a reader can tell whether it caches *this* tensor
+            // rather than an older version of it (§10.6 rule 2).
+            let structural = b
+                .derived
+                .iter()
+                .find(|(n, _)| n == &t.name)
+                .map(|(_, d)| hash.digest(&d.value.to_value().encode()))
+                .ok_or_else(|| Error::Core(format!("`{}` has no structural form", t.name)))?;
+            caches.push(opaque_cache(
+                t,
+                be,
+                bb,
+                payload,
+                structural,
+                raw.len() as u64,
+            ));
+        }
+        report
+            .represented
+            .push(format!("opaque block cache ({} tensor(s))", caches.len()));
+    }
+
     // I2: the header, in full, in a form an export can write back. Not a
     // summary — a key this build does not model is still a key the file had.
+    if !caches.is_empty() {
+        b = b.manifest_key(
+            "caches",
+            Value::Array(
+                caches
+                    .iter()
+                    .map(|o| {
+                        Value::Array(vec![
+                            Value::U(otype::RUNTIME_CACHE as u64),
+                            Value::Bytes(o.digest(hash).to_vec()),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+    }
     let foreign = foreign_object(&f, &imported);
     b = b.manifest_key(
         "foreign",
@@ -1677,6 +1735,7 @@ pub fn import(bytes: &[u8], opts: &ImportOpts) -> Res<Imported> {
         .asset("provenance", otype::PROVENANCE, report.to_value())
         .build();
     objects.push(foreign);
+    objects.extend(caches);
     Ok(Imported {
         objects,
         root,
@@ -1731,6 +1790,80 @@ pub fn arch_params(f: &File<'_>) -> Vec<(&'static str, Value)> {
         out.push(("rope", Value::map(vec![("theta", Value::F64(theta))])));
     }
     out
+}
+
+/// One tensor's blocks, verbatim, as the §10.6 `RuntimeCache` §05.2.4 calls the
+/// *opaque* representation.
+///
+/// The point of it is that `llama.cpp` can map these bytes and run with no
+/// conversion at all, while the canonical form of the same tensor stays an
+/// expression a reader can see through. Two things make that safe rather than a
+/// second source of truth: the cache is keyed by the structural expression's
+/// digest (§10.6 rule 2), so a stale one is detectable, and it is flagged
+/// `CACHEABLE`, so deleting every cache leaves the same model (§10.6 rule 1).
+///
+/// The dtype is `opaque`, which §04.3.5 restricts to `literal`, `slice` and
+/// cast-to-opaque: this build will not do arithmetic on bytes whose element
+/// layout it has declined to describe. The layout says how long a block is and
+/// what its fields are, which is the *sizing* information §04.3.5 does allow.
+fn opaque_cache(
+    t: &Imported1,
+    block_elems: u64,
+    block_bytes: u64,
+    payload: crate::expr::Ref,
+    structural: Digest,
+    size: u64,
+) -> Object {
+    let id = format!("org.ggml/{}", t.ty.name());
+    let dtype = DType::Opaque {
+        id: id.clone(),
+        block_elems,
+        block_bytes,
+    };
+    let groups: Vec<Vec<crate::layout::Field>> = vec![fields(t.ty)
+        .iter()
+        .map(|f| crate::layout::Field {
+            name: f.name.to_string(),
+            dtype: None,
+            count: Some(f.len as u64),
+        })
+        .collect()];
+    let layout = Layout::Interleaved {
+        groups,
+        stride_bytes: block_bytes,
+    };
+    let numel: u64 = t.dims.iter().product();
+    let value = Expr::Literal {
+        chunks: payload,
+        dtype,
+        shape: dims(&[numel / block_elems]),
+        layout,
+    };
+    let mut o = Object::structure(
+        otype::RUNTIME_CACHE,
+        &Value::map(vec![
+            ("t", Value::text("omni.rt/cache")),
+            ("v", Value::U(1)),
+            ("kind", Value::text("materialized-tensor")),
+            ("tensor", Value::text(t.name.clone())),
+            ("key", Value::Bytes(structural.to_vec())),
+            (
+                "target",
+                Value::map(vec![(
+                    "runtime",
+                    Value::map(vec![("name", Value::text("ggml"))]),
+                )]),
+            ),
+            ("payload", value.to_value()),
+            ("size", Value::U(size)),
+            ("executable", Value::Bool(false)),
+            ("reproducible", Value::Bool(true)),
+        ]),
+    );
+    // §10.6 rule 1: every cache is droppable, and the flag is how a reader
+    // knows it without understanding what is cached.
+    o.oflags |= crate::container::oflags::CACHEABLE;
+    o
 }
 
 /// The `Foreign` object (§01.9): the whole GGUF header, and where every
@@ -2051,6 +2184,10 @@ pub struct Plan {
     /// Whether this is a re-export of a file this build imported, in which case
     /// the header is the source's own rather than one composed here.
     pub from_gguf: bool,
+    /// Tensors whose §05.2.4 opaque cache was found and checked against the
+    /// bytes the structural form reassembles to. Zero when the container
+    /// carries no caches, which is the default.
+    pub opaque_checked: usize,
 }
 
 impl Plan {
@@ -2074,6 +2211,10 @@ impl Plan {
             ),
             ("lossless", json::Value::Bool(self.lossless())),
             ("tensors", json::Value::U(self.tensors.len() as u64)),
+            (
+                "opaque_caches_verified",
+                json::Value::U(self.opaque_checked as u64),
+            ),
             ("bytes", json::Value::U(self.bytes)),
             (
                 "lost",
@@ -2097,6 +2238,36 @@ impl Plan {
 /// One tensor as it will be written: name, type, GGUF-order extents, offset in
 /// the data section, and the bytes themselves.
 type Written = (String, Type, Vec<u64>, u64, Vec<u8>);
+
+/// The opaque block caches (§05.2.4, §10.6) a container carries, by tensor name.
+///
+/// A cache is an *assertion* that these bytes are what the structural form
+/// computes, and §10.6 rule 2 says a consumer must check it rather than trust
+/// it. So the export path reads them and compares; a stale one is a defect,
+/// not a fallback.
+fn opaque_caches(ctx: &Ctx<'_>, manifest: &Value) -> Vec<(String, crate::expr::Ref)> {
+    let mut out = Vec::new();
+    for item in manifest
+        .get("caches")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&[])
+    {
+        let Ok(r) = crate::expr::parse_ref_value(item) else {
+            continue;
+        };
+        let Ok(v) = ctx.value(&r.1) else { continue };
+        let (Some(name), Some(payload)) = (
+            v.get("tensor").and_then(|x| x.as_str()),
+            v.get("payload").and_then(|x| Expr::from_value(x).ok()),
+        ) else {
+            continue;
+        };
+        if let Expr::Literal { chunks, .. } = payload {
+            out.push((name.to_string(), chunks));
+        }
+    }
+    out
+}
 
 /// The GGUF header a container carries, when it came from one.
 struct Preserved {
@@ -2348,8 +2519,9 @@ fn put_meta(out: &mut Vec<u8>, m: &Meta) {
 /// it composes a file from the tensor table, and [`plan`] has already said what
 /// that cannot carry.
 pub fn export(ctx: &Ctx<'_>, manifest: &Value, table: &TensorTable) -> Res<(Vec<u8>, Plan)> {
-    let p = plan(ctx, manifest, table)?;
+    let mut p = plan(ctx, manifest, table)?;
     let pres = preserved(ctx, manifest)?;
+    let caches = opaque_caches(ctx, manifest);
 
     // (name, ggml type, dims, bytes) in file order, with the data already in
     // hand: a tensor's size is not a number to trust from a header when the
@@ -2395,6 +2567,24 @@ pub fn export(ctx: &Ctx<'_>, manifest: &Value, table: &TensorTable) -> Res<(Vec<
                             .expect("a preserved field list implies a block");
                     reassemble(t.ty, &parts, (numel / be) as usize)?
                 };
+                // §05.2.4 permits both representations, and this is where they
+                // are made to agree: the cache is compared with what the
+                // structural form reassembles to, and a disagreement is an
+                // error rather than a preference between two answers.
+                if let Some((_, r)) = caches.iter().find(|(n, _)| *n == t.name) {
+                    let cached = ctx.chunk_bytes(r).map_err(|e| Error::Core(e.to_string()))?;
+                    if cached != data {
+                        return Err(Error::Core(format!(
+                            "`{}`: the opaque cache holds {} bytes and the \
+                             structural form reassembles to {}; §10.6 rule 2 \
+                             makes that a stale cache rather than a choice",
+                            t.name,
+                            cached.len(),
+                            data.len()
+                        )));
+                    }
+                    p.opaque_checked += 1;
+                }
                 entries.push((t.name.clone(), t.ty, t.dims.clone(), t.offset, data));
             }
             (pres.version, pres.alignment, pres.kv.clone())
@@ -2747,6 +2937,72 @@ mod tests {
         assert!(plan.lossless(), "{:?}", plan.loss);
         assert_eq!(out.len(), src.len(), "the file changed length");
         assert!(out == src, "the round trip is not byte-exact");
+    }
+
+    #[test]
+    fn the_opaque_form_is_attached_on_request_and_checked_on_the_way_out() {
+        // §05.2.4 permits both representations. The structural one is canonical
+        // and the opaque one is an attachment, so what has to be true is that
+        // they agree — and that dropping the attachment changes nothing.
+        let t = Type::Q4K;
+        let (be, _) = t.block().unwrap();
+        let src = W::new()
+            .kv("general.architecture", Meta::Str("llama".into()))
+            .tensor("w", t, &[be, 2], blocks(t, 2, 41))
+            .finish();
+        let plain = import(&src, &ImportOpts::default()).unwrap();
+        let with = import(
+            &src,
+            &ImportOpts {
+                opaque_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(with.objects.len() > plain.objects.len());
+        assert!(with
+            .report
+            .represented
+            .iter()
+            .any(|s| s.contains("opaque block cache")));
+
+        let mut mem = MemoryStore::new(HashAlgo::default());
+        for o in &with.objects {
+            let _ = mem.put(&o.payload);
+        }
+        let ctx = Ctx::new(&mem);
+        let manifest = ctx.value(&with.root).unwrap();
+        // §10.6 rule 1: every cache object is flagged droppable.
+        let cache = with
+            .objects
+            .iter()
+            .find(|o| o.otype == otype::RUNTIME_CACHE)
+            .expect("a cache was attached");
+        assert!(cache.oflags & crate::container::oflags::CACHEABLE != 0);
+        // Rule 2: it is keyed by what produced it, and that key is the
+        // structural expression's digest rather than a name or a date.
+        let v = crate::cbor::decode(&cache.payload).unwrap();
+        let key = v.get("key").and_then(|k| k.as_bytes()).unwrap().to_vec();
+        let model = crate::expr::parse_ref_value(
+            manifest.get("assets").and_then(|a| a.get("model")).unwrap(),
+        )
+        .unwrap();
+        let mv = ctx.value(&model.1).unwrap();
+        let tref = crate::expr::parse_ref_value(mv.get("tensors").unwrap()).unwrap();
+        let table = TensorTable::load(&ctx, &tref).unwrap();
+        let desc = TensorDesc::load(&ctx, table.get("w").unwrap()).unwrap();
+        assert_eq!(
+            key,
+            HashAlgo::default()
+                .digest(&desc.value.to_value().encode())
+                .to_vec()
+        );
+
+        // And the export checks the two against each other rather than
+        // preferring one.
+        let (out, p) = export(&ctx, &manifest, &table).unwrap();
+        assert_eq!(p.opaque_checked, 1);
+        assert!(out == src);
     }
 
     #[test]

@@ -140,11 +140,15 @@ VERBS:
                               into OMNI-CT — or left out and named, if §06.9
                               cannot express it
     import  gguf <in.gguf> -o <out.omni> [--name N] [--arch FAMILY]
+                              [--keep-opaque]
                               A GGUF file as one dequantize expression per
                               tensor (§05.2.4). Every source byte is kept, cut
                               into the fields of its block, so an export is the
                               same file back; every block is dequantized twice
-                              and compared before the import is claimed
+                              and compared before the import is claimed.
+                              --keep-opaque also attaches §05.2.4's opaque form
+                              as a droppable RuntimeCache, doubling the
+                              quantized bytes to buy zero-conversion mmap
     import  peft <adapter-dir> --base <base.omni> -o <out.omni>
                               A PEFT LoRA as an §08 Adapter, pinned to that base
                               by digest rather than by the name PEFT gives it
@@ -2627,6 +2631,14 @@ fn cmd_strip(args: &[String]) -> R {
 
     // R-N01: the weights must come through untouched. Not "mostly", and not
     // "the same shapes" — the same digests.
+    //
+    // "Untouched" means every data object the *stripped* model still reaches,
+    // which is not the same as every data object the original had. A cache with
+    // a payload owns blobs of its own, and dropping the cache drops them: that
+    // is what §10.6 rule 1 asks for. This check was written before anything in
+    // this build wrote a cache with a payload, and it read every disappearing
+    // blob as a lost weight — so `strip --caches` refused to write a container
+    // whose caches it had just been asked to remove.
     let fresh = Container::open(bytes.clone())?;
     let after: Vec<Digest> = fresh
         .index
@@ -2636,7 +2648,7 @@ fn cmd_strip(args: &[String]) -> R {
         .collect();
     let mut lost = 0usize;
     for d in &before {
-        if !after.contains(d) && !sep.training_only.contains(d) {
+        if !after.contains(d) && reachable.contains(d) && !sep.training_only.contains(d) {
             lost += 1;
         }
     }
@@ -4242,6 +4254,7 @@ fn cmd_import_gguf(args: &[String], input: &str) -> R {
         max_verify_elems: flag(args, "--verify-elems")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1 << 22),
+        opaque_cache: args.iter().any(|a| a == "--keep-opaque"),
     };
     let imported = match import(&bytes, &opts) {
         Ok(i) => i,
@@ -4306,6 +4319,18 @@ through the expression graph and once from the block layout",
         human(packed.len() as u64),
         100.0 * packed.len() as f64 / r.source_size.max(1) as f64
     );
+    if opts.opaque_cache {
+        let n = imported
+            .tensors
+            .iter()
+            .filter(|t| t.ty.is_quantized())
+            .count();
+        pr!(
+            "  opaque       {} block cache(s) attached (§05.2.4), keyed by the \
+structural expression's digest and droppable (§10.6)",
+            commas(n as u64)
+        );
+    }
     pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
     Ok(0)
 }
@@ -4361,6 +4386,14 @@ fn cmd_export_gguf(args: &[String], input: &str) -> R {
     let (bytes, p) = export(&ctx, &manifest, &table)?;
     std::fs::write(out, &bytes)?;
     pr!("wrote {out}  {}", human(bytes.len() as u64));
+    if p.opaque_checked > 0 {
+        // §10.6 rule 2: a cache is checked against what it claims to cache,
+        // never preferred over it.
+        pr!(
+            "  opaque       {} cache(s) agreed with the structural form",
+            commas(p.opaque_checked as u64)
+        );
+    }
     let report_path = format!("{out}.loss.json");
     std::fs::write(
         &report_path,

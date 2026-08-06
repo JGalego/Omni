@@ -505,11 +505,21 @@ llama.cpp's intermediate and is never written to a file; the repacked
 `Q4_0_4_4`/`_4_8`/`_8_8` types, which are one CPU's cache layout rather than a
 model; and GGUF v1.
 
-Two things §4.2 describes are not here. The **opaque `RuntimeCache`**
-(`--keep-opaque`) is not written: it would double the stored bytes of every
-quantized tensor, and the structural form is byte-preserving, so the case for
-it is a runtime one — `mmap` and zero conversion — that this build cannot
-demonstrate without a runtime to hand it to. And **no tokenizer** is
+`--keep-opaque` adds §4.2's second representation: each quantized tensor's
+blocks, verbatim, as a §10.6 `RuntimeCache` with an `opaque` dtype and an
+`interleaved` layout — the form `llama.cpp` can map and run with no conversion.
+It is off by default because it doubles the stored bytes of every quantized
+tensor and the structural form already preserves them; §05.2.4 says the
+structural form is canonical and the opaque one *may* be attached, and this is
+that may. Two rules make it an attachment rather than a second source of truth:
+the cache is keyed by the structural expression's digest, so a stale one is
+detectable (§10.6 rule 2), and it is flagged `CACHEABLE`, so deleting every
+cache leaves the same model (rule 1). The export path reads the cache and
+*compares* it with what the structural form reassembles to — §4.2's "verified
+equivalence between the two" — and a disagreement is an error rather than a
+preference.
+
+One thing §4.2 describes is not here. **No tokenizer** is
 synthesized, which is a finding rather than an omission: GGUF stores the
 vocabulary, the merges and the scores, but `tokenizer.ggml.pre` names a
 pre-tokenizer whose regexes are compiled into llama.cpp. A §06.7 tokenizer built
