@@ -467,6 +467,60 @@ jobs:
                 f"{len(g)/1024/1024:.2f} MiB")
           PY_GIF
 
+      # §05.2.4 + import/export: the claim is that a GGML block format is an
+      # expression rather than a file type. What would make that claim false is
+      # a value read the wrong way, and byte identity cannot see one — so the
+      # check is against a third implementation, in Python, written from the
+      # block layouts.
+      - name: Every GGUF block type dequantizes to what the format says
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+
+          python3 tools/gguf-fixture.py write /tmp/fixture.gguf /tmp/fixture.vals
+          "$OMNI" import gguf /tmp/fixture.gguf -o /tmp/fixture.omni | tee /tmp/gguf.txt
+
+          # All ten block types in one file, every element of every one of them
+          # dequantized twice inside the import and compared (I4).
+          grep -q '5,760 element(s) dequantized twice' /tmp/gguf.txt
+          grep -q '10 reassembled and compared with the source' /tmp/gguf.txt
+          # The chat template is self-contained and becomes OMNI-CT; the
+          # tokenizer is not, and saying so is the point.
+          grep -q 'unrepresented' /tmp/gguf.txt
+
+          # The differential test: 5 760 float32 values, bit for bit, against a
+          # dequantizer that shares nothing with this build.
+          python3 tools/gguf-fixture.py check "$OMNI" /tmp/fixture.omni /tmp/fixture.vals \
+            | tee /tmp/ggufdiff.txt
+          test "$(grep -c 'agree bit-for-bit' /tmp/ggufdiff.txt)" = 10
+
+          # And the round trip: the same file back, byte for byte, because
+          # nothing was converted on the way in.
+          "$OMNI" export gguf /tmp/fixture.omni -o /tmp/back.gguf | tee /tmp/ggufex.txt
+          grep -q "the source file's own, key for key" /tmp/ggufex.txt
+          grep -q '^  lossless     yes' /tmp/ggufex.txt
+          cmp /tmp/fixture.gguf /tmp/back.gguf
+          echo "gguf round trip: $(stat -c%s /tmp/fixture.gguf) bytes, identical"
+
+          # A type whose codebook is not in the file is refused by name, with
+          # its own exit code, rather than guessed at (§05.6 rule 1).
+          python3 - <<'PY_IQ'
+          import struct
+          def gstr(s):
+              b = s.encode(); return struct.pack("<Q", len(b)) + b
+          out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, 1, 0))
+          out += gstr("w") + struct.pack("<I", 1) + struct.pack("<Q", 256)
+          out += struct.pack("<IQ", 16, 0)          # 16 = IQ2_XXS
+          out += b"\0" * ((32 - len(out) % 32) % 32) + b"\0" * 66
+          open("/tmp/iq.gguf", "wb").write(bytes(out))
+          PY_IQ
+          set +e
+          "$OMNI" import gguf /tmp/iq.gguf -o /tmp/iq.omni > /tmp/iq.txt 2>&1
+          code=$?
+          set -e
+          test "$code" = 4 || { echo "::error::expected exit 4, got $code"; cat /tmp/iq.txt; exit 1; }
+          grep -q 'IQ2_XXS' /tmp/iq.txt
+          test ! -f /tmp/iq.omni
+
       # §08 + import: a PEFT LoRA is safetensors plus a config, and the thing OMNI
       # adds is that the base is pinned by digest rather than named by a string.
       - name: A PEFT LoRA imports as an adapter pinned to its base

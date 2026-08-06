@@ -91,8 +91,8 @@ Deliverables:
 - Quantization schemes: affine, sym, codebook, nested; GPTQ/AWQ/NF4/MX/GGUF-K
   structural mappings.
 - Sparsity schemes.
-- `omni-import-safetensors` ✅, `-pytorch` ✅, `-hf-repo` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
-- `omni-export-safetensors` ✅, `-gptq` ✅, `-awq` ✅, `-gguf`.
+- `omni-import-safetensors` ✅, `-pytorch` ✅, `-hf-repo` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf` ✅.
+- `omni-export-safetensors` ✅, `-gptq` ✅, `-awq` ✅, `-gguf` ✅.
 - `omni delta`, `omni adapter`, `omni convert`.
 - Conformance corpus: `numeric/`, `roundtrip/`, `valid/features`.
 
@@ -105,18 +105,19 @@ be made bit-exact, §05.2.4 is wrong and gets revised.*
 **Gate 1 status.** Not met. The *format* side is done and tested: the dtype
 algebra, the layouts, the expression algebra with range pushdown, the sparsity and
 quantization catalogues, `omni delta` and `omni adapter`, and — as of the codec
-work — `zstd` in both directions, checked against libzstd on every push. **Six
-importers and four exporters now exist**: safetensors, PEFT, GPTQ and AWQ in both
-directions, PyTorch `.bin` in, and a whole Hugging Face repo in, with the I1–I6
-and E1–E4 contracts of
+work — `zstd` in both directions, checked against libzstd on every push. **Seven
+importers and five exporters now exist**: safetensors, GGUF, PEFT, GPTQ and AWQ in
+both directions, PyTorch `.bin` in, and a whole Hugging Face repo in, with the
+I1–I6 and E1–E4 contracts of
 [`import-export.md`](import-export.md) implemented rather than summarised — every
 tensor verified byte-for-byte against the source on import, every loss named
 before an export writes anything, and a round-trip whose tensor digests are
 checked against a fixture built from the format's own definition in Python. The
-two quantized importers go further, because byte identity cannot catch a
+quantized importers go further, because byte identity cannot catch a
 misread packing: every layer is dequantized through the expression graph and
-compared against arithmetic done in Python, so §05.2.2's and §05.2.3's structural
-mappings are checked against the formats and not against this implementation.
+compared against arithmetic done in Python, so §05.2.2's, §05.2.3's and §05.2.4's
+structural mappings are checked against the formats and not against this
+implementation.
 The PyTorch importer is the §12.10 one: a restricted unpickler with an opcode
 allowlist and nineteen resolvable symbols, checked in CI against a payload that
 Python's own `pickle.loads` is first shown to execute. It imports only —
@@ -129,12 +130,36 @@ chat template, the generation defaults — into one container where the tokenize
 shipped with those weights is addressed by digest instead of downloaded
 separately and hoped about.
 
-That is six rows of a 25-row capability matrix. GGUF, ONNX and EXL2 do not
-exist, so the gate's actual asks are still untouched: no round-trip over 100 real
+**GGUF is the row this gate names, and it now exists in both directions.**
+Eleven block types — `Q4_0` through `Q6_K` — as `dequantize` expressions over
+literals whose `packed` layouts name the bit widths, with **no re-encoding**: a
+block is a struct, so the import keeps every source byte regrouped by field and
+the export re-interleaves them, which makes the round trip byte-exact by
+construction rather than by careful rounding. CI checks it three ways on every
+push: the file comes back identical, every block is dequantized twice inside the
+import and compared element by element, and 5 760 float32 values are compared
+bit for bit against `tools/gguf-fixture.py`, a Python implementation written from
+the GGML block layouts. The `IQ*` types are refused by name — their codebooks are
+compiled into llama.cpp rather than stored in the file, and §05.6 rule 1 forbids
+inventing a dequantization.
+
+Writing it produced one finding worth more than the row: **GGUF's tokenizer is
+not self-contained.** The file carries the vocabulary, the merges and the scores,
+but `tokenizer.ggml.pre` names a pre-tokenizer whose regexes live in llama.cpp's
+source, so those keys do not determine where a token begins. A §06.7 tokenizer
+built from them would decode correctly and encode differently from the model it
+shipped with. So none is built, the keys are preserved, and the capability matrix
+row moved from ● to ◐ on the evidence rather than staying at the number it was
+first written with.
+
+That is seven rows of a 25-row capability matrix. ONNX and EXL2 do not
+exist, and the gate's actual asks are still untouched: no round-trip over 100 real
 models, no delta-size study over 50 real pairs, and no differential test against
-`llama.cpp`'s dequantization — all three need corpora rather than code. The
-catalogue and these importers are necessary for that work and are not a
-substitute for it.
+`llama.cpp`'s own binary — the K-quant dequantization is checked against two
+independent implementations of the *format*, which is the part that can be done
+without a corpus, and not against the binary the gate names. All three need
+corpora and a build of llama.cpp rather than code here. The catalogue and these
+importers are necessary for that work and are not a substitute for it.
 
 ## Phase 2 — Prove the semantic layer (months 7–12)
 

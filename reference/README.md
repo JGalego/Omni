@@ -368,14 +368,15 @@ What is **not** implemented, and is reported as such rather than faked:
   layout, but the push itself needs bearer-token auth and chunked blob uploads
   against a live registry, which is a client rather than a format concern
 - `omni mount` (§13.9), which needs FUSE
-- Every importer and exporter except safetensors, PyTorch, PEFT, GPTQ, AWQ and
-  a whole Hugging Face repo.
+- Every importer and exporter except safetensors, PyTorch, GGUF, PEFT, GPTQ,
+  AWQ and a whole Hugging Face repo.
   The capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
-  build implements six of them; GGUF, ONNX and EXL2 do not exist, and a
+  build implements seven of them; ONNX and EXL2 do not exist, and a
   request for one is refused by name rather than half-attempted. Export covers
-  safetensors, PEFT, GPTQ and AWQ — not PyTorch, because §12.10 clause 4 says
-  never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
-  versions are refused for the reasons named above
+  safetensors, GGUF, PEFT, GPTQ and AWQ — not PyTorch, because §12.10 clause 4
+  says never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
+  versions are refused for the reasons named above, and so are GGUF's `IQ*`
+  types, whose codebooks are in llama.cpp's source rather than in the file
 - §12.10's confined child process for the pickle import. The restricted
   unpickler is implemented in full — an opcode allowlist, 19 resolvable symbols,
   no call mechanism beyond tensor reconstruction — and the sandbox is not, on
