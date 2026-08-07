@@ -66,9 +66,15 @@ VERBS:
                               carries; exit 3 when it carries none
     dump    <file> --object <hex>   CBOR diagnostic notation for one object
     cat     <file> --tensor <name> [--hex] [--limit N] [--raw] [--with <file>]
+                              [--cache SIZE] [--no-fuse]
                               Evaluate a tensor's expression and print elements;
                               --raw hexdumps the stored bytes instead, --with
-                              layers another container (a delta's parent)
+                              layers another container (a delta's parent).
+                              §04.7.4's evaluator refinements are switchable and
+                              counted: elementwise chains fuse into one pass by
+                              default, and --cache keys results by expression
+                              identity so a shared sub-expression is computed
+                              once
     deps    <file> --tensor <name> [--range A:B]
                               What a (partial) read of that tensor must fetch
     tokenize <file> --text <string> | --ids <a,b,c>
@@ -2257,7 +2263,19 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
     let (loaded, plugin_problems) = plugin_host(c);
     let objects = |d: &[u8; 32]| c.read(d).ok();
     let host = omni_core::plugin::Host::new(loaded).with_objects(&objects);
-    let ctx = Ctx::new(backing).with_plugin_host(&host);
+    // §04.7.4's two refinements, both switchable, because a claim about either
+    // needs both sides measured rather than one side asserted.
+    let cache = match flag(args, "--cache") {
+        Some(size) => Some(omni_core::expr::EvalCache::new(parse_size(size)?)),
+        None => None,
+    };
+    let mut ctx = Ctx::new(backing).with_plugin_host(&host);
+    if let Some(c) = &cache {
+        ctx = ctx.with_cache(c);
+    }
+    if args.iter().any(|a| a == "--no-fuse") {
+        ctx = ctx.without_fusion();
+    }
     for p in &plugin_problems {
         prr!("omni: {p}\n");
     }
@@ -2275,6 +2293,23 @@ fn cmd_cat(c: &Container, args: &[String]) -> R {
         t.data.len(),
         desc.value.deps_all().len()
     );
+    // §04.7.4 item 2: the buffers the fused passes did not allocate. Reported
+    // rather than assumed, because "one traversal with one output buffer" is a
+    // claim about memory and a claim about memory needs a count.
+    if ctx.buffers_saved.get() > 0 {
+        pr!(
+            "; fusion    {} intermediate buffer(s) not allocated (§04.7.4)",
+            ctx.buffers_saved.get()
+        );
+    }
+    if let Some(cache) = &cache {
+        let (hits, misses, evictions) = cache.stats();
+        pr!(
+            "; cache     {hits} hit(s), {misses} miss(es), {evictions} eviction(s), \
+{} held",
+            human(cache.bytes())
+        );
+    }
     let n = t.data.len().min(limit);
     if args.iter().any(|a| a == "--hex") {
         let bytes = t.to_bytes(&desc.dtype, &desc.layout, omni_core::Round::Rne)?;

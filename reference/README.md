@@ -107,8 +107,15 @@ implemented:
   the bit position of any element and the R-T03 sufficiency check
 - §04.7 the tensor expression algebra: the closed core node set, static shape and
   dtype inference (R-T01), normalization and expression identity (§04.7.5),
-  evaluation, declared determinism (§04.7.6), plugin fallbacks, and range
-  pushdown so partial loading is automatic (§04.7.4)
+  evaluation, declared determinism (§04.7.6), plugin fallbacks, and all three of
+  §04.7.4's evaluator refinements — range pushdown so partial loading is
+  automatic, **fusion** so a chain of elementwise nodes is one pass into one
+  buffer rather than one buffer per node, and **caching** keyed by the §04.7.5
+  identity, which is what makes "a different expression is a different key" a
+  design rather than an invalidation problem. Both of the last two are
+  switchable and counted: `omni cat --no-fuse` and `--cache SIZE` exist so the
+  claim is measured on both sides, and CI checks that the values are bit-identical
+  either way
 - §04.6 sparsity: all eight schemes — coo, csr, csc, bsr, n:m, bitmask, ragged,
   blocklist — each validating its own structure rather than reading it
   optimistically

@@ -87,7 +87,7 @@ except the 72-hour fuzz run**, which is a release activity.
 Deliverables:
 - Full dtype algebra with bit-exact encode/decode and all rounding modes.
 - Layout math: strided, tiled, packed, blocked-scaled, interleaved.
-- `omni-eval`: expression evaluation, range pushdown, fusion, caching.
+- `omni-eval`: expression evaluation ✅, range pushdown ✅, fusion ✅, caching ✅.
 - Quantization schemes: affine, sym, codebook, nested; GPTQ/AWQ/NF4/MX/GGUF-K
   structural mappings.
 - Sparsity schemes.
@@ -103,9 +103,15 @@ every GGUF K-quant type: zero mismatches. *If the structural GGUF mapping cannot
 be made bit-exact, §05.2.4 is wrong and gets revised.*
 
 **Gate 1 status.** Not met. The *format* side is done and tested: the dtype
-algebra, the layouts, the expression algebra with range pushdown, the sparsity and
+algebra, the layouts, the expression algebra with all three of §04.7.4's
+refinements — range pushdown, elementwise fusion, and a result cache keyed by the
+§04.7.5 expression identity — the sparsity and
 quantization catalogues, `omni delta` and `omni adapter`, and — as of the codec
-work — `zstd` in both directions, checked against libzstd on every push. **Seven
+work — `zstd` in both directions, checked against libzstd on every push. Fusion
+and caching are the two the deliverable named and the code did not have; they are
+switchable (`omni cat --no-fuse`, `--cache SIZE`) precisely because they are
+claims about *cost*, so CI checks that the values are bit-identical either way
+and that the counts the tool prints are real. **Seven
 importers and five exporters now exist**: safetensors, GGUF, PEFT, GPTQ and AWQ in
 both directions, PyTorch `.bin` in, and a whole Hugging Face repo in, with the
 I1–I6 and E1–E4 contracts of

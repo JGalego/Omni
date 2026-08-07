@@ -179,6 +179,48 @@ jobs:
 
       # §06.7: a tokenizer that changed during conversion is a silent quality
       # regression everywhere else. Here it is a build failure.
+      # §04.7.4's two evaluator refinements. Both are claims about *cost* rather
+      # than about values, so both are checked the same way: the values have to
+      # be identical either side of the switch, and the saving has to be a
+      # number the tool prints rather than a property the code asserts about
+      # itself.
+      - name: Fusion and caching change the cost and not the value
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          "$OMNI" example --quantized /tmp/fuse.omni >/dev/null
+          T=model.layers.0.attn.q_proj.weight.lora
+
+          # A dequantized, LoRA-merged tensor: the chain §04.7.4 names.
+          "$OMNI" cat /tmp/fuse.omni --tensor "$T" --hex --limit 4096 > /tmp/fused.txt
+          "$OMNI" cat /tmp/fuse.omni --tensor "$T" --hex --limit 4096 --no-fuse \
+            > /tmp/unfused.txt
+          # Bit for bit. A fusion that changed a value would not be a fusion.
+          diff <(grep -E '^[0-9a-f]{8}' /tmp/fused.txt) \
+               <(grep -E '^[0-9a-f]{8}' /tmp/unfused.txt)
+          grep -q 'intermediate buffer(s) not allocated' /tmp/fused.txt
+          test ! -s <(grep 'not allocated' /tmp/unfused.txt)
+
+          # §04.7.4 item 3: the key is the expression's identity, so the cache
+          # needs no invalidation rule and a hit is a hit on that value.
+          "$OMNI" cat /tmp/fuse.omni --tensor "$T" --cache 1Mi --limit 4 \
+            | tee /tmp/cached.txt
+          grep -qE 'cache +[0-9]+ hit\(s\), [0-9]+ miss\(es\)' /tmp/cached.txt
+          # A cache small enough to overflow has to evict rather than grow.
+          "$OMNI" cat /tmp/fuse.omni --tensor "$T" --cache 4Ki --limit 4 \
+            | tee /tmp/evict.txt
+          python3 - <<'PY_CACHE'
+          import re
+          t = open('/tmp/evict.txt').read()
+          m = re.search(r'cache\s+(\d+) hit\(s\), (\d+) miss\(es\), (\d+) eviction', t)
+          assert m, t
+          assert int(m.group(3)) > 0, "a bounded cache that never evicted"
+          held = re.search(r'eviction\(s\), ([\d.]+) (B|KiB|MiB) held', t)
+          size = float(held.group(1)) * {'B': 1/1024, 'KiB': 1, 'MiB': 1024}[held.group(2)]
+          assert size <= 4.0, f"{size} KiB held in a 4 KiB cache"
+          print(f"the cache evicted {m.group(3)} entr(ies) and held {size} KiB")
+          PY_CACHE
+          echo "fusion and caching are cost, not value"
+
       - name: The tokenizer is checked, not trusted
         run: |
           OMNI=reference/target/release/omni

@@ -2502,6 +2502,18 @@ pub struct Ctx<'a> {
     /// falls back or refuses; with one, an op this build has never heard of is
     /// computed by the module the model shipped.
     pub plugin_host: Option<&'a dyn PluginRunner>,
+    /// §04.7.4 item 3: results kept under their expression identity. `None`
+    /// evaluates every node every time, which is the right default for a
+    /// one-shot materialization and the wrong one for a graph that reads the
+    /// same sub-expression from several tensors.
+    pub cache: Option<&'a EvalCache>,
+    /// §04.7.4 item 2: whether to fuse elementwise chains into one pass. On by
+    /// default — it changes the number of buffers and not the values — with a
+    /// switch because a claim about it needs both sides measured.
+    pub fuse: bool,
+    /// Buffers the fused passes did not allocate, counted so the claim above is
+    /// a number rather than an assertion.
+    pub buffers_saved: std::cell::Cell<u64>,
 }
 
 impl<'a> Ctx<'a> {
@@ -2512,7 +2524,23 @@ impl<'a> Ctx<'a> {
             max_elems: 1 << 28,
             plugins: Vec::new(),
             plugin_host: None,
+            cache: None,
+            fuse: true,
+            buffers_saved: std::cell::Cell::new(0),
         }
+    }
+
+    /// Attaches a result cache (§04.7.4 item 3).
+    pub fn with_cache(mut self, cache: &'a EvalCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Turns elementwise fusion off, which exists so that "fused and unfused
+    /// agree on every value" is a test rather than a hope.
+    pub fn without_fusion(mut self) -> Self {
+        self.fuse = false;
+        self
     }
 
     /// Attaches a plugin host (§11.6).
@@ -2614,6 +2642,32 @@ impl Expr {
     }
 
     fn eval_inner(&self, ctx: &Ctx<'_>, shape: &[u64], dtype: &DType) -> Res<Tensor> {
+        // §04.7.4 item 3. The key is the expression's identity, so a hit is a
+        // hit on *this value* and nothing else — which is why correctness needs
+        // no invalidation rule.
+        let key = ctx.cache.map(|_| self.identity(HashAlgo::default()));
+        if let (Some(cache), Some(k)) = (ctx.cache, key.as_ref()) {
+            if let Some(t) = cache.get(k) {
+                return Ok(t);
+            }
+            cache.misses.set(cache.misses.get() + 1);
+        }
+        let t = self.eval_uncached(ctx, shape, dtype)?;
+        if let (Some(cache), Some(k)) = (ctx.cache, key) {
+            cache.put(k, &t);
+        }
+        Ok(t)
+    }
+
+    fn eval_uncached(&self, ctx: &Ctx<'_>, shape: &[u64], dtype: &DType) -> Res<Tensor> {
+        // §04.7.4 item 2. A chain of two or more elementwise nodes runs as one
+        // pass into one buffer; anything else falls through to the tree walk
+        // below, which is also what runs when fusion is off.
+        if ctx.fuse {
+            if let Some(f) = Fusion::plan(self) {
+                return f.run(ctx, shape, dtype);
+            }
+        }
         let n = numel(shape);
         Ok(match self {
             Expr::Literal {
@@ -3467,6 +3521,171 @@ mod tests {
     fn f32_literal(store: &mut MemoryStore, shape: &[u64], data: &[f64]) -> Expr {
         let t = Tensor::new(shape.to_vec(), DType::F32, data.to_vec());
         literal(store, &t, &DType::F32, &Layout::default())
+    }
+
+    // ------------------------------------------- fusion and caching (§04.7.4) --
+
+    /// `clamp(cast(add(a, scale(mul(b, c), 3)), bf16), -2, 2)` — five
+    /// elementwise nodes over three leaves, one of which broadcasts.
+    fn a_chain(store: &mut MemoryStore) -> Expr {
+        let a = f32_literal(store, &[2, 3], &[1.0, -2.0, 3.0, 0.5, -0.25, 4.0]);
+        let b = f32_literal(store, &[2, 3], &[0.5, 0.25, -1.0, 2.0, 1.5, -0.5]);
+        // Rank-1, so it broadcasts along the rows: the fused pass has to index
+        // leaves by the *output* position, not by its own.
+        let c = f32_literal(store, &[3], &[2.0, -1.0, 0.5]);
+        Expr::Clamp {
+            x: Box::new(Expr::Cast {
+                x: Box::new(Expr::Bin {
+                    op: BinOp::Add,
+                    a: Box::new(a),
+                    b: Box::new(Expr::Scale {
+                        x: Box::new(Expr::Bin {
+                            op: BinOp::Mul,
+                            a: Box::new(b),
+                            b: Box::new(c),
+                        }),
+                        k: Scalar::Int(3),
+                    }),
+                }),
+                dtype: DType::BF16,
+                round: Round::Rne,
+            }),
+            lo: Scalar::Int(-2),
+            hi: Scalar::Int(2),
+        }
+    }
+
+    #[test]
+    fn a_fused_chain_computes_exactly_what_the_tree_computes() {
+        let mut s = MemoryStore::new(HashAlgo::default());
+        let e = a_chain(&mut s);
+
+        let fused = Ctx::new(&s);
+        let tree = Ctx::new(&s).without_fusion();
+        let a = e.eval(&fused).unwrap();
+        let b = e.eval(&tree).unwrap();
+        // Bit for bit, including the rounding the cast does: a fusion that
+        // changed a value would not be a fusion.
+        assert_eq!(a.data, b.data);
+        assert_eq!(a.shape, b.shape);
+
+        // And it saved the buffers it claims to: five elementwise nodes are one
+        // pass, so four intermediates never existed.
+        let plan = Fusion::plan(&e).expect("a five-node chain fuses");
+        assert_eq!(plan.ops(), 5);
+        assert_eq!(plan.buffers_saved(), 4);
+        assert_eq!(plan.leaves.len(), 3);
+        assert_eq!(fused.buffers_saved.get(), 4);
+        assert_eq!(tree.buffers_saved.get(), 0);
+    }
+
+    #[test]
+    fn what_is_not_elementwise_is_a_leaf_rather_than_a_guess() {
+        let mut s = MemoryStore::new(HashAlgo::default());
+        let x = f32_literal(&mut s, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        // A matmul's element depends on a whole row and column, so it cannot be
+        // computed at the output index — it is materialized once and read.
+        let mm = Expr::MatMul {
+            a: Box::new(x.clone()),
+            b: Box::new(x.clone()),
+            sum: Sum::Sequential,
+        };
+        let e = Expr::Bin {
+            op: BinOp::Add,
+            a: Box::new(mm),
+            b: Box::new(Expr::Scale {
+                x: Box::new(x),
+                k: Scalar::Int(2),
+            }),
+        };
+        let plan = Fusion::plan(&e).expect("add and scale fuse over the product");
+        assert_eq!(plan.ops(), 2);
+        assert_eq!(plan.leaves.len(), 2, "the matmul is a leaf");
+        let s2 = &s;
+        assert_eq!(
+            e.eval(&Ctx::new(s2)).unwrap().data,
+            e.eval(&Ctx::new(s2).without_fusion()).unwrap().data
+        );
+
+        // One node is not a chain: planning it would cost a plan and save
+        // nothing.
+        let single = Expr::Scale {
+            x: Box::new(f32_literal(&mut s, &[2], &[1.0, 2.0])),
+            k: Scalar::Int(2),
+        };
+        assert!(Fusion::plan(&single).is_none());
+    }
+
+    #[test]
+    fn the_cache_is_keyed_by_what_the_expression_is() {
+        let mut s = MemoryStore::new(HashAlgo::default());
+        let leaf = f32_literal(&mut s, &[4], &[1.0, 2.0, 3.0, 4.0]);
+        // The same sub-expression twice: a DAG written as a tree, which is what
+        // a LoRA over a shared base looks like.
+        let shared = Expr::MatMul {
+            a: Box::new(Expr::Reshape {
+                x: Box::new(leaf.clone()),
+                shape: dims(&[2, 2]),
+            }),
+            b: Box::new(Expr::Reshape {
+                x: Box::new(leaf.clone()),
+                shape: dims(&[2, 2]),
+            }),
+            sum: Sum::Sequential,
+        };
+        let e = Expr::Bin {
+            op: BinOp::Add,
+            a: Box::new(shared.clone()),
+            b: Box::new(shared),
+        };
+
+        let plain = e.eval(&Ctx::new(&s)).unwrap();
+        let cache = EvalCache::new(1 << 20);
+        let cached = e.eval(&Ctx::new(&s).with_cache(&cache)).unwrap();
+        assert_eq!(plain.data, cached.data);
+        let (hits, misses, _) = cache.stats();
+        assert!(hits > 0, "a shared sub-expression was evaluated twice");
+        assert!(misses > 0);
+
+        // §04.7.4: "a different expression is a different key". Changing one
+        // constant changes the identity, so nothing stale can be returned.
+        let other = Expr::Scale {
+            x: Box::new(e.clone()),
+            k: Scalar::Int(2),
+        };
+        let with_other = other.eval(&Ctx::new(&s).with_cache(&cache)).unwrap();
+        for (a, b) in with_other.data.iter().zip(&plain.data) {
+            assert_eq!(*a, b * 2.0);
+        }
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_says_what_it_dropped() {
+        let mut s = MemoryStore::new(HashAlgo::default());
+        // 64 elements is 512 bytes of f64; a 1 KiB cache holds two of them.
+        let data: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let cache = EvalCache::new(1024);
+        for k in 1..=6u64 {
+            let e = Expr::Scale {
+                x: Box::new(f32_literal(&mut s, &[64], &data)),
+                k: Scalar::Int(k as i64),
+            };
+            e.eval(&Ctx::new(&s).with_cache(&cache)).unwrap();
+        }
+        assert!(cache.bytes() <= 1024, "{} bytes held", cache.bytes());
+        let (_, _, evictions) = cache.stats();
+        assert!(evictions > 0, "a bounded cache that never evicted");
+
+        // A value larger than the whole cache is not cached at all, rather than
+        // emptying the cache to hold something it cannot keep.
+        let big: Vec<f64> = (0..1024).map(|i| i as f64).collect();
+        let e = Expr::Scale {
+            x: Box::new(f32_literal(&mut s, &[1024], &big)),
+            k: Scalar::Int(7),
+        };
+        let before = cache.bytes();
+        e.eval(&Ctx::new(&s).with_cache(&cache)).unwrap();
+        assert!(cache.bytes() <= before.max(1024));
     }
 
     #[test]
@@ -4399,5 +4618,257 @@ mod tests {
                 0xbd, 0x28
             ]
         );
+    }
+}
+
+// ------------------------------------------------------ fusion and caching --
+
+/// §04.7.4 item 2: a chain of elementwise nodes evaluated in **one pass over
+/// the output**, with one buffer instead of one per node.
+///
+/// The saving is memory rather than arithmetic. Evaluating
+/// `add(cast(a), scale(mul(b, c), k))` as a tree allocates a full tensor for the
+/// cast, one for the multiply, one for the scale and one for the add — four
+/// buffers of the output's size. Fused, the leaves are materialized once (they
+/// have to be: they are the stored bytes) and the chain runs per element into a
+/// single output, which is what §04.7.4 means by "a LoRA-merged int4 model
+/// materializes in one traversal with one output buffer".
+///
+/// Only the nodes whose value at index *i* depends on their operands at index
+/// *i* fuse. Everything else — a `matmul`, a `gather`, a `dequantize` whose
+/// scale is per block — is a **leaf**: materialized once, then read by index.
+/// That boundary is what keeps fusion value-preserving without a proof
+/// obligation per node.
+#[derive(Debug, Default)]
+pub struct Fusion {
+    /// Sub-expressions that must be materialized before the pass runs.
+    pub leaves: Vec<Expr>,
+    /// The chain, in postfix order: a stack machine small enough to run per
+    /// element without allocating.
+    steps: Vec<Step>,
+}
+
+#[derive(Clone, Debug)]
+enum Step {
+    /// Read leaf `i` at the output index, broadcasting.
+    Leaf(usize),
+    Bin(BinOp),
+    Scale(Scalar),
+    /// A cast has to go *through* the target encoding — that is what makes it a
+    /// cast rather than a relabelling — so it rounds here exactly as the
+    /// unfused node does.
+    Cast(DType, Round),
+    Clamp(f64, f64),
+}
+
+impl Fusion {
+    /// How many elementwise nodes this chain covers. One is not a chain, and
+    /// fusing it would cost a plan and save nothing.
+    pub fn ops(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|s| !matches!(s, Step::Leaf(_)))
+            .count()
+    }
+
+    /// Buffers the unfused tree would have allocated for those nodes, which is
+    /// what the fused pass does not.
+    pub fn buffers_saved(&self) -> usize {
+        self.ops().saturating_sub(1)
+    }
+
+    fn push_leaf(&mut self, e: &Expr) {
+        // A leaf that appears twice is materialized once: the same
+        // sub-expression is the same value, which is §04.7.5's whole point.
+        let at = self.leaves.iter().position(|l| l == e).unwrap_or_else(|| {
+            self.leaves.push(e.clone());
+            self.leaves.len() - 1
+        });
+        self.steps.push(Step::Leaf(at));
+    }
+
+    fn walk(&mut self, e: &Expr) {
+        match e {
+            Expr::Bin { op, a, b } => {
+                self.walk(a);
+                self.walk(b);
+                self.steps.push(Step::Bin(*op));
+            }
+            Expr::Scale { x, k } => {
+                self.walk(x);
+                self.steps.push(Step::Scale(*k));
+            }
+            Expr::Cast { x, dtype, round } => {
+                self.walk(x);
+                self.steps.push(Step::Cast(dtype.clone(), *round));
+            }
+            Expr::Clamp { x, lo, hi } => {
+                self.walk(x);
+                self.steps.push(Step::Clamp(lo.as_f64(), hi.as_f64()));
+            }
+            // `approx` is a marker rather than a transform (§04.7), so it is
+            // transparent here for the same reason it is transparent to `eval`.
+            Expr::Approx { x, .. } => self.walk(x),
+            other => self.push_leaf(other),
+        }
+    }
+
+    /// Plans the fusion of one expression. `None` when there is no chain to
+    /// fuse — a single node, or a root that is not elementwise at all.
+    pub fn plan(e: &Expr) -> Option<Fusion> {
+        let mut f = Fusion::default();
+        f.walk(e);
+        (f.ops() >= 2).then_some(f)
+    }
+}
+
+/// A result cache keyed by expression identity (§04.7.4 item 3).
+///
+/// "Cache correctness is automatic: a different expression is a different key."
+/// That is the whole design, and it is why the key is the §04.7.5 identity
+/// digest rather than a pointer or a name — two publishers who wrote the same
+/// value in different but equivalent ways get one entry, and a value that
+/// differs anywhere gets its own.
+///
+/// The cache is bounded in bytes, because a model is bigger than memory and an
+/// unbounded cache turns a lazy evaluator back into an eager one. Eviction is
+/// least-recently-used, which is the right default when the access pattern is a
+/// graph walk: the node you just used is the one about to be used again.
+pub struct EvalCache {
+    entries: std::cell::RefCell<Vec<(Digest, Tensor)>>,
+    bytes: std::cell::Cell<u64>,
+    cap: u64,
+    hits: std::cell::Cell<u64>,
+    misses: std::cell::Cell<u64>,
+    evictions: std::cell::Cell<u64>,
+}
+
+impl std::fmt::Debug for EvalCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (h, m, e) = self.stats();
+        write!(
+            f,
+            "EvalCache {{ {} entr(ies), {} B of {} B, {h} hit(s), {m} miss(es), \
+             {e} eviction(s) }}",
+            self.entries.borrow().len(),
+            self.bytes.get(),
+            self.cap
+        )
+    }
+}
+
+impl EvalCache {
+    /// A cache holding at most `cap` bytes of materialized results.
+    pub fn new(cap: u64) -> EvalCache {
+        EvalCache {
+            entries: std::cell::RefCell::new(Vec::new()),
+            bytes: std::cell::Cell::new(0),
+            cap,
+            hits: std::cell::Cell::new(0),
+            misses: std::cell::Cell::new(0),
+            evictions: std::cell::Cell::new(0),
+        }
+    }
+
+    /// `(hits, misses, evictions)`. A cache nobody counts is a cache nobody can
+    /// tell is working.
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.hits.get(), self.misses.get(), self.evictions.get())
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    fn get(&self, key: &Digest) -> Option<Tensor> {
+        let mut e = self.entries.borrow_mut();
+        let at = e.iter().position(|(k, _)| k == key)?;
+        // Most-recently-used moves to the end, so eviction takes from the front.
+        let hit = e.remove(at);
+        let t = hit.1.clone();
+        e.push(hit);
+        self.hits.set(self.hits.get() + 1);
+        Some(t)
+    }
+
+    fn put(&self, key: Digest, t: &Tensor) {
+        let cost = t.data.len() as u64 * 8;
+        if cost > self.cap {
+            // One value larger than the whole cache: caching it would evict
+            // everything to hold something that cannot be kept.
+            return;
+        }
+        let mut e = self.entries.borrow_mut();
+        while self.bytes.get() + cost > self.cap && !e.is_empty() {
+            let (_, old) = e.remove(0);
+            self.bytes.set(self.bytes.get() - old.data.len() as u64 * 8);
+            self.evictions.set(self.evictions.get() + 1);
+        }
+        self.bytes.set(self.bytes.get() + cost);
+        e.push((key, t.clone()));
+    }
+}
+
+impl Fusion {
+    /// Runs the fused chain: leaves once, then one pass over the output.
+    fn run(&self, ctx: &Ctx<'_>, shape: &[u64], dtype: &DType) -> Res<Tensor> {
+        let mut leaves = Vec::with_capacity(self.leaves.len());
+        for l in &self.leaves {
+            leaves.push(l.eval_child(ctx)?);
+        }
+        let n = numel(shape);
+        let mut data = Vec::with_capacity(n as usize);
+        let mut idx = vec![0u64; shape.len()];
+        // The stack is at most as deep as the chain, and the chain is known, so
+        // this allocates once rather than per element.
+        let mut stack: Vec<f64> = Vec::with_capacity(self.steps.len());
+        let mut buf = vec![0u8; 16];
+        for i in 0..n {
+            stack.clear();
+            for step in &self.steps {
+                match step {
+                    Step::Leaf(k) => stack.push(leaves[*k].broadcast_at(&idx)),
+                    Step::Bin(op) => {
+                        let b = stack.pop().unwrap_or(0.0);
+                        let a = stack.pop().unwrap_or(0.0);
+                        stack.push(op.apply(a, b));
+                    }
+                    Step::Scale(k) => {
+                        let v = stack.pop().unwrap_or(0.0);
+                        stack.push(v * k.as_f64());
+                    }
+                    Step::Clamp(lo, hi) => {
+                        let v = stack.pop().unwrap_or(0.0);
+                        stack.push(v.clamp(*lo, *hi));
+                    }
+                    Step::Cast(to, round) => {
+                        let v = stack.pop().unwrap_or(0.0);
+                        let want = to.packed_bytes(1).max(1) as usize;
+                        if buf.len() < want {
+                            buf.resize(want, 0);
+                        }
+                        let r = match round {
+                            Round::Stochastic { seed, .. } => Round::Stochastic {
+                                seed: *seed,
+                                index: i,
+                            },
+                            other => *other,
+                        };
+                        if !to.encode(&mut buf, 0, v, r) {
+                            return Err(Error::Unsupported(format!(
+                                "cast to {} is not defined element-wise",
+                                to.label()
+                            )));
+                        }
+                        stack.push(to.decode(&buf, 0).unwrap_or(f64::NAN));
+                    }
+                }
+            }
+            data.push(stack.pop().unwrap_or(0.0));
+            bump(&mut idx, shape);
+        }
+        ctx.buffers_saved
+            .set(ctx.buffers_saved.get() + self.buffers_saved() as u64);
+        Ok(Tensor::new(shape.to_vec(), dtype.clone(), data))
     }
 }
