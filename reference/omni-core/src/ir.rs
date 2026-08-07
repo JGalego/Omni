@@ -1450,7 +1450,10 @@ static TENSOR_OPS: &[OpSpec] = &[
         1,
         0,
         false,
-        [("axis", AttrKind::Int, false)]
+        [
+            ("axis", AttrKind::Int, false),
+            ("reduction", AttrKind::Text, false)
+        ]
     ),
     op!(
         "cumsum",
@@ -1574,12 +1577,15 @@ static NN_OPS: &[OpSpec] = &[
     op!(
         "ssm_scan",
         &[1],
-        3,
-        Some(5),
+        5,
+        Some(6),
         1,
         0,
         false,
-        [("delta_softplus", AttrKind::Bool, false)]
+        [
+            ("delta_softplus", AttrKind::Bool, false),
+            ("reverse", AttrKind::Bool, false)
+        ]
     ),
     op!(
         "conv1d_causal",
@@ -2268,6 +2274,55 @@ pub fn infer(op: &Op, ins: &[Type]) -> Inferred {
             }
         }
         ("omni.nn", "norm" | "rope" | "activation") => elementwise_unary(),
+        // §07.8.1: `y` has `u`'s shape, and the operands that must line up with
+        // it are checked here rather than left to the interpreter — a selective
+        // scan whose `Δ` is a different shape from its input is a graph that
+        // will produce numbers and mean nothing.
+        ("omni.nn", "ssm_scan") => match (tensor(0), tensor(1), tensor(2)) {
+            (Ok((u, du)), Ok((delta, _)), Ok((a, _))) => {
+                if u.len() < 2 {
+                    return Inferred::Ill("ssm_scan needs a [..., L, P] sequence".into());
+                }
+                if delta.len() != u.len() || !delta.iter().zip(&u).all(|(x, y)| dims_agree(x, y)) {
+                    return Inferred::Ill(format!(
+                        "ssm_scan: the timestep is {:?} and the sequence is {:?}; \
+                         §07.8.1 makes Δ per channel *and* position",
+                        delta.iter().map(dim_str).collect::<Vec<_>>(),
+                        u.iter().map(dim_str).collect::<Vec<_>>()
+                    ));
+                }
+                if a.len() != 2 {
+                    return Inferred::Ill("ssm_scan: the state transition A is [P, N]".into());
+                }
+                if !dims_agree(&a[0], &u[u.len() - 1]) {
+                    return Inferred::Ill(format!(
+                        "ssm_scan: A has {} channels and the sequence has {}",
+                        dim_str(&a[0]),
+                        dim_str(&u[u.len() - 1])
+                    ));
+                }
+                // B and C carry the state dimension where the sequence carries
+                // channels, which is the shape difference that makes the model
+                // selective rather than a plain linear recurrence.
+                for (i, name) in [(3usize, "B"), (4, "C")] {
+                    match tensor(i) {
+                        Ok((s, _)) => {
+                            if s.len() != u.len() || !dims_agree(&s[s.len() - 1], &a[1]) {
+                                return Inferred::Ill(format!(
+                                    "ssm_scan: {name} is {:?}, and §07.8.1 wants \
+                                     [..., L, N] with N = {}",
+                                    s.iter().map(dim_str).collect::<Vec<_>>(),
+                                    dim_str(&a[1])
+                                ));
+                            }
+                        }
+                        Err(e) => return Inferred::Ill(e),
+                    }
+                }
+                Inferred::Types(vec![Type::tensor(u, du)])
+            }
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Inferred::Ill(e),
+        },
         ("omni.nn", "embedding") => match (tensor(0), tensor(1)) {
             (Ok((ids, _)), Ok((table, d))) => {
                 if table.len() != 2 {
@@ -4401,6 +4456,7 @@ pub const FAMILIES: &[&str] = &[
     "gnn.mpnn",
     "rl.actor_critic",
     "audio.encoder",
+    "ssm.mamba",
 ];
 
 pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<Module, String> {
@@ -4424,6 +4480,7 @@ pub fn synthesize(family: &str, params: &Value, available: &[String]) -> Result<
         "gnn.mpnn" => synthesize_gnn(params, available),
         "rl.actor_critic" => synthesize_rl(params, available),
         "audio.encoder" => synthesize_audio(params, available),
+        "ssm.mamba" => synthesize_ssm(params, available),
         other => Err(format!(
             "no synthesizer for family `{other}`; this build knows {}",
             FAMILIES.join(", ")
@@ -5386,6 +5443,37 @@ impl Emit {
         id
     }
 
+    /// An op whose result is not the emitter's dtype. Index arithmetic is the
+    /// case that needs it: an edge list is `i32` in a graph whose tensors are
+    /// `f32`, and elementwise ops require both operands to agree.
+    fn op_typed(
+        &mut self,
+        dialect: &str,
+        name: &str,
+        ins: &[u32],
+        attrs: Vec<(&str, Value)>,
+        t: Type,
+    ) -> u32 {
+        let id = self.id();
+        let mut op = Op::new(dialect, name, 1).with_inputs(ins);
+        for (k, v) in attrs {
+            op = op.with_attr(k, v);
+        }
+        self.ops.push(op.with_output(id, t));
+        id
+    }
+
+    /// An inline constant of one repeated value.
+    fn splat(&mut self, value: Value, shape: &[Dim], dtype: DType) -> u32 {
+        let id = self.id();
+        self.ops.push(
+            Op::new("omni.core", "constant", 1)
+                .with_attr("value", value)
+                .with_output(id, Type::tensor(shape.to_vec(), dtype)),
+        );
+        id
+    }
+
     fn act(&mut self, x: u32, kind: &str, shape: &[Dim]) -> u32 {
         self.op_attrs(
             "omni.nn",
@@ -5905,16 +5993,40 @@ fn synthesize_rnn(params: &Value, available: &[String], lstm: bool) -> Result<Mo
     ))
 }
 
+/// The dtype an index tensor has. §07's families use `i32` edge lists, which is
+/// what every graph framework stores and what `tensor.gather` reads.
+fn idx_dtype() -> DType {
+    DType::Int {
+        w: 32,
+        signed: true,
+    }
+}
+
+/// An `IntList` attribute value.
+fn int_list_value(xs: &[i64]) -> Value {
+    Value::Array(
+        xs.iter()
+            .map(|n| {
+                if *n < 0 {
+                    Value::I(*n)
+                } else {
+                    Value::U(*n as u64)
+                }
+            })
+            .collect(),
+    )
+}
+
 /// `gnn.mpnn` — §07.8's GNN row: messages gathered along an edge index and
 /// aggregated per node.
 ///
-/// The gather half is exactly what §07.8 describes. The aggregation is not:
-/// `tensor.scatter` writes element for element, last write wins, so two edges
-/// into the same node leave one message and drop the other. Summing them needs
-/// a scatter-*add*, and §07 defines no reduction on `scatter`. Rather than
-/// invent one, this synthesizer takes the incidence matrix as an input and
-/// aggregates with an `einsum`, which is the same arithmetic written in an op
-/// that exists — and the gap is recorded in §07.8 next to `ssm_scan`'s.
+/// Both halves are now the ops §07.8 describes. The aggregation used to be an
+/// `einsum` against a dense `[E, N]` incidence matrix, because `tensor.scatter`
+/// wrote element for element — last write wins — so two edges into one node
+/// left one message and dropped the other. §07.4 now spells `reduction` on
+/// `scatter`, which is what the gap note said the fix would be, so the
+/// aggregation is a scatter-add over an edge list and the graph no longer
+/// carries a matrix that is quadratic in the thing it is sparse in.
 fn synthesize_gnn(params: &Value, available: &[String]) -> Result<Module, String> {
     let get = |k: &str| -> Option<u64> { params.get(k).and_then(|v| v.as_u64()) };
     let in_f = get("input_size").ok_or("arch.params has no `input_size`")?;
@@ -5957,10 +6069,6 @@ fn synthesize_gnn(params: &Value, available: &[String]) -> Result<Module, String
             width,
             hidden,
         );
-        // Aggregation: incidence is `[E, N]`, one row per edge with a one in
-        // the destination's column, so this sums the messages arriving at each
-        // node. See the note above about why it is not a scatter.
-        let agg = e.einsum("en,eh->nh", &[2, projected], &[n.clone(), Dim::N(hidden)]);
         let own = e.linear(
             h,
             &format!("gnn.layers.{l}.self.weight"),
@@ -5968,6 +6076,48 @@ fn synthesize_gnn(params: &Value, available: &[String]) -> Result<Module, String
             std::slice::from_ref(&n),
             width,
             hidden,
+        );
+        // Aggregation: a scatter-add over the destination of every edge. Two
+        // things have to be built first, and both are index arithmetic rather
+        // than model structure.
+        //
+        // `scatter` is element for element, so the indices have the updates'
+        // shape: `dst` arrives as one index per edge and is widened to one per
+        // edge *and feature*. `reshape` to `[-1, 1]` keeps the symbolic edge
+        // count — that is what the `-1` is for — and multiplying by a row of
+        // ones broadcasts it across the hidden axis.
+        let col = e.op_typed(
+            "omni.tensor",
+            "reshape",
+            &[2],
+            vec![("shape", int_list_value(&[-1, 1]))],
+            Type::tensor(vec![edges.clone(), Dim::N(1)], idx_dtype()),
+        );
+        let ones = e.splat(Value::U(1), &[Dim::N(1), Dim::N(hidden)], idx_dtype());
+        let idx = e.op_typed(
+            "omni.tensor",
+            "mul",
+            &[col, ones],
+            Vec::new(),
+            Type::tensor(vec![edges.clone(), Dim::N(hidden)], idx_dtype()),
+        );
+        // The base a scatter writes into: zero, so a node with no incoming edge
+        // aggregates nothing. It is `own × 0` rather than a constant because
+        // `[N, hidden]` has a symbolic axis and a constant needs a shape it can
+        // count.
+        let zero = e.splat(Value::U(0), &[Dim::N(1), Dim::N(1)], dt.clone());
+        let base = e.op(
+            "omni.tensor",
+            "mul",
+            &[own, zero],
+            &[n.clone(), Dim::N(hidden)],
+        );
+        let agg = e.op_attrs(
+            "omni.tensor",
+            "scatter",
+            &[base, idx, projected],
+            vec![("axis", Value::U(0)), ("reduction", Value::text("add"))],
+            &[n.clone(), Dim::N(hidden)],
         );
         let sum = e.op(
             "omni.tensor",
@@ -5998,11 +6148,11 @@ fn synthesize_gnn(params: &Value, available: &[String]) -> Result<Module, String
                 "x".into(),
                 Type::tensor(vec![n.clone(), Dim::N(in_f)], dt.clone()),
             ),
-            ("src".into(), Type::tensor(vec![edges.clone()], i32t)),
             (
-                "incidence".into(),
-                Type::tensor(vec![edges, n.clone()], dt.clone()),
+                "src".into(),
+                Type::tensor(vec![edges.clone()], i32t.clone()),
             ),
+            ("dst".into(), Type::tensor(vec![edges], i32t)),
         ],
         vec![Type::tensor(vec![n, Dim::N(classes)], dt)],
         vec![
@@ -6014,6 +6164,233 @@ fn synthesize_gnn(params: &Value, available: &[String]) -> Result<Module, String
     );
     Ok(finish_module(
         "gnn.mpnn",
+        f,
+        &["omni.core", "omni.tensor", "omni.nn"],
+    ))
+}
+
+/// `ssm.mamba` — §07.8's state-space row, and the reason §07.8.1 had to be
+/// written before it could exist.
+///
+/// A selective SSM block: two input projections, a depthwise causal
+/// convolution, the three *selective* projections (Δ, B, C — computed from the
+/// input rather than fixed, which is the whole idea), the scan, and a gate.
+///
+/// One structural note, because it is a real consequence of §07's op set rather
+/// than a stylistic choice. A published Mamba block fuses `in_proj` into one
+/// `[2·d_inner, d_model]` matrix and `x_proj` into one
+/// `[dt_rank + 2·d_state, d_inner]` matrix, then *slices* the result. Slicing
+/// needs concrete bounds on every axis (`tensor.slice`), and the sequence axis
+/// here is symbolic — a graph does not know how long its input is. So the fused
+/// matrices are named as their halves. That is the same arithmetic and a
+/// different checkpoint layout, and it is written down rather than worked
+/// around silently.
+fn synthesize_ssm(params: &Value, available: &[String]) -> Result<Module, String> {
+    let get = |k: &str| -> Option<u64> { params.get(k).and_then(|v| v.as_u64()) };
+    let d_model = get("d_model").ok_or("arch.params has no `d_model`")?;
+    let d_state = get("d_state").unwrap_or(16).max(1);
+    let d_conv = get("d_conv").unwrap_or(4).max(1);
+    let expand = get("expand").unwrap_or(2).max(1);
+    let d_inner = get("d_inner").unwrap_or(expand * d_model).max(1);
+    let dt_rank = get("dt_rank").unwrap_or(d_model.div_ceil(16)).max(1);
+    let layers = get("n_layers").unwrap_or(1).max(1);
+
+    let mut needed = Vec::new();
+    for l in 0..layers {
+        for w in [
+            "in_proj_x.weight",
+            "in_proj_z.weight",
+            "conv1d.weight",
+            "dt_in.weight",
+            "dt_proj.weight",
+            "b_proj.weight",
+            "c_proj.weight",
+            "a_log",
+            "out_proj.weight",
+        ] {
+            needed.push(format!("ssm.layers.{l}.{w}"));
+        }
+    }
+    require(available, needed)?;
+
+    let time = Dim::Sym("T".into());
+    let dt = DType::F32;
+    let mut e = Emit::new(1, dt.clone());
+    let mut x = 0u32;
+    for l in 0..layers {
+        let seq_inner = [time.clone(), Dim::N(d_inner)];
+        let p = |w: &str| format!("ssm.layers.{l}.{w}");
+        let xs = e.linear(
+            x,
+            &p("in_proj_x.weight"),
+            None,
+            std::slice::from_ref(&time),
+            d_model,
+            d_inner,
+        );
+        let z = e.linear(
+            x,
+            &p("in_proj_z.weight"),
+            None,
+            std::slice::from_ref(&time),
+            d_model,
+            d_inner,
+        );
+
+        // The depthwise causal convolution wants `[batch, channels, length]`,
+        // and the block works time-major, so this is a transpose and a reshape
+        // either side of it. `-1` carries the symbolic length through: it is
+        // what a reshape has instead of a name for a dimension it cannot count.
+        let chan_time = [Dim::N(d_inner), time.clone()];
+        let xt = e.op_attrs(
+            "omni.tensor",
+            "transpose",
+            &[xs],
+            vec![("perm", int_list_value(&[1, 0]))],
+            &chan_time,
+        );
+        let x3 = e.op_attrs(
+            "omni.tensor",
+            "reshape",
+            &[xt],
+            vec![("shape", int_list_value(&[1, d_inner as i64, -1]))],
+            &[Dim::N(1), Dim::N(d_inner), time.clone()],
+        );
+        let kernel = e.constant(
+            &p("conv1d.weight"),
+            &[Dim::N(d_inner), Dim::N(1), Dim::N(d_conv)],
+        );
+        let conv = e.op_attrs(
+            "omni.nn",
+            "conv1d_causal",
+            &[x3, kernel],
+            vec![("groups", Value::U(d_inner))],
+            &[Dim::N(1), Dim::N(d_inner), time.clone()],
+        );
+        let flat = e.op_attrs(
+            "omni.tensor",
+            "reshape",
+            &[conv],
+            vec![("shape", int_list_value(&[d_inner as i64, -1]))],
+            &chan_time,
+        );
+        let back = e.op_attrs(
+            "omni.tensor",
+            "transpose",
+            &[flat],
+            vec![("perm", int_list_value(&[1, 0]))],
+            &seq_inner,
+        );
+        let xc = e.act(back, "silu", &seq_inner);
+
+        // The selective projections. Δ, B and C are computed *from the input*,
+        // which is what separates this from a linear time-invariant SSM and is
+        // the reason the scan cannot be a convolution.
+        let dt_low = e.linear(
+            xc,
+            &p("dt_in.weight"),
+            None,
+            std::slice::from_ref(&time),
+            d_inner,
+            dt_rank,
+        );
+        let delta = e.linear(
+            dt_low,
+            &p("dt_proj.weight"),
+            optional(available, p("dt_proj.bias")).as_ref(),
+            std::slice::from_ref(&time),
+            dt_rank,
+            d_inner,
+        );
+        let seq_state = [time.clone(), Dim::N(d_state)];
+        let bproj = e.linear(
+            xc,
+            &p("b_proj.weight"),
+            None,
+            std::slice::from_ref(&time),
+            d_inner,
+            d_state,
+        );
+        let cproj = e.linear(
+            xc,
+            &p("c_proj.weight"),
+            None,
+            std::slice::from_ref(&time),
+            d_inner,
+            d_state,
+        );
+
+        // `A` is stored as `A_log` and used as `−exp(A_log)`, which is how
+        // every Mamba checkpoint stores it: the state transition must be
+        // negative for the recurrence to be stable, and parameterising the log
+        // is what keeps it so under gradient descent. The container holds what
+        // the checkpoint holds and the graph does the arithmetic.
+        let a_log = e.constant(&p("a_log"), &[Dim::N(d_inner), Dim::N(d_state)]);
+        let a_exp = e.op(
+            "omni.tensor",
+            "exp",
+            &[a_log],
+            &[Dim::N(d_inner), Dim::N(d_state)],
+        );
+        let a = e.op(
+            "omni.tensor",
+            "neg",
+            &[a_exp],
+            &[Dim::N(d_inner), Dim::N(d_state)],
+        );
+
+        let mut scan_ins = vec![xc, delta, a, bproj, cproj];
+        if let Some(skip) = optional(available, p("d")) {
+            scan_ins.push(e.constant(&skip, &[Dim::N(d_inner)]));
+        }
+        let y = e.op_attrs(
+            "omni.nn",
+            "ssm_scan",
+            &scan_ins,
+            vec![("delta_softplus", Value::Bool(true))],
+            &seq_inner,
+        );
+        let _ = seq_state;
+
+        // The gate: `y ⊙ silu(z)`. Without it the block is a linear recurrence
+        // with a convolution in front, and the gate is what makes it a Mamba
+        // block rather than an S4 layer.
+        let gate = e.act(z, "silu", &seq_inner);
+        let gated = e.op("omni.tensor", "mul", &[y, gate], &seq_inner);
+        let projected = e.linear(
+            gated,
+            &p("out_proj.weight"),
+            None,
+            std::slice::from_ref(&time),
+            d_inner,
+            d_model,
+        );
+        // The residual, which is what makes a stack of these trainable.
+        x = e.op(
+            "omni.tensor",
+            "add",
+            &[x, projected],
+            &[time.clone(), Dim::N(d_model)],
+        );
+    }
+    e.ret(&[x]);
+
+    let f = function(
+        vec![(
+            "x".into(),
+            Type::tensor(vec![time.clone(), Dim::N(d_model)], dt.clone()),
+        )],
+        vec![Type::tensor(vec![time.clone(), Dim::N(d_model)], dt)],
+        vec![
+            ("kind", Value::text("forward")),
+            ("d_state", Value::U(d_state)),
+            ("d_conv", Value::U(d_conv)),
+        ],
+        e.ops,
+        vec![at_least_one("T")],
+    );
+    Ok(finish_module(
+        "ssm.mamba",
         f,
         &["omni.core", "omni.tensor", "omni.nn"],
     ))
@@ -6896,6 +7273,27 @@ mod tests {
                     ("kernel", Value::U(3)),
                 ]),
                 vec![("audio.blocks.0.conv.weight", vec![3, 2, 3])],
+            ),
+            (
+                "ssm.mamba",
+                Value::map(vec![
+                    ("d_model", Value::U(4)),
+                    ("d_state", Value::U(3)),
+                    ("d_conv", Value::U(2)),
+                    ("expand", Value::U(2)),
+                    ("dt_rank", Value::U(2)),
+                ]),
+                vec![
+                    ("ssm.layers.0.in_proj_x.weight", vec![8, 4]),
+                    ("ssm.layers.0.in_proj_z.weight", vec![8, 4]),
+                    ("ssm.layers.0.conv1d.weight", vec![8, 1, 2]),
+                    ("ssm.layers.0.dt_in.weight", vec![2, 8]),
+                    ("ssm.layers.0.dt_proj.weight", vec![8, 2]),
+                    ("ssm.layers.0.b_proj.weight", vec![3, 8]),
+                    ("ssm.layers.0.c_proj.weight", vec![3, 8]),
+                    ("ssm.layers.0.a_log", vec![8, 3]),
+                    ("ssm.layers.0.out_proj.weight", vec![4, 8]),
+                ],
             ),
         ];
         for (family, params, weights) in &shapes {

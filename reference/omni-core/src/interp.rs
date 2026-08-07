@@ -1294,7 +1294,19 @@ impl State<'_> {
             "scatter" => {
                 let (x, i, u) = (a(0)?, a(1)?, a(2)?);
                 let axis = axis_of(int_attr_or(op, "axis", 0)?, x.shape.len())?;
-                one(scatter(x, i, u, axis, &dt(x))?)
+                // An unrecognised reduction is refused rather than treated as
+                // `replace`: the two produce different models from the same
+                // graph, which is exactly the case §15.1 says to report.
+                let reduce = match op.attr("reduction").and_then(|v| v.as_str()) {
+                    None => Reduction::Replace,
+                    Some(name) => Reduction::parse(name).ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "scatter reduction `{name}`: §07.4 defines replace, add, \
+                             mul, max and min"
+                        ))
+                    })?,
+                };
+                one(scatter(x, i, u, axis, reduce, &dt(x))?)
             }
             "sort" | "topk" => {
                 let x = a(0)?;
@@ -1616,7 +1628,54 @@ fn gather(t: &Tensor, i: &Tensor, axis: usize, dtype: &DType) -> Res<Tensor> {
     Ok(Tensor::new(shape, dtype.clone(), data))
 }
 
-fn scatter(t: &Tensor, i: &Tensor, u: &Tensor, axis: usize, dtype: &DType) -> Res<Tensor> {
+/// How a scatter combines an update with what is already at its destination
+/// (§07.4).
+///
+/// `replace` is the original behaviour and stays the default, so adding this
+/// attribute did not bump `scatter`'s version (§07.4.1: an optional attribute
+/// with a specified default is the same op). Everything else exists because
+/// message passing needs it: two edges arriving at one node have two messages,
+/// and with `replace` the second silently deletes the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reduction {
+    Replace,
+    Add,
+    Mul,
+    Max,
+    Min,
+}
+
+impl Reduction {
+    fn parse(s: &str) -> Option<Reduction> {
+        Some(match s {
+            "replace" => Reduction::Replace,
+            "add" => Reduction::Add,
+            "mul" => Reduction::Mul,
+            "max" => Reduction::Max,
+            "min" => Reduction::Min,
+            _ => return None,
+        })
+    }
+
+    fn apply(self, old: f64, new: f64) -> f64 {
+        match self {
+            Reduction::Replace => new,
+            Reduction::Add => old + new,
+            Reduction::Mul => old * new,
+            Reduction::Max => old.max(new),
+            Reduction::Min => old.min(new),
+        }
+    }
+}
+
+fn scatter(
+    t: &Tensor,
+    i: &Tensor,
+    u: &Tensor,
+    axis: usize,
+    reduce: Reduction,
+    dtype: &DType,
+) -> Res<Tensor> {
     let mut out = t.clone();
     out.dtype = dtype.clone();
     if i.shape != u.shape {
@@ -1647,7 +1706,7 @@ fn scatter(t: &Tensor, i: &Tensor, u: &Tensor, axis: usize, dtype: &DType) -> Re
         dst[axis] = pick as u64;
         let strides = out.strides();
         let lin: u64 = dst.iter().zip(&strides).map(|(a, b)| a * b).sum();
-        out.data[lin as usize] = u.at(&idx);
+        out.data[lin as usize] = reduce.apply(out.data[lin as usize], u.at(&idx));
         crate::expr::bump(&mut idx, &i.shape);
     }
     Ok(out)
@@ -2164,31 +2223,138 @@ impl State<'_> {
                 let d = dt(x);
                 Ok(self.moe_route(x, w, k as u64, normalize, &d)?)
             }
-            // `ssm_scan` is not refused for being hard. It is refused because
-            // §07 names it — "(associative scan)" — without saying what it
-            // computes: which operand is the state transition and which the
-            // input projection, whether the timestep is an operand or folded
-            // into `A`, and whether the discretization is zero-order hold or
-            // bilinear. Those choices produce different numbers from the same
-            // tensors. Every other op in this dialect either has a shape
-            // function pinning its operands or a definition that is standard
-            // across every framework; this one has neither, so implementing it
-            // would mean inventing the semantics and then checking my own
-            // invention. See `docs/spec/07-graph.md` §7.8.
-            "ssm_scan" => Err(Error::Unsupported(
-                "omni.nn/ssm_scan: §07 names this op but does not define it. The \
-                 operand order, whether the timestep is an operand, and the \
-                 discretization rule are all unstated, and different readings \
-                 give different numbers — so this is a gap in the specification \
-                 rather than a gap in this build, and filling it here would be \
-                 inventing a semantics and then agreeing with myself"
-                    .into(),
-            )),
+            // §07.8.1 now defines this op, and this implementation is a
+            // transcription of that definition rather than a reading of it. It
+            // was refused for one draft because the specification named it
+            // without saying which operand was the state transition, whether
+            // the timestep was an operand, or whether the discretization was
+            // zero-order hold or bilinear — readings that give different
+            // numbers from the same tensors.
+            "ssm_scan" => {
+                let d = dt(a(0)?);
+                Ok(vec![self.ssm_scan(
+                    a(0)?,
+                    a(1)?,
+                    a(2)?,
+                    a(3)?,
+                    a(4)?,
+                    ins.get(5),
+                    matches!(op.attr("delta_softplus"), Some(Value::Bool(true))),
+                    matches!(op.attr("reverse"), Some(Value::Bool(true))),
+                    &d,
+                )?])
+            }
             other => Err(Error::Unsupported(format!(
                 "omni.nn/{other}: not an op of this dialect at version {}",
                 op.version
             ))),
         }
+    }
+
+    /// §07.8.1's selective scan, transcribed from the definition.
+    ///
+    /// The recurrence is sequential in `t` by construction — that is what a
+    /// scan is — and the parallel form every accelerator uses is an
+    /// associative-scan rewrite of exactly this, not a different operator. A
+    /// reference interpreter has no reason to prefer the clever one.
+    #[allow(clippy::too_many_arguments)]
+    fn ssm_scan(
+        &self,
+        u: &Tensor,
+        delta: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        c: &Tensor,
+        skip: Option<&Tensor>,
+        softplus: bool,
+        reverse: bool,
+        dtype: &DType,
+    ) -> Res<Tensor> {
+        if u.shape.len() < 2 {
+            return Err(Error::Type(format!(
+                "ssm_scan: the sequence is {:?}, and §07.8.1 wants [..., L, P]",
+                u.shape
+            )));
+        }
+        if delta.shape != u.shape {
+            return Err(Error::Type(format!(
+                "ssm_scan: Δ is {:?} and the sequence is {:?}",
+                delta.shape, u.shape
+            )));
+        }
+        let rank = u.shape.len();
+        let (len, chan) = (u.shape[rank - 2], u.shape[rank - 1]);
+        if a.shape.len() != 2 || a.shape[0] != chan {
+            return Err(Error::Type(format!(
+                "ssm_scan: A is {:?}, and §07.8.1 wants [P, N] with P = {chan}",
+                a.shape
+            )));
+        }
+        let state = a.shape[1];
+        for (t, name) in [(b, "B"), (c, "C")] {
+            if t.shape.len() != rank || t.shape[rank - 2] != len || t.shape[rank - 1] != state {
+                return Err(Error::Type(format!(
+                    "ssm_scan: {name} is {:?}, and §07.8.1 wants [..., {len}, {state}]",
+                    t.shape
+                )));
+            }
+        }
+        if let Some(d) = skip {
+            if d.shape != vec![chan] {
+                return Err(Error::Type(format!(
+                    "ssm_scan: D is {:?}, and §07.8.1 wants [{chan}]",
+                    d.shape
+                )));
+            }
+        }
+        // Everything before the last two axes is batch, and it is the same for
+        // the sequence, the timestep and the two projections.
+        let batch: u64 = u.shape[..rank - 2].iter().product();
+        self.check_size(&u.shape)?;
+        let mut out = vec![0.0; u.numel() as usize];
+        // The state, [P, N], reset for each batch element.
+        let mut h = vec![0.0f64; (chan * state) as usize];
+        for bi in 0..batch {
+            h.iter_mut().for_each(|x| *x = 0.0);
+            let useq = bi * len * chan;
+            let proj = bi * len * state;
+            for step in 0..len {
+                let t = if reverse { len - 1 - step } else { step };
+                for p in 0..chan {
+                    let ui = (useq + t * chan + p) as usize;
+                    let dt_raw = delta.data[ui];
+                    // §07.8.1: softplus first, if asked. `ln(1 + e^x)` written
+                    // the stable way, because a large Δ is not a reason to
+                    // return an infinity.
+                    let d = if softplus {
+                        if dt_raw > 20.0 {
+                            dt_raw
+                        } else {
+                            (1.0 + dt_raw.exp()).ln()
+                        }
+                    } else {
+                        dt_raw
+                    };
+                    let x = u.data[ui];
+                    let mut acc = 0.0;
+                    for n in 0..state {
+                        let k = (p * state + n) as usize;
+                        // Ā = exp(ΔA), zero-order hold; B̄ = ΔB, Euler.
+                        let abar = (d * a.data[(p * state + n) as usize]).exp();
+                        let bbar = d * b.data[(proj + t * state + n) as usize];
+                        h[k] = abar * h[k] + bbar * x;
+                        acc += c.data[(proj + t * state + n) as usize] * h[k];
+                    }
+                    if let Some(dskip) = skip {
+                        acc += dskip.data[p as usize] * x;
+                    }
+                    out[ui] = acc;
+                }
+            }
+        }
+        let mut t = Tensor::new(u.shape.clone(), dtype.clone(), out);
+        t = round_through(&t, dtype, Round::Rne)?;
+        Ok(t)
     }
 
     /// N-dimensional convolution, and the causal 1-D case that shares it.
@@ -3755,11 +3921,10 @@ mod tests {
     #[test]
     fn what_is_not_implemented_is_refused_by_name() {
         let x = f32t(&[1, 2, 2], &[1.0, 2.0, 3.0, 4.0]);
-        // What is left once conv, conv1d_causal, pool, interpolate and moe_route
-        // were implemented: one op §07 names without defining, one that needs a
-        // network, an op of no dialect, and a dialect nobody has heard of.
+        // What is left once every op of `omni.nn` is implemented — `ssm_scan`
+        // included, since §07.8.1 defines it: one that needs a network, an op
+        // of no dialect, and a dialect nobody has heard of.
         for (dialect, name, needle) in [
-            ("omni.nn", "ssm_scan", "ssm_scan"),
             ("omni.nn", "not_an_op", "omni.nn/not_an_op"),
             ("omni.io", "external", "external"),
             ("acme.secret", "op", "acme.secret/op"),
@@ -4108,6 +4273,165 @@ mod tests {
     }
 
     #[test]
+    fn a_synthesized_selective_scan_is_causal_and_remembers() {
+        // §07.8.1's op, in the family it was defined for. Two properties, and
+        // both are properties of a *selective state-space model* rather than of
+        // "it produced numbers": the scan is causal, so a later token cannot
+        // move an earlier output; and it carries state, so an earlier token
+        // must move a later one. A wrong `reverse`, a non-causal convolution or
+        // a state that is reset per position each break exactly one of these.
+        let (d_model, d_state, d_conv, d_inner, dt_rank) = (4u64, 3u64, 2u64, 8u64, 2u64);
+        let w = seeded_weights(&[
+            ("ssm.layers.0.in_proj_x.weight", vec![d_inner, d_model], 0.7),
+            ("ssm.layers.0.in_proj_z.weight", vec![d_inner, d_model], 1.1),
+            ("ssm.layers.0.conv1d.weight", vec![d_inner, 1, d_conv], 0.9),
+            ("ssm.layers.0.dt_in.weight", vec![dt_rank, d_inner], 0.5),
+            ("ssm.layers.0.dt_proj.weight", vec![d_inner, dt_rank], 1.3),
+            ("ssm.layers.0.b_proj.weight", vec![d_state, d_inner], 0.6),
+            ("ssm.layers.0.c_proj.weight", vec![d_state, d_inner], 1.7),
+            ("ssm.layers.0.a_log", vec![d_inner, d_state], 0.3),
+            ("ssm.layers.0.d", vec![d_inner], 2.2),
+            ("ssm.layers.0.out_proj.weight", vec![d_model, d_inner], 0.8),
+        ]);
+        let params = Value::map(vec![
+            ("d_model", Value::U(d_model)),
+            ("d_state", Value::U(d_state)),
+            ("d_conv", Value::U(d_conv)),
+            ("d_inner", Value::U(d_inner)),
+            ("dt_rank", Value::U(dt_rank)),
+        ]);
+        let m = crate::ir::synthesize("ssm.mamba", &params, &synth_names(&w))
+            .expect("ssm.mamba synthesizes");
+
+        let t = 5u64;
+        let seq: Vec<f64> = (0..t * d_model)
+            .map(|i| ((i as f64) * 0.37).cos())
+            .collect();
+        let x = Tensor::new(vec![t, d_model], DType::F32, seq.clone());
+        let out = run(&m, &[x], &w, &Limits::default())
+            .unwrap_or_else(|e| panic!("the synthesized Mamba block did not run: {e}"));
+        assert_eq!(out.returned[0].shape, vec![t, d_model]);
+        assert!(
+            out.returned[0].data.iter().all(|v| v.is_finite()),
+            "the scan produced non-finite values"
+        );
+
+        let row = |o: &Outcome, i: u64| -> Vec<f64> {
+            (0..d_model)
+                .map(|c| o.returned[0].get(&[i, c]).unwrap())
+                .collect()
+        };
+
+        // Causality: change the last position and the first output must not
+        // move.
+        let mut later = seq.clone();
+        for v in later.iter_mut().skip(((t - 1) * d_model) as usize) {
+            *v = 3.0;
+        }
+        let out_later = run(
+            &m,
+            &[Tensor::new(vec![t, d_model], DType::F32, later)],
+            &w,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            row(&out, 0),
+            row(&out_later, 0),
+            "position 0 saw a later token: the scan is not causal"
+        );
+
+        // Memory: change the first position and the last output must move.
+        let mut earlier = seq;
+        for v in earlier.iter_mut().take(d_model as usize) {
+            *v = -3.0;
+        }
+        let out_earlier = run(
+            &m,
+            &[Tensor::new(vec![t, d_model], DType::F32, earlier)],
+            &w,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            row(&out, t - 1),
+            row(&out_earlier, t - 1),
+            "the last position ignored the first: the state is not threaded"
+        );
+    }
+
+    #[test]
+    fn the_selective_scan_computes_what_the_specification_says() {
+        // §07.8.1 written out by hand, against the interpreter's own
+        // transcription of it. The point is not that the arithmetic is hard —
+        // it is that this op spent a draft undefined precisely because two
+        // readings of the same words give different numbers, so the definition
+        // needs a second implementation to be worth anything.
+        let (l, p, n) = (3usize, 2usize, 2usize);
+        let f32t = |shape: Vec<u64>, data: Vec<f64>| Tensor::new(shape, DType::F32, data);
+        let u = f32t(
+            vec![l as u64, p as u64],
+            vec![1.0, -0.5, 0.25, 2.0, -1.0, 0.5],
+        );
+        let delta = f32t(vec![l as u64, p as u64], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        let a = f32t(vec![p as u64, n as u64], vec![-1.0, -2.0, -0.5, -1.5]);
+        let b = f32t(
+            vec![l as u64, n as u64],
+            vec![1.0, 0.5, -1.0, 2.0, 0.25, 0.75],
+        );
+        let c = f32t(
+            vec![l as u64, n as u64],
+            vec![0.5, 1.0, 2.0, -1.0, 1.5, 0.25],
+        );
+        let d = f32t(vec![p as u64], vec![0.3, -0.7]);
+
+        // The reference, straight from the specification's five lines.
+        let mut want = vec![0.0f64; l * p];
+        let mut h = vec![0.0f64; p * n];
+        for t in 0..l {
+            for ch in 0..p {
+                let dt = delta.data[t * p + ch];
+                let x = u.data[t * p + ch];
+                let mut acc = 0.0;
+                for k in 0..n {
+                    let abar = (dt * a.data[ch * n + k]).exp();
+                    let bbar = dt * b.data[t * n + k];
+                    h[ch * n + k] = abar * h[ch * n + k] + bbar * x;
+                    acc += c.data[t * n + k] * h[ch * n + k];
+                }
+                want[t * p + ch] = acc + d.data[ch] * x;
+            }
+        }
+
+        let op = Op::new("omni.nn", "ssm_scan", 1).with_output(6, ty(&[l as u64, p as u64]));
+        let got = one_op(op, &[u, delta, a, b, c, d]).expect("the scan runs");
+        for (g, w) in got.data.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "{g} vs {w}");
+        }
+
+        // And the two attributes, each checked for the thing it changes.
+        let ones = |shape: Vec<u64>, v: f64| {
+            Tensor::new(shape.clone(), DType::F32, vec![v; numel(&shape) as usize])
+        };
+        let straight = Op::new("omni.nn", "ssm_scan", 1).with_output(5, ty(&[3, 1]));
+        let reversed = straight.clone().with_attr("reverse", Value::Bool(true));
+        let args = vec![
+            f32t(vec![3, 1], vec![1.0, 0.0, 0.0]),
+            ones(vec![3, 1], 0.5),
+            f32t(vec![1, 1], vec![-1.0]),
+            ones(vec![3, 1], 1.0),
+            ones(vec![3, 1], 1.0),
+        ];
+        let fwd = one_op(straight, &args).unwrap();
+        let rev = one_op(reversed, &args).unwrap();
+        // An impulse at the start decays forward; reversed, it arrives at the
+        // end and nothing before it has seen anything.
+        assert!(fwd.data[0] > 0.0 && fwd.data[2] > 0.0);
+        assert_eq!(rev.data[0], fwd.data[0]);
+        assert_eq!(rev.data[1], 0.0, "a reversed scan saw a later impulse");
+    }
+
+    #[test]
     fn a_synthesized_graph_network_passes_messages_along_its_edges() {
         let (fin, hidden, classes) = (2u64, 3u64, 2u64);
         let w = seeded_weights(&[
@@ -4137,10 +4461,19 @@ mod tests {
             },
             vec![0.0, 1.0],
         );
-        let inc = Tensor::new(vec![2, 3], DType::F32, vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        // Both edges land on node 2, which is the case a scatter with no
+        // reduction gets wrong: the second message would overwrite the first.
+        let dst = Tensor::new(
+            vec![2],
+            DType::Int {
+                w: 32,
+                signed: true,
+            },
+            vec![2.0, 2.0],
+        );
         let out = run(
             &m,
-            &[x.clone(), src.clone(), inc.clone()],
+            &[x.clone(), src.clone(), dst.clone()],
             &w,
             &Limits::default(),
         )
@@ -4152,7 +4485,7 @@ mod tests {
         // 1's output must not, because there is no edge from 0 to 1.
         let mut x2 = x.clone();
         x2.data[0] = -2.0;
-        let out2 = run(&m, &[x2, src, inc], &w, &Limits::default()).unwrap();
+        let out2 = run(&m, &[x2, src.clone(), dst.clone()], &w, &Limits::default()).unwrap();
         let row = |t: &Tensor, n: u64| -> Vec<f64> {
             (0..classes).map(|c| t.get(&[n, c]).unwrap()).collect()
         };
@@ -4165,6 +4498,19 @@ mod tests {
             row(&out.returned[0], 1),
             row(&out2.returned[0], 1),
             "node 1 changed, and no edge reaches it from node 0"
+        );
+
+        // The property the reduction exists for, stated directly: node 2
+        // receives *both* messages. Changing node 1's features moves node 2 as
+        // well — with `replace` one of the two would have been overwritten, and
+        // whichever edge came second would be the only one that mattered.
+        let mut x3 = x.clone();
+        x3.data[2] = 3.0;
+        let out3 = run(&m, &[x3, src, dst], &w, &Limits::default()).unwrap();
+        assert_ne!(
+            row(&out.returned[0], 2),
+            row(&out3.returned[0], 2),
+            "node 2 did not receive node 1's message: the aggregation dropped one"
         );
     }
 
@@ -4713,25 +5059,43 @@ mod tests {
     }
 
     #[test]
-    fn ssm_scan_is_a_specification_gap_and_says_so() {
-        // Refused not for being hard but for being undefined: §07 names the op
-        // without saying what it computes. The message has to make that
-        // distinction, or the next person implements a guess.
+    fn a_mis_shaped_selective_scan_is_named_rather_than_run() {
+        // This op spent a draft refused for being undefined. Now that §07.8.1
+        // defines it, the thing worth guarding is the operand *roles*: a scan
+        // whose Δ is per-position but not per-channel, or whose A has the wrong
+        // number of channels, is the same confusion the gap was about, and it
+        // has to be an error naming the operand rather than numbers.
         let e = nn(
             "ssm_scan",
             vec![],
             &[
-                f32t(&[1, 2], &[1.0, 2.0]),
-                f32t(&[1, 2], &[1.0, 2.0]),
-                f32t(&[1, 2], &[1.0, 2.0]),
+                f32t(&[3, 2], &[0.0; 6]),
+                // Δ per position only: the reading §07.8.1 exists to rule out.
+                f32t(&[3, 1], &[0.0; 3]),
+                f32t(&[2, 2], &[0.0; 4]),
+                f32t(&[3, 2], &[0.0; 6]),
+                f32t(&[3, 2], &[0.0; 6]),
             ],
-            &[1, 2],
+            &[3, 2],
         )
-        .expect_err("undefined");
-        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
-        let m = e.to_string();
-        assert!(m.contains("does not define"), "{m}");
-        assert!(m.contains("discretization"), "{m}");
+        .expect_err("a mis-shaped Δ");
+        assert!(e.to_string().contains("Δ"), "{e}");
+
+        let e = nn(
+            "ssm_scan",
+            vec![],
+            &[
+                f32t(&[3, 2], &[0.0; 6]),
+                f32t(&[3, 2], &[0.0; 6]),
+                // A with three channels for a two-channel sequence.
+                f32t(&[3, 2], &[0.0; 6]),
+                f32t(&[3, 2], &[0.0; 6]),
+                f32t(&[3, 2], &[0.0; 6]),
+            ],
+            &[3, 2],
+        )
+        .expect_err("a mis-shaped A");
+        assert!(e.to_string().contains("[P, N]"), "{e}");
     }
     // ------------------------------------------- the other synthesizers --
 

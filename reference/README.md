@@ -353,17 +353,24 @@ implemented:
   about its input has to say so differently. Whitespace
   control is carried across, because `{%- … -%}` decides whether a prompt has a
   leading newline and a tokenizer notices
-- **Ten synthesizable architecture families**, which is the count Gate 2 asks
-  for: `transformer.decoder`, `transformer.encoder`, `transformer.moe`,
-  `cnn.classifier`, `mlp`, `rnn.lstm`, `rnn.gru`, `gnn.mpnn`, `rl.actor_critic`
-  and `audio.encoder`. Each is *executed* in the tests over known weights, and
+- **Eleven synthesizable architecture families**, one more than the count Gate 2
+  asks for: `transformer.decoder`, `transformer.encoder`, `transformer.moe`,
+  `cnn.classifier`, `mlp`, `rnn.lstm`, `rnn.gru`, `gnn.mpnn`, `rl.actor_critic`,
+  `audio.encoder` and `ssm.mamba` — the last of which needed §07.8.1 written
+  before it could exist, since its defining op was named and not defined. Each is
+  *executed* in the tests over known weights, and
   each assertion is a property of that architecture rather than "it produced
   numbers": the mixture's output moves when only the router changes, the
   recurrence's first step cannot see the last input, the graph network's node
   moves when its neighbour does and not when a stranger does, the causal audio
-  encoder's earlier frames do not move when a later frame changes. Running them
+  encoder's earlier frames do not move when a later frame changes, the selective
+  scan's first output does not move when a later token changes and its last one
+  does when an earlier token does. Running them
   is what found `core.scan` declared with one result and returning two, and
-  found that `tensor.scatter` cannot aggregate messages at all. The count is met
+  found that `tensor.scatter` could not aggregate messages at all — now fixed in
+  §07.4 with the `reduction` attribute ONNX already spells, so the GNN row
+  aggregates with a scatter-add over an edge list rather than a dense incidence
+  matrix. The count is met
   and the rest of the criterion is not: the gate also wants outputs matched
   against the source framework, and there is no source framework here
 - **A reference interpreter for OMNI-IR** (`omni graph run`), which is where §07's
@@ -379,13 +386,21 @@ implemented:
   completes the dialect bar one op; a graph is bounded in ops, elements and loop
   iterations, because a graph is untrusted input.
 
-  The one refusal left is `ssm_scan`, and it is a *specification* gap rather than
-  an implementation one: §07 registers the op's arity and its `delta_softplus`
-  attribute but never says which operand is the state transition, whether the
-  timestep is an operand, or whether the discretization is zero-order hold or
-  bilinear — readings that give different numbers from the same tensors. An
-  implementation that picked one would be checking its guess against itself, so
-  this build refuses it by name and §07.8 now records the gap.
+  `ssm_scan` was the one refusal left, and it was a *specification* gap rather
+  than an implementation one: §07 registered the op's arity and its
+  `delta_softplus` attribute but never said which operand was the state
+  transition, whether the timestep was an operand, or whether the discretization
+  was zero-order hold or bilinear — readings that give different numbers from the
+  same tensors. **§07.8.1 now defines it**: the operand roles, the per-channel
+  *and* per-position Δ that makes the model selective, `Ā = exp(ΔA)` and
+  `B̄ = ΔB` named separately because that asymmetry is what every published
+  implementation computes, and a `reverse` attribute for the bidirectional case.
+  The interpreter is a transcription of those five lines, and a test writes them
+  out a second time by hand — an op that spent a draft undefined because two
+  readings disagree needs a second implementation before its definition is worth
+  anything. The registered arity changed with it, which is not a compatibility
+  break for a reason §07.8.1 states: no conforming implementation could have
+  existed to break
 
   It earned its keep on the first run. **`graph synthesize` was emitting a graph
   that verified and computed the wrong thing:** the projections were reshaped to

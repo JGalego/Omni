@@ -1280,6 +1280,11 @@ jobs:
           set -e
           test "$rc" = 3
           grep -q 'weights-only' /tmp/norun.txt
+          # The families it offers instead. `ssm.mamba` is in the list because
+          # §07.8.1 defines `nn.ssm_scan`; for one draft the op was named and not
+          # defined, and the family could not exist.
+          grep -q 'ssm.mamba' /tmp/norun.txt
+          test "$(grep -o 'can build one for: .*' /tmp/norun.txt | tr ',' '\n' | wc -l)" = 11
 
           # A graph is untrusted input, so the interpreter is bounded and reports
           # the bound rather than running forever.

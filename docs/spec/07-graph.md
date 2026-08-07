@@ -233,43 +233,99 @@ plausible `omni.nn` covers everything. Sketches:
 |---|---|
 | Transformer (dense) | `scan` over layers or unrolled; `nn.attention`, `nn.norm`, `tensor.matmul` |
 | MoE | `nn.moe_route` produces routing weights + indices; `tensor.gather` over expert weights; ragged `map` region per expert. Expert weights are ordinary tensors with `blocklist` sparsity for partial fetch |
-| Mamba / SSM | `nn.ssm_scan` (associative scan) — **underspecified, see below** — `nn.conv1d_causal`, `state` type for recurrent carry |
+| Mamba / SSM | `nn.ssm_scan` (selective scan, §7.8.1), `nn.conv1d_causal`, `state` type for recurrent carry |
 | RWKV | `core.scan` with an explicit recurrent state carry; WKV as a dialect op or as a composite |
 | CNN | `nn.conv`, `nn.pool`, `nn.norm` |
 | Diffusion / flow matching | The denoiser is a `Model`; the **sampler is a graph**: `core.while` over timesteps with a schedule tensor. Multi-model bundle (§01.7) holds text encoder + denoiser + VAE + scheduler graph |
 | RNN / LSTM / GRU | `core.scan` with `state` |
-| GNN | `tensor.gather` over edge index tensors; aggregation is **not** `scatter` — see below; ragged types |
+| GNN | `tensor.gather` over edge index tensors; `tensor.scatter{reduction:"add"}` to aggregate per node; ragged types |
 | Speech / audio | streaming `stream` types, `nn.conv1d_causal`, chunked `scan` |
 | Video | temporal axis in shapes; `scan` over frames; state for caches |
 | RL policies | ordinary graph + `omni.io` observation/action typing; value and policy heads as separate functions in one module |
 | Retrieval-augmented | `omni.io` external-call op declared as an **effect**, so it is visible and refusable |
 
-> **Known gap: `nn.ssm_scan` is named but not defined.** Writing a reference
-> interpreter (`omni graph run`) surfaced this. The op's arity and attributes are
-> registered — three to five operands and `delta_softplus` — but nothing here says
-> which operand is the state transition and which the input projection, whether
-> the timestep is an operand or already folded into `A`, or whether the
-> discretization is zero-order hold or bilinear. Those readings produce different
-> numbers from the same tensors, so two conforming implementations could disagree
-> about what a Mamba model computes while both passing verification.
+### 7.8.1 `nn.ssm_scan`
+
+This op was **named but not defined** for one draft, and the reference
+interpreter refused it by name rather than pick a reading — an implementation
+that guessed would have been checking its guess against itself. What was missing
+was not the arity but the *meaning*: which operand is the state transition and
+which the input projection, whether the timestep is an operand or folded into
+`A`, and whether the discretization is zero-order hold or bilinear. Those
+readings produce different numbers from the same tensors, so two conforming
+implementations could have disagreed about what a Mamba model computes while both
+passing verification.
+
+```
+ssm_scan(u, Δ, A, B, C [, D]) -> y
+```
+
+| Operand | Shape | Meaning |
+|---|---|---|
+| `u` | `[…, L, P]` | the sequence, `P` channels, `L` positions |
+| `Δ` | `[…, L, P]` | the timestep, **per channel and position** — this is what makes the model *selective* |
+| `A` | `[P, N]` | the state transition, one row of `N` state dimensions per channel |
+| `B` | `[…, L, N]` | the input projection, per position |
+| `C` | `[…, L, N]` | the output projection, per position |
+| `D` | `[P]` | optional skip connection |
+
+Leading dimensions are batch and must agree across `u`, `Δ`, `B` and `C`. The
+result has `u`'s shape and dtype.
+
+| Attribute | Type | Default | Meaning |
+|---|---|---|---|
+| `delta_softplus` | bool | `false` | apply `softplus` to `Δ` before anything else |
+| `reverse` | bool | `false` | scan from the last position toward the first |
+
+Semantics, stated so that there is one reading:
+
+```
+Δ̂  = delta_softplus ? log(1 + exp(Δ)) : Δ
+Ā_t = exp(Δ̂_t ⊗ A)                              [L, P, N]   zero-order hold on A
+B̄_t = Δ̂_t ⊗ B_t                                 [L, P, N]   Euler on B
+h_0 = 0                                          [P, N]
+h_t = Ā_t ⊙ h_{t−1} + B̄_t · u_t
+y_t = Σ_n C_t[n] · h_t[:, n]   ( + D ⊙ u_t )
+```
+
+`Ā` is the zero-order hold `exp(ΔA)`; `B̄` is the Euler form `ΔB` and **not** the
+exact hold `(ΔA)⁻¹(exp(ΔA) − I)ΔB`. That asymmetry is not an oversight — it is
+what every published implementation computes, and a specification that named the
+exact form would describe a model nobody has trained. A future version may add
+the exact discretization as a new op version; it must not silently change this
+one.
+
+> **The registered arity changed when this was defined, and that is not a
+> compatibility break.** The op was declared with three to five operands, which
+> was itself part of the underspecification. No conforming implementation could
+> have existed to break: the meaning was absent, so any implementation was
+> guessing, and §7.4.1's rule protects implementations rather than declarations.
+> The arity is corrected in place at version 1 rather than bumped to a version 2
+> whose version 1 means nothing.
 >
-> Every other op in `omni.nn` is either pinned by a shape function or standard
-> across every framework. This one is neither, and the reference implementation
-> **refuses it by name** rather than picking a reading — an implementation that
-> guessed would then be checking its guess against itself. Defining it is
-> outstanding specification work, not outstanding implementation work.
+> **`tensor.scatter` aggregates, and this paragraph is here because it once did
+> not.** Synthesizing the GNN row found it: `scatter` was defined element for
+> element — index *k* of the updates goes to position *k* with the scattered axis
+> replaced — so when two edges arrived at the same node the second message
+> overwrote the first and the aggregation silently lost it. `scatter` now takes
+> an optional
 >
-> **Known gap: `tensor.scatter` cannot aggregate.** Synthesizing the GNN row
-> surfaced this one. `scatter` is defined element for element — index *k* of the
-> updates goes to position *k* with the scattered axis replaced — so when two
-> edges arrive at the same node, the second message overwrites the first and the
-> aggregation silently loses it. Message passing needs a scatter-*add*, and §07
-> defines no reduction on `scatter`; ONNX spells it `ScatterElements(reduction)`
-> and JAX spells it `segment_sum`, so the shape of the fix is not in doubt, only
-> its spelling. Until it is spelled, `gnn.mpnn` takes the incidence matrix as an
-> input and aggregates with `einsum`, which is the same arithmetic in an op that
-> exists — and is dense where the operation is sparse, which is the cost of the
-> gap.
+> ```
+> reduction : "replace" | "add" | "mul" | "max" | "min"     default "replace"
+> ```
+>
+> applied between what is already at the destination and the update arriving
+> there. `replace` is the previous behaviour and is the default, so this is an
+> optional attribute with a specified default and **`scatter` stays at version
+> 1** (§7.4.1). The spelling is ONNX's `ScatterElements(reduction)` rather than a
+> new one, because the operation is not new — only its absence here was.
+>
+> An unrecognised `reduction` is a refusal, not a fallback to `replace`: the two
+> produce different numbers from the same graph, which is exactly the case §15.1
+> says a reader must report rather than resolve. `gnn.mpnn` now aggregates with
+> `scatter{reduction:"add"}` over an edge list, and no longer carries the dense
+> `[E, N]` incidence matrix that the workaround needed — a matrix quadratic in
+> the thing the operation is sparse in.
 | **Unknown, 2040** | New dialect. Core unchanged. |
 
 The load-bearing claim is the last row, and it is supported by the fact that

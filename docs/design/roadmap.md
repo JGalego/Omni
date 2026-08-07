@@ -183,11 +183,11 @@ hub snapshot, with the failures analyzed and published. *If OMNI-CT cannot cover
 95 %, the language grows or the fallback story changes.*
 
 **Gate 2 status.** Not met, and closer than it was: the gate wants ten
-architecture families and this build now synthesizes **ten** —
+architecture families and this build now synthesizes **eleven** —
 `transformer.decoder`, `transformer.encoder`, `transformer.moe`,
-`cnn.classifier`, `mlp`, `rnn.lstm`, `rnn.gru`, `gnn.mpnn`, `rl.actor_critic`
-and `audio.encoder` — with Mamba/SSM still blocked on a specification gap rather
-than on code (see `ssm_scan` below). That is the *count* the gate names; what it
+`cnn.classifier`, `mlp`, `rnn.lstm`, `rnn.gru`, `gnn.mpnn`, `rl.actor_critic`,
+`audio.encoder` and `ssm.mamba`, the last of which needed §07.8.1 written before
+it could exist. That is more than the *count* the gate names; what it
 also asks for is outputs matching the source framework within a declared
 tolerance, and there is no source framework here to compare against, so the
 count is met and the comparison is not.
@@ -199,9 +199,11 @@ the shipped lowerings. The tokenizer IR and OMNI-CT run their own conformance
 vectors. The WASM host of §11.6 exists and runs plugin expression ops under the
 restricted profile. A reference interpreter (`omni graph run`) executes all of
 `omni.core` including its control flow, all 31 `omni.tensor` ops with a general
-`einsum`, `omni.quant`'s four, and all of `omni.nn` except `ssm_scan`, which is
-refused because §07 names it without defining it — the operand roles and the
-discretization rule are unstated, and different readings give different numbers.
+`einsum`, `omni.quant`'s four, and **all** of `omni.nn` — `ssm_scan` included,
+which was refused for a draft because §07 named it without defining it. §07.8.1
+now states the operand roles, the per-channel and per-position Δ, and the
+discretization rule, so the op is decidable rather than a place where two
+conforming readers could disagree about what a Mamba model computes.
 
 **Every family is executed, not merely emitted**, and each is checked against a
 property of *that* architecture rather than against "it produced numbers": the
@@ -215,9 +217,15 @@ the decoder attending across *heads* instead of positions while passing
 verification. It found `core.scan` declared with one result in the op registry
 and returning two in the interpreter — the same graph ran correctly and failed
 verification, and nothing had used both results until an LSTM did. And
-synthesizing the GNN row found that `tensor.scatter` cannot aggregate at all:
-it writes element for element, so two edges into one node lose a message. Both
-are now recorded in §07.
+synthesizing the GNN row found that `tensor.scatter` could not aggregate at all:
+it wrote element for element, so two edges into one node lost a message. That
+one is now **fixed rather than recorded**: §07.4 spells `reduction` on `scatter`
+— ONNX's `ScatterElements` spelling, not a new one — as an optional attribute
+with a specified default, so the op stays at version 1, and `gnn.mpnn`
+aggregates with a scatter-add over an edge list instead of carrying a dense
+`[E, N]` incidence matrix that was quadratic in the thing the operation is
+sparse in. An unrecognised reduction is refused rather than silently treated as
+`replace`, because the two produce different models from one graph.
 
 **Jinja2 → OMNI-CT now converts 14 of the 15-template corpus**, up from 10. The
 three blockers §06.9 had recorded as gaps in itself — no loop variable, no slice
@@ -249,7 +257,7 @@ and three kinds do not — `omni.nn/attention` and `omni.nn/rope`, which are the
 semantic ops §07.2 exists to keep, and `omni.tensor/rsqrt`, which ONNX has no
 operator for.
 
-**Still not met:** the ten families are executed against arithmetic done in the
+**Still not met:** the eleven families are executed against arithmetic done in the
 tests rather than against PyTorch, the tokenizer vectors are this repository's
 rather than 200 real ones, and the translation figure is a percentage of a
 15-template corpus and not of the public snapshot the gate names. ONNX's
