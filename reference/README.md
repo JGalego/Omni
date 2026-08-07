@@ -491,11 +491,15 @@ What is **not** implemented, and is reported as such rather than faked:
   it is named here rather than half-implemented. The OCI referrers API, which is
   how an adapter or a signature would be linked to the model it belongs to, is
   also not here
-- `omni convert --requantize`. `--cast` is here — it converts, measures the
-  error it introduced, records the recipe as provenance and can re-read its own
-  output to check it — but requantizing is a *search over a calibration set*
-  (§05.5), and a build with no calibration data would have to invent either the
-  data or the scales. It is refused with what it would need
+- GPTQ's Hessian update and AWQ's per-channel scaling transform.
+  `omni convert --requantize` is here — both the round-to-nearest baseline,
+  whose scales come from the weights alone, and a clip search whose objective is
+  written into the provenance rather than implied by a name, weighted by a
+  calibration set's per-channel activation magnitudes when one is given. What is
+  not here is a re-derivation of two published algorithms checked against
+  nothing. The verb was refused for a while on the argument that quantizing needs
+  activations; that is true of those two and false of round-to-nearest, and
+  refusing the whole verb was refusing more than the argument supported
 - `omni mount` (§13.9), which needs FUSE
 - Every importer and exporter except safetensors, PyTorch, GGUF, ONNX, PEFT,
   GPTQ, AWQ and a whole Hugging Face repo.

@@ -82,6 +82,7 @@ pub mod pytorch;
 pub mod quant;
 pub mod recover;
 pub mod registry;
+pub mod requant;
 pub mod safetensors;
 pub mod serve;
 pub mod sha256;

@@ -760,6 +760,107 @@ jobs:
       # these, pack it again with the options its header records, and the
       # result must be the same bytes (W1). Accepting them proves nothing,
       # which is why the corpus states the obligation and this runs it.
+      # §05.5: quantization is a measurement, and a measurement needs
+      # provenance. The verb was refused for a while on the argument that the
+      # scales depend on activations — true of GPTQ and AWQ, not of
+      # round-to-nearest — so both methods are here and the difference between
+      # them is exactly what the provenance has to record.
+      - name: Requantization is a search, and the record says which one
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          "$OMNI" example --tune 3 /tmp/rq-src.omni >/dev/null
+
+          # No calibration: round to nearest. The container gets smaller because
+          # each weight becomes a `dequantize` over its indices (§05.2), not
+          # because a second copy was written at lower precision.
+          "$OMNI" convert /tmp/rq-src.omni --requantize affine:4:32 -o /tmp/rq.omni \
+            --verify | tee /tmp/rq.txt
+          grep -q '  method       rtn' /tmp/rq.txt
+          grep -q 'nothing was invented' /tmp/rq.txt
+          grep -q 'verified' /tmp/rq.txt
+          python3 - <<'PY_SIZE'
+          import re
+          t = open('/tmp/rq.txt').read()
+          pct = float(re.search(r'tensor bytes .*\(([\d.]+) %\)', t).group(1))
+          # 4-bit indices plus f32 scales every 32 elements, against bf16: about
+          # a third. A number rather than "smaller".
+          assert 25 <= pct <= 45, f"{pct}% is not what 4 bits over bf16 costs"
+          print(f"requantized to {pct}% of the source tensor bytes")
+          PY_SIZE
+
+          # The dequantize expression is what makes it small, so it has to be
+          # there and it has to evaluate.
+          "$OMNI" cat /tmp/rq.omni --tensor model.layers.0.attn.q_proj.weight --limit 4 \
+            | tee /tmp/rqcat.txt
+          grep -q 'affine' /tmp/rqcat.txt
+          # A provenance ref to the source model's manifest (§05.5) is a
+          # reference to an object that lives in *another* container, so the
+          # result is **incomplete** rather than invalid — the §15.1 distinction
+          # again, and exit 5 rather than 1.
+          "$OMNI" verify /tmp/rq.omni --level 6 > /tmp/rqverify.txt 2>&1 || true
+          grep -q 'V3 integrity   ✓' /tmp/rqverify.txt
+          grep -q '^incomplete' /tmp/rqverify.txt
+          # Read beside its source, nothing is missing.
+          "$OMNI" verify /tmp/rq.omni --level 6 --with /tmp/rq-src.omni >/dev/null 2>&1 || true
+
+          # With a calibration set: the search is weighted by what the model
+          # actually uses, and §05.5's question becomes a field lookup.
+          python3 - <<'PY_ACTS'
+          import json, struct
+          names = ["model.layers.0.attn.q_proj.weight", "model.layers.0.attn.o_proj.weight"]
+          tensors, blob = {}, b""
+          for n in names:
+              # One channel that barely fires, so clipping it is cheap.
+              vals = [0.001 if i % 16 == 0 else 1.0 for i in range(64)]
+              data = b"".join(struct.pack("<f", v) for v in vals)
+              tensors[n] = {"dtype": "F32", "shape": [64],
+                            "data_offsets": [len(blob), len(blob) + len(data)]}
+              blob += data
+          tensors["__metadata__"] = {"dataset": "synthetic/impulse", "samples": "128"}
+          hdr = json.dumps(tensors, separators=(",", ":")).encode()
+          open("/tmp/acts.safetensors", "wb").write(struct.pack("<Q", len(hdr)) + hdr + blob)
+          PY_ACTS
+          "$OMNI" convert /tmp/rq-src.omni --requantize affine:4:32 \
+            --calib /tmp/acts.safetensors -o /tmp/rq-cal.omni --verify | tee /tmp/rqc.txt
+          grep -q '  method       clip' /tmp/rqc.txt
+          grep -q 'synthetic/impulse' /tmp/rqc.txt
+          grep -qE 'search       11 clip ratio' /tmp/rqc.txt
+          # The calibrated search has to actually clip: an activation weighting
+          # that changed nothing would be a calibration set nobody read.
+          python3 - <<'PY_CLIP'
+          import re
+          t = open('/tmp/rqc.txt').read()
+          n = int(re.search(r'(\d+) group\(s\) chose something other than 1.0', t).group(1))
+          assert n > 0, "the calibrated search never clipped"
+          print(f"{n} groups clipped under the activation-weighted objective")
+          PY_CLIP
+          # And the record answers §05.5's question by field lookup.
+          "$OMNI" dump /tmp/rq-cal.omni --provenance | tee /tmp/rqprov.txt
+          grep -q 'omni.prov/quantization' /tmp/rqprov.txt
+          grep -q '"dataset": "synthetic/impulse"' /tmp/rqprov.txt
+          grep -q '"samples": 128' /tmp/rqprov.txt
+          grep -q 'objective' /tmp/rqprov.txt
+          # A run without one says so instead of leaving a field that looks like
+          # data and is not (I1).
+          "$OMNI" dump /tmp/rq.omni --provenance | tee /tmp/rqprov2.txt
+          grep -q 'nothing was invented' /tmp/rqprov2.txt
+          test "$(grep -c '"calibration"' /tmp/rqprov2.txt)" = 0
+
+          expect() {
+            local want=$1; shift
+            local got=0
+            "$@" >/dev/null 2>&1 || got=$?
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, expected $want"; exit 1
+            fi
+          }
+          # A method this build does not implement is refused by name rather
+          # than approximated by the one it does.
+          expect 2 "$OMNI" convert /tmp/rq-src.omni --requantize gptq:4:128 -o /tmp/no.omni
+          "$OMNI" convert /tmp/rq-src.omni --requantize gptq:4:128 -o /tmp/no.omni 2>&1 \
+            | grep -q 'closed'
+          echo "requantization is a search with a record of which one"
+
       - name: A container survives being taken apart and put back together
         run: |
           OMNI=$PWD/reference/target/release/omni

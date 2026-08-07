@@ -93,7 +93,8 @@ Deliverables:
 - Sparsity schemes.
 - `omni-import-safetensors` ✅, `-pytorch` ✅, `-hf-repo` ✅, `-peft` ✅, `-gptq` ✅, `-awq` ✅, `-gguf` ✅.
 - `omni-export-safetensors` ✅, `-gptq` ✅, `-awq` ✅, `-gguf` ✅.
-- `omni delta`, `omni adapter`, `omni convert`.
+- `omni delta` ✅, `omni adapter` ✅, `omni convert` ✅ (`--cast` and
+  `--requantize`, the latter with §05.5's provenance).
 - Conformance corpus: `numeric/` ✅, `roundtrip/` ✅, `valid/features` ✅.
 
 **Gate 1:** lossless round-trip for safetensors, GGUF, GPTQ, AWQ, PEFT, verified
@@ -106,7 +107,12 @@ be made bit-exact, §05.2.4 is wrong and gets revised.*
 algebra, the layouts, the expression algebra with all three of §04.7.4's
 refinements — range pushdown, elementwise fusion, and a result cache keyed by the
 §04.7.5 expression identity — the sparsity and
-quantization catalogues, `omni delta` and `omni adapter`, and — as of the codec
+quantization catalogues, `omni delta`, `omni adapter` and `omni convert` — whose
+`--requantize` is now a search rather than a refusal, with the round-to-nearest
+baseline that needs no data and a clip search that weights its objective by a
+calibration set's activation magnitudes, both recording §05.5's provenance so
+"which calibration set produced this?" is a field lookup and "none" is an answer
+rather than an empty field — and — as of the codec
 work — `zstd` in both directions, checked against libzstd on every push. Fusion
 and caching are the two the deliverable named and the code did not have; they are
 switchable (`omni cat --no-fuse`, `--cache SIZE`) precisely because they are

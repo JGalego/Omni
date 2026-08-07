@@ -233,15 +233,21 @@ VERBS:
                               Sign a manifest and embed the attestation
     sign    --verify <file> --key <pubkey-hex>[,<hex>…] [--require any|all|k:N]
                               V7: authenticity against a trust policy
-    convert <in.omni> --cast DTYPE [--except GLOB,GLOB] [--verify]
-                      -o <out.omni>
-                              Cast every tensor to another dtype, except the
-                              ones named, measuring the error it introduces and
-                              recording the recipe. Globs are §08.3's selectors,
-                              where `*` does not cross a `.` and `**` does.
-                              --verify re-reads the result and compares.
-                              --requantize is refused: it needs a calibration
-                              set (§05.5), not a flag
+    convert <in.omni> --cast DTYPE | --requantize SPEC
+                      [--calib <acts.safetensors>] [--except GLOB,GLOB]
+                      [--verify] -o <out.omni>
+                              Cast every tensor to another dtype, or requantize
+                              them, except the ones named — measuring the error
+                              it introduces and recording the recipe. Globs are
+                              §08.3's selectors, where `*` does not cross a `.`
+                              and `**` does. --verify re-reads the result and
+                              compares. SPEC is <affine|sym>:<bits>:<group>; a
+                              weight becomes a `dequantize` expression over its
+                              indices, so it costs the indices plus the scales
+                              rather than a second copy. --calib supplies
+                              per-input-channel activation magnitudes and turns
+                              the clip search into a calibrated one, recorded in
+                              §05.5's provenance with the set's own digest
     delta   <base.omni> <tuned.omni> -o <delta.omni> [--max-err E]
                               Express one model as a delta over another (§08.6)
     adapter make  <base.omni> -o <lora.omni> [--rank R] [--alpha A]
@@ -7409,15 +7415,357 @@ fn cmd_sign(args: &[String]) -> R {
 /// expressions over the base's chunk objects, which live in the base container.
 /// That is what makes a delta small, and `omni verify` reports it as incomplete
 /// rather than invalid.
-/// `omni convert` — a model-to-model transformation, and the only one this
-/// build does without asking for data it does not have.
+/// `omni convert --requantize` — §05.5's search, and the record that makes it
+/// answerable.
+///
+/// The result is not a copy of the model at a lower precision. Each weight
+/// becomes a `dequantize` expression over its own indices (§05.2), so what the
+/// container stores is the indices and the per-group parameters — which is the
+/// whole argument of §05.7 for making quantization a transformation rather than
+/// a file type, checked here by the size the tool prints.
+fn cmd_requantize(args: &[String], input: &str, spec: &str) -> R {
+    use omni_core::expr::Expr;
+    use omni_core::pattern::glob_match;
+    use omni_core::requant::{provenance, quantize, Calibration, Spec, CLIP_GRID};
+
+    let spec = match Spec::parse(spec) {
+        Ok(s) => s,
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(2);
+        }
+    };
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let except: Vec<&str> = flag(args, "--except")
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let c = Container::open(std::fs::read(input)?)?;
+    let hash = c.header.hash;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let table = tensor_table(&c)?;
+    let manifest = c.root()?;
+
+    // The calibration set, if there is one: a safetensors file whose tensors
+    // are named after the model's and hold the mean absolute activation of each
+    // input channel. Reusing a format that exists means the file has a digest
+    // §05.5 can record and a reader that already works.
+    let calib = match flag(args, "--calib") {
+        Some(path) => {
+            let bytes = std::fs::read(path)?;
+            let f = omni_core::safetensors::File::parse(&bytes)?;
+            let mut channels = Vec::new();
+            for e in &f.entries {
+                let raw = f.tensor(e);
+                let mut v = Vec::with_capacity(e.numel() as usize);
+                for i in 0..e.numel() {
+                    v.push(e.dtype.decode(raw, i).unwrap_or(0.0).abs());
+                }
+                channels.push((e.name.clone(), v));
+            }
+            let samples = f
+                .metadata
+                .iter()
+                .find(|(k, _)| k == "samples")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(0);
+            Some(Calibration {
+                dataset: f
+                    .metadata
+                    .iter()
+                    .find(|(k, _)| k == "dataset")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| path.to_string()),
+                digest: hash.digest(&bytes),
+                samples,
+                channels,
+            })
+        }
+        None => None,
+    };
+    // The grid is the search. With no calibration the objective is unweighted,
+    // and the module docs record what that does and does not buy.
+    let grid: &[f64] = if calib.is_some() { CLIP_GRID } else { &[1.0] };
+    let method = if calib.is_some() { "clip" } else { "rtn" };
+
+    let name = flag(args, "--name")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}-{}", stem(input), spec.label()));
+    let mut b = ModelBuilder::new(name).hash(hash);
+    let mut names: Vec<String> = table
+        .order
+        .iter()
+        .filter(|n| table.tensors.contains_key(*n))
+        .cloned()
+        .collect();
+    for n in table.tensors.keys() {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
+
+    let (mut done, mut kept, mut before, mut after) = (0usize, 0usize, 0u64, 0u64);
+    let (mut worst_abs, mut worst_rel) = (0.0f64, 0.0f64);
+    let (mut worst_name, mut searched, mut clipped, mut calibrated) =
+        (String::new(), 0usize, 0u64, 0usize);
+    let mut derived: Vec<(String, TensorDesc)> = Vec::new();
+    for tname in &names {
+        let r = &table.tensors[tname];
+        let desc = TensorDesc::load(&ctx, r)?;
+        let shape = omni_core::expr::concrete(&desc.shape);
+        let quantizable = shape.as_ref().is_some_and(|s| !s.is_empty())
+            && !except.iter().any(|g| glob_match(g, tname))
+            // A tensor that is already integers is not one to quantize again,
+            // and a scale is machinery rather than a weight.
+            && matches!(desc.dtype, DType::Float(_));
+        let Some(shape) = shape.filter(|_| quantizable) else {
+            kept += 1;
+            if let Some(s) = omni_core::expr::concrete(&desc.shape) {
+                before += stored_of(&desc, &s);
+                after += stored_of(&desc, &s);
+            }
+            carry_tensor(&mut b, &c, tname, &desc, r, hash)?;
+            continue;
+        };
+        let t = desc.value.eval(&ctx)?;
+        let acts = calib.as_ref().and_then(|c| c.get(tname));
+        if acts.is_some() {
+            calibrated += 1;
+        }
+        let q = match quantize(&t.data, &shape, &spec, acts, grid, &DType::F32, &desc.dtype) {
+            Ok(q) => q,
+            // A tensor this scheme cannot tile is kept rather than reshaped
+            // into one it can: a ragged last group is a different scheme.
+            Err(e) => {
+                prr!("omni: `{tname}` kept as it is — {e}\n");
+                kept += 1;
+                before += stored_of(&desc, &shape);
+                after += stored_of(&desc, &shape);
+                carry_tensor(&mut b, &c, tname, &desc, r, hash)?;
+                continue;
+            }
+        };
+        searched = searched.max(q.searched);
+        clipped += q.clipped;
+        if q.max_abs_error > worst_abs {
+            worst_abs = q.max_abs_error;
+            worst_name = tname.clone();
+        }
+        worst_rel = worst_rel.max(q.rel_error);
+
+        // The indices and the per-group parameters, stored; the weight itself
+        // is an expression over them and costs nothing (§04.1).
+        let idx_dtype = spec.index_dtype();
+        let mut packed = vec![0u8; idx_dtype.packed_bytes(q.q.len() as u64) as usize];
+        for (i, v) in q.q.iter().enumerate() {
+            idx_dtype.encode(&mut packed, i as u64, *v, omni_core::Round::Rne);
+        }
+        let grid_shape = [q.rows, q.groups];
+        let q_expr = b.literal(&packed, idx_dtype.clone(), &shape, Layout::default());
+        let mut scale_bytes = vec![0u8; DType::F32.packed_bytes(q.scale.len() as u64) as usize];
+        for (i, v) in q.scale.iter().enumerate() {
+            DType::F32.encode(&mut scale_bytes, i as u64, *v, omni_core::Round::Rne);
+        }
+        let scale = b.literal(&scale_bytes, DType::F32, &grid_shape, Layout::default());
+        let mut block = vec![Value::U(1); shape.len()];
+        let last = block.len() - 1;
+        block[last] = Value::U(spec.group.min(*shape.last().unwrap()));
+        let mut scheme = vec![
+            (
+                "scheme",
+                Value::text(if q.zero.is_empty() { "sym" } else { "affine" }),
+            ),
+            ("formula", Value::text(spec.formula.id())),
+            ("out", desc.dtype.to_value()),
+            ("axis", Value::U(shape.len() as u64 - 1)),
+            ("block", Value::Array(block)),
+            ("scale", scale.to_value()),
+        ];
+        if !q.zero.is_empty() {
+            let mut zb = vec![0u8; idx_dtype.packed_bytes(q.zero.len() as u64) as usize];
+            for (i, v) in q.zero.iter().enumerate() {
+                idx_dtype.encode(&mut zb, i as u64, *v, omni_core::Round::Rne);
+            }
+            let zero = b.literal(&zb, idx_dtype.clone(), &grid_shape, Layout::default());
+            scheme.push(("zero", zero.to_value()));
+            after += zb.len() as u64;
+        }
+        after += packed.len() as u64 + scale_bytes.len() as u64;
+        before += stored_of(&desc, &shape);
+        done += 1;
+
+        let value = Expr::Dequantize {
+            x: Box::new(q_expr),
+            scheme: Value::map(scheme),
+        };
+        derived.push((
+            tname.clone(),
+            TensorDesc {
+                shape: omni_core::expr::dims(&shape),
+                dtype: desc.dtype.clone(),
+                layout: Layout::default(),
+                value,
+                semantic: desc.semantic.clone(),
+                role: desc.role.clone(),
+                axes: desc.axes.clone(),
+                device_hint: None,
+                materialize: omni_core::tensor::Materialize::Lazy,
+                stats: None,
+                digest_materialized: None,
+            },
+        ));
+    }
+    for (n, d) in derived {
+        b = b.derived(n, d);
+    }
+
+    // §05.5, in full: what the method was, what it searched, and which data —
+    // or, honestly, that there was none.
+    b = b.asset(
+        "provenance",
+        otype::PROVENANCE,
+        provenance(
+            &spec,
+            method,
+            calib.as_ref(),
+            grid,
+            done,
+            worst_abs,
+            worst_rel,
+            &c.header.root_digest,
+        ),
+    );
+    if let Some(arch) = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+        .and_then(|d| c.get_value(&d).ok())
+        .and_then(|m| m.get("arch").cloned())
+    {
+        b.extra.push(("arch".into(), arch));
+    }
+
+    let (objects, root) = b.build();
+    let bytes = pack(
+        &objects,
+        &root,
+        &PackOptions {
+            hash,
+            log2_align: c.header.log2_align,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &bytes)?;
+
+    pr!("requantized {input} -> {out}");
+    pr!(
+        "  scheme       {} ({} bits, groups of {})",
+        spec.label(),
+        spec.bits,
+        spec.group
+    );
+    pr!("  method       {method}");
+    match &calib {
+        Some(cal) => {
+            pr!(
+                "  calibration  {} — {} tensor(s), {} sample(s), {}",
+                cal.dataset,
+                commas(cal.channels.len() as u64),
+                commas(cal.samples),
+                short(hash, &cal.digest)
+            );
+            pr!(
+                "  weighted     {} tensor(s) had activations; the rest searched \
+unweighted",
+                commas(calibrated as u64)
+            );
+        }
+        // Said rather than left blank: §05.5's question has an answer here, and
+        // the answer is "none".
+        None => pr!(
+            "  calibration  none — the scales come from the weights alone, so \
+nothing was invented"
+        ),
+    }
+    pr!(
+        "  quantized    {} tensor(s), {} kept",
+        commas(done as u64),
+        commas(kept as u64)
+    );
+    if searched > 1 {
+        pr!(
+            "  search       {searched} clip ratio(s) per group; {} group(s) chose \
+something other than 1.0",
+            commas(clipped)
+        );
+    }
+    if done > 0 {
+        pr!("  worst error  {worst_abs:.3e} absolute in `{worst_name}`, {worst_rel:.3e} relative");
+    }
+    pr!(
+        "  tensor bytes {} -> {} ({:.1} %)",
+        human(before),
+        human(after),
+        100.0 * after as f64 / before.max(1) as f64
+    );
+    pr!("  recipe       attached as a Provenance object (§05.5)");
+
+    if args.iter().any(|a| a == "--verify") {
+        // §05.6 rule 3: re-materialize and compare, and refuse to claim a
+        // conversion this build cannot read back.
+        let fresh = Container::open(bytes)?;
+        let fstore = Borrowed(&fresh);
+        let fctx = Ctx::new(&fstore);
+        let ftable = tensor_table(&fresh)?;
+        let mut checked = 0usize;
+        for tname in &names {
+            let Some(r) = ftable.tensors.get(tname) else {
+                continue;
+            };
+            let d = TensorDesc::load(&fctx, r)?;
+            let got = d.value.eval(&fctx)?;
+            let want = TensorDesc::load(&ctx, &table.tensors[tname])?
+                .value
+                .eval(&ctx)?;
+            for (a, w) in got.data.iter().zip(&want.data) {
+                if (a - w).abs() > worst_abs * 1.000_001 + 1e-9 {
+                    prr!(
+                        "omni: `{tname}` reads back {a} where the source was {w}, \
+which is outside the error this conversion reported\n"
+                    );
+                    return Ok(1);
+                }
+            }
+            checked += 1;
+        }
+        pr!(
+            "  verified     {} tensor(s) re-read and within the reported error",
+            commas(checked as u64)
+        );
+    }
+    Ok(0)
+}
+
+/// `omni convert` — a model-to-model transformation.
 ///
 /// §4 of `docs/design/cli.md` shows two: `--cast`, which is arithmetic, and
-/// `--requantize`, which is a *search* over a calibration set. The first is
-/// here. The second is refused by name with what it would need, because a
-/// quantizer without calibration data either invents the data or invents the
-/// scales, and §05.5 exists precisely so that "which calibration set produced
-/// this?" has an answer.
+/// `--requantize`, which is a search. `--requantize` was refused for a while
+/// with a reason that was half right — that quantizing is a measurement whose
+/// scales depend on activations — and that is true of GPTQ and AWQ and *not*
+/// true of round-to-nearest, whose scales come from the weights alone. Both are
+/// here now, and the difference between them is what §05.5's provenance
+/// records: a run with a calibration set names it by digest, and a run without
+/// one says so rather than leaving an empty field that looks like data.
 fn cmd_convert(args: &[String]) -> R {
     use omni_core::pattern::glob_match;
 
@@ -7426,15 +7774,7 @@ fn cmd_convert(args: &[String]) -> R {
         return Ok(2);
     };
     if let Some(spec) = flag(args, "--requantize") {
-        prr!(
-            "omni: --requantize {spec} needs a calibration set, and this build has \
-             none to offer it. Quantizing is a measurement (§05.5): the scales \
-             depend on activations, the activations depend on the data, and the \
-             container records which data it was — so a `--calib` this build \
-             invented would be recorded as provenance and be false. `omni \
-             convert --cast` is the transformation that needs no data\n"
-        );
-        return Ok(2);
+        return cmd_requantize(args, input, spec);
     }
     let (Some(target), Some(out)) = (
         flag(args, "--cast"),
