@@ -29,10 +29,15 @@
 //! * `synthesize` (§07.5): a weights-only transformer becomes self-describing
 //!   from its `arch.params` alone.
 //!
-//! What is not: WASM `shape_fn`/`verify_fn`/`ref_impl` execution (§11.6 — that
-//! is the plugin host, and it is reported unimplemented rather than skipped),
-//! machine-level graphs, and autodiff, which §07.10 puts outside the IR on
-//! purpose.
+//! * WASM `shape_fn` and `verify_fn` execution (§07.4.2): a dialect this build
+//!   has never heard of is *decided* rather than indeterminate when the model
+//!   ships its semantics, which is §07.2's key move applied to verification.
+//!   The host is [`crate::plugin::Dialects`]; the ABI is in §07.4.2.
+//!
+//! What is not: `ref_impl` execution — the interpreter runs the ops it knows and
+//! refuses the rest by name rather than falling back to a shipped reference
+//! implementation — machine-level graphs, and autodiff, which §07.10 puts
+//! outside the IR on purpose.
 
 use crate::cbor::Value;
 use crate::container::Digest;
@@ -1769,10 +1774,16 @@ pub fn op_spec(ns: &str, name: &str) -> Option<&'static OpSpec> {
 
 /// A `DialectRef` object (§07.4.2) for one of the dialects above.
 ///
-/// The WASM `shape_fn` / `verify_fn` / `ref_impl` slots are deliberately absent
-/// rather than empty: this build has no plugin host, and a `DialectRef` that
-/// claimed to carry executable semantics it cannot run would be a lie a reader
-/// could not detect.
+/// The WASM `shape_fn` / `verify_fn` / `ref_impl` slots are absent rather than
+/// empty, and the reason has changed since this was first written. It used to
+/// be that there was no host to run them; there is one now
+/// ([`crate::plugin::Dialects`]), and it decides ops from dialects this build
+/// has never heard of. What these five dialects would put in those slots is
+/// *this build's own Rust shape functions, compiled to WebAssembly* — a second
+/// copy of the semantics, checked against the first by nothing. A `DialectRef`
+/// carrying that would be claiming an independent oracle it does not have. The
+/// slots are for dialects the working group did not write, which is what §07.4.2
+/// is for.
 pub fn dialect_ref_value(d: &Dialect) -> Value {
     let ops: Vec<(Value, Value)> = d
         .ops
@@ -2417,6 +2428,11 @@ pub struct Report {
     /// Unknown ops for which the model ships a lowering, so a runtime can
     /// proceed anyway (§07.2). These are *not* counted as unknown.
     pub recoverable: usize,
+    /// Ops from an unknown dialect that shipped their own §07.4.2 semantics, so
+    /// this verifier could decide them rather than shrug. Not counted as
+    /// unknown either, and for a stronger reason than a lowering: a lowering
+    /// says the op is *recoverable*, a shape function says it is *right*.
+    pub shipped: usize,
 }
 
 impl Report {
@@ -2441,6 +2457,28 @@ impl Report {
 /// a directory, a test.
 pub type TensorLookup<'a> = &'a dyn Fn(&str) -> Option<(Vec<u64>, DType)>;
 
+/// Semantics that arrived with the model: §07.4.2's `shape_fn` and `verify_fn`,
+/// for dialects this build has never heard of.
+///
+/// This is the other half of §07.2's key move. A shipped *lowering* makes an
+/// unknown op executable; a shipped *shape function* makes it **decidable** —
+/// a verifier can say the graph is well-typed, or say precisely where it is
+/// not, instead of shrugging. Without one, R-I05 reports indeterminate, which
+/// is correct and is also the weakest true statement available.
+pub trait DialectHost {
+    /// Whether this host has any §07.4.2 function for the op. Asked before
+    /// anything is run, so probing costs nothing.
+    fn provides(&self, op: &Op) -> bool;
+
+    /// The op's result types, `None` when this host has no shape function for
+    /// it, `Some(Err)` when the shipped function refused or failed.
+    fn shape(&self, op: &Op, ins: &[Type]) -> Option<Result<Vec<Type>, String>>;
+
+    /// A shipped `verify_fn`'s finding: `Some(Ok(()))` valid, `Some(Err(msg))`
+    /// invalid with a reason, `None` when there is no function.
+    fn check(&self, op: &Op, ins: &[Type]) -> Option<Result<(), String>>;
+}
+
 /// What a verifier may consult beyond the module itself.
 #[derive(Default)]
 pub struct Context<'a> {
@@ -2450,6 +2488,8 @@ pub struct Context<'a> {
     /// Rewrites the model ships, which decide whether an unknown op is
     /// recoverable (§07.2) rather than merely unknown.
     pub rewrites: &'a [Rewrite],
+    /// The WASM semantics the model ships for its own dialects (§07.4.2).
+    pub semantics: Option<&'a dyn DialectHost>,
 }
 
 /// Verifies a module.
@@ -2604,15 +2644,21 @@ fn verify_region(
                             ),
                         ));
                     }
-                    if cx.rewrites.iter().any(|w| w.matches_op(op)) {
+                    // §07.4.2: a dialect that ships its own semantics is
+                    // *decidable* even though this build has never heard of
+                    // it. That is checked below, next to R-I06, because what a
+                    // `shape_fn` decides is exactly the question R-I06 asks.
+                    if cx.semantics.is_some_and(|h| h.provides(op)) {
+                        r.shipped += 1;
+                    } else if cx.rewrites.iter().any(|w| w.matches_op(op)) {
                         r.recoverable += 1;
                     } else {
                         r.unknown += 1;
                         r.findings.push(unknown(
                             "R-I05",
                             format!(
-                                "@{fname}: dialect `{}` is not known to this build and no \
-                                 lowering for {} is shipped",
+                                "@{fname}: dialect `{}` is not known to this build, and it \
+                                 ships neither a §07.4.2 shape function nor a lowering for {}",
                                 op.dialect,
                                 op.qualified()
                             ),
@@ -2734,6 +2780,13 @@ fn verify_region(
                         format!("@{fname}: {} — {msg}", op.qualified()),
                     )),
                 }
+            } else if let Some(host) = cx.semantics {
+                // The op is from a dialect this build does not know, and the
+                // model shipped the semantics. Running them turns an
+                // indeterminate op into a decided one — which is §07.2's claim
+                // about unknown ops, applied to verification rather than to
+                // execution.
+                check_shipped(host, op, &input_types, fname, r);
             }
 
             // R-I10: a constant that names a tensor is a claim about that
@@ -2756,6 +2809,75 @@ fn verify_region(
             }
         }
         scope.truncate(outer);
+    }
+}
+
+/// Runs a dialect's shipped `shape_fn` and `verify_fn` over one op (§07.4.2).
+///
+/// The outcomes are the three §15.1 names, and which one applies is the model's
+/// to decide rather than this build's: a shape function that answers decides
+/// R-I06; a verify function that objects makes the op invalid; a function that
+/// refuses or traps leaves the op indeterminate, with the reason, because a
+/// plugin that will not answer is not the same as a graph that is wrong.
+fn check_shipped(host: &dyn DialectHost, op: &Op, ins: &[Type], fname: &str, r: &mut Report) {
+    match host.check(op, ins) {
+        Some(Ok(())) => r.checked += 1,
+        Some(Err(msg)) => {
+            r.findings.push(invalid(
+                "R-I05",
+                format!(
+                    "@{fname}: {}'s own verify function rejects it — {msg}",
+                    op.qualified()
+                ),
+            ));
+            return;
+        }
+        None => {}
+    }
+    match host.shape(op, ins) {
+        Some(Ok(ts)) => {
+            r.checked += 1;
+            if ts.len() != op.outputs.len() {
+                r.findings.push(invalid(
+                    "R-I06",
+                    format!(
+                        "@{fname}: {} declares {} result(s) and its shipped shape \
+                         function produces {}",
+                        op.qualified(),
+                        op.outputs.len(),
+                        ts.len()
+                    ),
+                ));
+                return;
+            }
+            for (k, (declared, computed)) in
+                op.outputs.iter().map(|(_, t)| t).zip(ts.iter()).enumerate()
+            {
+                if !types_agree(declared, computed) {
+                    r.findings.push(invalid(
+                        "R-I06",
+                        format!(
+                            "@{fname}: {} result {k} is declared {} and its shipped \
+                             shape function computes {}",
+                            op.qualified(),
+                            declared.print(),
+                            computed.print()
+                        ),
+                    ));
+                }
+            }
+        }
+        Some(Err(msg)) => {
+            r.unchecked += 1;
+            r.findings.push(unknown(
+                "R-I06",
+                format!(
+                    "@{fname}: {}'s shipped shape function did not answer — {msg}",
+                    op.qualified()
+                ),
+            ));
+        }
+        None => r.unchecked += 1,
     }
 }
 

@@ -2562,6 +2562,38 @@ jobs:
           expect 3 "$OMNI" graph /tmp/weights.omni
           echo "the graph verifies, lowers, and says what it cannot do"
 
+      # §07.4.2, end to end. §07.2's key move is usually stated about
+      # execution — an unknown op is recoverable if the model ships its
+      # lowering — and this is the same move applied to *verification*: a
+      # dialect this build has never heard of is decidable if the model ships
+      # its shape function. The difference is between "this reader cannot tell"
+      # and "this graph is well-typed", and both have to be demonstrated on the
+      # same container.
+      - name: A dialect nobody has heard of decides its own graph
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          "$OMNI" example --dialect /tmp/dial.omni >/dev/null
+
+          # The dialect is unknown to this build, and embedded in the container.
+          "$OMNI" graph /tmp/dial.omni --dialects | tee /tmp/dialects.txt
+          grep -q 'x.example        v1 unknown    embedded' /tmp/dialects.txt
+
+          # And the graph verifies anyway, because the model brought the
+          # semantics: nothing unknown, nothing unchecked, and the fuel the
+          # decision cost is reported rather than hidden.
+          "$OMNI" graph /tmp/dial.omni --verify | tee /tmp/dialv.txt
+          grep -q '0 unchecked, 0 unknown' /tmp/dialv.txt
+          grep -qE "decided      1 op\(s\) by the dialect's own" /tmp/dialv.txt
+          grep -qE 'in 1 call\(s\) and [0-9]+ fuel' /tmp/dialv.txt
+          "$OMNI" verify /tmp/dial.omni --level 6 | grep -q '^valid'
+
+          # The WebAssembly is an object in the container like any other, so it
+          # is signed with the model and deduplicated across every model that
+          # uses the dialect — which is the difference between "install this
+          # dialect" and "the model is self-describing".
+          "$OMNI" ls /tmp/dial.omni | grep -q 'DialectRef'
+          echo "an unknown dialect decided its own graph"
+
       # §10: resolution is a function of the model and the capability set, so a
       # CI job can answer "will this run on our fleet?" without the fleet.
       - name: Capability negotiation and planning

@@ -171,6 +171,49 @@ can validate and, if necessary, *execute* a 2026 custom op without the 2026
 toolchain, because WASM is a frozen, formally-specified instruction set with a
 deterministic profile.
 
+Without them, an op from an unknown dialect is **indeterminate** (§15.1), which
+is correct and is the weakest true statement a verifier can make. With them it is
+*decided*. That is §7.2's key move applied to verification rather than to
+execution, and it is the difference between "this reader cannot tell" and "this
+graph is well-typed".
+
+#### The calling convention
+
+`shape_fn` and `verify_fn` take the same four arguments and return the same
+three outcomes:
+
+```
+shape (in: i32, in_len: i32, out: i32, out_cap: i32) -> i32
+verify(in: i32, in_len: i32, out: i32, out_cap: i32) -> i32
+```
+
+`in` points at canonical OMNI-CBOR of
+
+```cbor-diag
+{ "op": <the Op, exactly as §7.3 encodes it>,
+  "in": [ <the operands' resolved §7.3.1 types> ] }
+```
+
+The op is passed whole rather than summarised, because a dialect's shape often
+depends on its attributes and a summary is a decision about which ones matter.
+
+| Return | `shape_fn` | `verify_fn` |
+|---|---|---|
+| `n > 0` | `n` bytes of CBOR `[<type>…]` written at `out`: the result types | `n` bytes of UTF-8 at `out`: **invalid**, and this is the reason |
+| `0` | the op produces no results | **valid** |
+| `n < 0` | the function **declines to decide**: indeterminate | the same |
+
+The host allocates `out` through the module's own §11.6 `alloc`, so a module
+never assumes a memory layout. A module that traps, exhausts its fuel, or
+returns a length past `out_cap` is *indeterminate* as well, with the reason —
+never invalid. **A plugin that will not answer says nothing about the graph**,
+and reporting one as the other is precisely the conformance violation §15.1
+names.
+
+A `shape_fn` that answers decides R-I06 for that op: its result types are
+compared with the declared ones exactly as a built-in shape function's are. A
+`verify_fn` that objects makes the op **invalid**, in the dialect's own words.
+
 ## 7.5 Weights-only models
 
 A `Model` with `tensors` but no `graph` is legal and common (the safetensors

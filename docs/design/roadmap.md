@@ -181,7 +181,8 @@ importers are necessary for that work and are not a substitute for it.
 Deliverables:
 - OMNI-IR: parse, verify, print; `omni.core` + `omni.tensor` + `omni.nn` v1.
 - Dialect mechanism, op versioning, declarative rewrites, lowering.
-- `omni-plugin`: WASM host with the restricted profile, fuel metering.
+- `omni-plugin`: WASM host with the restricted profile, fuel metering ✅, and
+  §07.4.2's `shape_fn`/`verify_fn` execution ✅.
 - Tokenizer IR + conformance vectors + Jinja2 → OMNI-CT translator.
 - `omni graph synthesize` for registered families.
 - `omni-import-onnx` ✅, `-export-onnx` ✅.
@@ -209,7 +210,14 @@ OMNI-IR parses, verifies, prints and rewrites; `omni.core` is frozen and
 `graph synthesize` builds a graph from `arch.params` and `graph lower` applies
 the shipped lowerings. The tokenizer IR and OMNI-CT run their own conformance
 vectors. The WASM host of §11.6 exists and runs plugin expression ops under the
-restricted profile. A reference interpreter (`omni graph run`) executes all of
+restricted profile — and, as of §07.4.2's calling convention being written down,
+the `shape_fn` and `verify_fn` a dialect ships with the model. That closes the
+gap between §07.2's claim about *execution* (an unknown op is recoverable if its
+lowering is shipped) and the same claim about *verification*: a dialect this
+build has never heard of is now decided rather than indeterminate when the model
+brought its semantics. What is still absent is `ref_impl` execution — the
+interpreter refuses an op it does not know by name rather than falling back to a
+shipped reference implementation. A reference interpreter (`omni graph run`) executes all of
 `omni.core` including its control flow, all 31 `omni.tensor` ops with a general
 `einsum`, `omni.quant`'s four, and **all** of `omni.nn` — `ssm_scan` included,
 which was refused for a draft because §07 named it without defining it. §07.8.1

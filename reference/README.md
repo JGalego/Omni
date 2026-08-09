@@ -469,6 +469,17 @@ implemented:
   integers past 2^53, and refusal of trailing commas, comments, `NaN`, lone
   surrogates and duplicate keys — a permissive reader is how two implementations
   come to disagree about one file
+- §07.4.2 **shipped dialect semantics**: a `DialectRef` may carry WebAssembly
+  that computes an op's result types and checks its wellformedness, and this
+  build runs it in the §11.6 host. That is §07.2's key move applied to
+  verification rather than to execution — a dialect nobody has heard of is
+  *decided* rather than indeterminate, and `omni example --dialect` builds a
+  container CI checks it on. The three outcomes are §15.1's three, and which one
+  applies is the dialect's to say: a shape function that answers decides R-I06, a
+  verify function that objects makes the op invalid in the dialect's own words,
+  and a function that declines, traps or runs out of fuel leaves it
+  indeterminate — because a plugin that will not answer says nothing about the
+  graph
 - §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
   reached through `omni sign --verify`
 

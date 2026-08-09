@@ -495,60 +495,7 @@ impl crate::expr::PluginRunner for Host<'_> {
 /// attributes it declares; this one takes numbers as numbers and says so.
 pub fn example_module() -> Vec<u8> {
     let mut b = Enc::default();
-    // A bump allocator over a fixed arena, which is all a pure function needs.
-    // `alloc(n)`: ptr = *0; *0 = ptr + ((n + 7) & ~7); return ptr.
-    let t_i32_i32 = b.ty(&[I32], &[I32]);
-    let arena_start = 1024i32;
-    let mut alloc = Vec::new();
-    // if *0 == 0 { *0 = arena_start }
-    alloc.extend(i32const(0));
-    alloc.extend([0x28, 0x02, 0x00]); // i32.load
-    alloc.extend([0x45]); // i32.eqz
-    alloc.extend([0x04, 0x40]); // if
-    alloc.extend(i32const(0));
-    alloc.extend(i32const(arena_start));
-    alloc.extend([0x36, 0x02, 0x00]); // i32.store
-    alloc.push(0x0b);
-    // ptr = *0; end = ptr + ((n + 7) & -8); *0 = end
-    alloc.extend(i32const(0));
-    alloc.extend([0x28, 0x02, 0x00]);
-    alloc.extend([0x21, 1]);
-    alloc.extend([0x20, 1]);
-    alloc.extend([0x20, 0]);
-    alloc.extend(i32const(7));
-    alloc.extend([0x6a]);
-    alloc.extend(i32const(-8));
-    alloc.extend([0x71, 0x6a]); // and, add
-    alloc.extend([0x21, 2]);
-    alloc.extend(i32const(0));
-    alloc.extend([0x20, 2]);
-    alloc.extend([0x36, 0x02, 0x00]);
-    // Grow linear memory until the arena fits. A plugin that wants more than the
-    // host's cap gets -1 from memory.grow and returns null, which the host
-    // reports rather than writing past the end of anything.
-    alloc.extend([0x02, 0x40]); // block
-    alloc.extend([0x03, 0x40]); // loop
-    alloc.extend([0x20, 2]);
-    alloc.extend([0x3f, 0x00]); // memory.size
-    alloc.extend(i32const(65536));
-    alloc.extend([0x6c]); // i32.mul
-    alloc.extend([0x4c]); // i32.le_s
-    alloc.extend([0x0d, 0x01]); // br_if 1 — the arena fits
-    alloc.extend(i32const(1));
-    alloc.extend([0x40, 0x00]); // memory.grow
-    alloc.extend([0x21, 3]);
-    alloc.extend([0x20, 3]);
-    alloc.extend(i32const(-1));
-    alloc.extend([0x46]); // i32.eq
-    alloc.extend([0x04, 0x40]); // if the cap was hit
-    alloc.extend(i32const(0));
-    alloc.extend([0x0f]); // return null
-    alloc.push(0x0b);
-    alloc.extend([0x0c, 0x00]); // br 0
-    alloc.push(0x0b); // end loop
-    alloc.push(0x0b); // end block
-    alloc.extend([0x20, 1]);
-    b.func("alloc", t_i32_i32, &[I32, I32, I32], alloc);
+    bump_allocator(&mut b);
 
     // The op. Signature: (argc, argv, attrs, attrs_len, out, out_len) -> i32.
     let t_op = b.ty(&[I32, I32, I32, I32, I32, I32], &[I32]);
@@ -606,6 +553,109 @@ pub fn example_module() -> Vec<u8> {
     op.extend(i32const(0));
     b.func("scale", t_op, &[I32, I32, F64], op);
     b.memory(2);
+    b.finish()
+}
+
+/// §11.6's `alloc`: a bump allocator over a fixed arena, which is all a pure
+/// function needs and what every module the host calls has to export, since the
+/// host writes its arguments into the module's own memory rather than assuming
+/// a layout.
+fn bump_allocator(b: &mut Enc) {
+    let t_i32_i32 = b.ty(&[I32], &[I32]);
+    let arena_start = 1024i32;
+    let mut alloc = Vec::new();
+    // if *0 == 0 { *0 = arena_start }
+    alloc.extend(i32const(0));
+    alloc.extend([0x28, 0x02, 0x00]); // i32.load
+    alloc.extend([0x45]); // i32.eqz
+    alloc.extend([0x04, 0x40]); // if
+    alloc.extend(i32const(0));
+    alloc.extend(i32const(arena_start));
+    alloc.extend([0x36, 0x02, 0x00]); // i32.store
+    alloc.push(0x0b);
+    // ptr = *0; end = ptr + ((n + 7) & -8); *0 = end
+    alloc.extend(i32const(0));
+    alloc.extend([0x28, 0x02, 0x00]);
+    alloc.extend([0x21, 1]);
+    alloc.extend([0x20, 1]);
+    alloc.extend([0x20, 0]);
+    alloc.extend(i32const(7));
+    alloc.extend([0x6a]);
+    alloc.extend(i32const(-8));
+    alloc.extend([0x71, 0x6a]); // and, add
+    alloc.extend([0x21, 2]);
+    alloc.extend(i32const(0));
+    alloc.extend([0x20, 2]);
+    alloc.extend([0x36, 0x02, 0x00]);
+    // Grow linear memory until the arena fits. A plugin that wants more than the
+    // host's cap gets -1 from memory.grow and returns null, which the host
+    // reports rather than writing past the end of anything.
+    alloc.extend([0x02, 0x40]); // block
+    alloc.extend([0x03, 0x40]); // loop
+    alloc.extend([0x20, 2]);
+    alloc.extend([0x3f, 0x00]); // memory.size
+    alloc.extend(i32const(65536));
+    alloc.extend([0x6c]); // i32.mul
+    alloc.extend([0x4c]); // i32.le_s
+    alloc.extend([0x0d, 0x01]); // br_if 1 — the arena fits
+    alloc.extend(i32const(1));
+    alloc.extend([0x40, 0x00]); // memory.grow
+    alloc.extend([0x21, 3]);
+    alloc.extend([0x20, 3]);
+    alloc.extend(i32const(-1));
+    alloc.extend([0x46]); // i32.eq
+    alloc.extend([0x04, 0x40]); // if the cap was hit
+    alloc.extend(i32const(0));
+    alloc.extend([0x0f]); // return null
+    alloc.push(0x0b);
+    alloc.extend([0x0c, 0x00]); // br 0
+    alloc.push(0x0b); // end loop
+    alloc.push(0x0b); // end block
+    alloc.extend([0x20, 1]);
+    b.func("alloc", t_i32_i32, &[I32, I32, I32], alloc);
+}
+
+/// A §07.4.2 function that answers with a fixed set of bytes.
+///
+/// It exists for the tests and for the CLI's worked example, and the reason it
+/// is a *constant* answer is that the interesting part is the plumbing rather
+/// than the arithmetic: a dialect that ships its semantics has to be loadable
+/// from the container, runnable under the §11.6 limits, and believed when it
+/// answers — and a shape function that decodes CBOR in hand-written
+/// WebAssembly would be testing the decoder instead.
+///
+/// `answer` is what the function writes at `out`; the return value is its
+/// length, or `code` when that is negative, which is how a function declines.
+pub fn constant_answer_module(export: &str, answer: &[u8], code: i32) -> Vec<u8> {
+    let mut b = Enc::default();
+    bump_allocator(&mut b);
+    // (in, in_len, out, out_cap) -> i32
+    let t = b.ty(&[I32, I32, I32, I32], &[I32]);
+    let mut f = Vec::new();
+    if code < 0 {
+        f.extend(i32const(code));
+        f.extend([0x0f]);
+    } else {
+        // Refuse rather than overrun: a function that writes past the buffer
+        // the host gave it is the one bug this ABI can actually have.
+        f.extend([0x20, 3]);
+        f.extend(i32const(answer.len() as i32));
+        f.extend([0x48]); // i32.lt_s
+        f.extend([0x04, 0x40]);
+        f.extend(i32const(-2));
+        f.extend([0x0f]);
+        f.push(0x0b);
+        for (i, byte) in answer.iter().enumerate() {
+            f.extend([0x20, 2]); // out
+            f.extend(i32const(i as i32));
+            f.extend([0x6a]); // i32.add
+            f.extend(i32const(*byte as i32));
+            f.extend([0x3a, 0x00, 0x00]); // i32.store8
+        }
+        f.extend(i32const(answer.len() as i32));
+    }
+    b.func(export, t, &[], f);
+    b.memory(1);
     b.finish()
 }
 
@@ -838,5 +888,509 @@ mod tests {
             .run("org.acme/scale", "scale", 1, &attrs, &[x, f], 4096)
             .unwrap_err();
         assert!(err.contains("fuel"), "{err}");
+    }
+}
+
+// ---------------------------------------------- §07.4.2 dialect semantics --
+
+/// The two §07.4.2 functions a dialect may ship.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialectFn {
+    /// Computes an op's result types.
+    Shape,
+    /// Decides whether an op is well formed beyond its types.
+    Verify,
+}
+
+impl DialectFn {
+    fn key(self) -> &'static str {
+        match self {
+            DialectFn::Shape => "shape_fn",
+            DialectFn::Verify => "verify_fn",
+        }
+    }
+}
+
+/// §07.4.2's shipped semantics, run in the §11.6 host.
+///
+/// A dialect this build has never heard of is *indeterminate* by default, and
+/// that is the weakest true statement a verifier can make. §07.4.2 offers a
+/// stronger one: the `DialectRef` may carry WebAssembly that computes an op's
+/// result types and checks its wellformedness, so a reader can decide a graph
+/// written against a dialect invented after it was built.
+///
+/// ## The calling convention
+///
+/// §07.4.2 names the slots and leaves their ABI to the registry, the way §11.6
+/// leaves the expression entry point to it. This is the smallest thing that
+/// works, and it is the same shape for both functions:
+///
+/// ```text
+/// shape (in: i32, in_len: i32, out: i32, out_cap: i32) -> i32
+/// verify(in: i32, in_len: i32, out: i32, out_cap: i32) -> i32
+/// ```
+///
+/// `in` points at canonical OMNI-CBOR of `{"op": <the op>, "in": [<types>]}` —
+/// the op exactly as §07.3 encodes it, with the operand types resolved. The
+/// return value says what happened, and the three outcomes are §15.1's three:
+///
+/// | Return | `shape` | `verify` |
+/// |---|---|---|
+/// | `n > 0` | `n` bytes of CBOR `[<type>…]` at `out` | `n` bytes of a UTF-8 reason: **invalid** |
+/// | `0` | no results | **valid** |
+/// | `n < 0` | the function declines to decide: **indeterminate** | same |
+///
+/// A module that traps, runs out of fuel or writes past `out_cap` is
+/// indeterminate too, with the reason. What it is not is invalid: a plugin that
+/// will not answer says nothing about the graph.
+pub struct Dialects<'a> {
+    /// `(namespace, op name or `*`, which function, module, export)`.
+    fns: Vec<(String, String, DialectFn, Module, String)>,
+    limits: Limits,
+    objects: &'a dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    /// Fuel spent and modules run, so a verifier can report what deciding cost.
+    pub calls: std::cell::Cell<u64>,
+    pub fuel: std::cell::Cell<u64>,
+}
+
+impl<'a> Dialects<'a> {
+    pub fn new(objects: &'a dyn Fn(&[u8; 32]) -> Option<Vec<u8>>) -> Dialects<'a> {
+        Dialects {
+            fns: Vec::new(),
+            limits: Limits::default(),
+            objects,
+            calls: std::cell::Cell::new(0),
+            fuel: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn limits(mut self, l: Limits) -> Self {
+        self.limits = l;
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fns.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.fns.len()
+    }
+
+    /// Loads every `shape_fn` and `verify_fn` a `DialectRef` object declares.
+    ///
+    /// Returns the problems rather than failing: a dialect whose module is
+    /// missing is one this reader cannot use, and that is a reason to fall back
+    /// to *indeterminate* rather than to refuse the container.
+    pub fn load(&mut self, dialect_ref: &Value) -> Vec<String> {
+        let mut problems = Vec::new();
+        let Some(ns) = dialect_ref.get("ns").and_then(|v| v.as_str()) else {
+            return vec!["a DialectRef with no `ns`".into()];
+        };
+        let mut add = |op: &str, kind: DialectFn, spec: &Value, problems: &mut Vec<String>| {
+            let (Some(w), Some(export)) = (
+                spec.get("wasm")
+                    .and_then(|v| crate::expr::parse_ref_value(v).ok()),
+                spec.get("export").and_then(|v| v.as_str()),
+            ) else {
+                problems.push(format!("`{ns}/{op}`'s {} names no module", kind.key()));
+                return;
+            };
+            let Some(bytes) = (self.objects)(&w.1) else {
+                problems.push(format!(
+                    "`{ns}/{op}`'s {} points at an object this container does not have",
+                    kind.key()
+                ));
+                return;
+            };
+            match Module::load(&bytes) {
+                Ok(m) => {
+                    self.fns
+                        .push((ns.to_string(), op.to_string(), kind, m, export.to_string()))
+                }
+                Err(e) => problems.push(format!("`{ns}/{op}`'s {}: {e}", kind.key())),
+            }
+        };
+        // Dialect-wide functions, then per-op ones. A per-op function wins,
+        // which is the order a reader would expect and the order they are
+        // searched in below.
+        for kind in [DialectFn::Shape, DialectFn::Verify] {
+            if let Some(spec) = dialect_ref.get(kind.key()) {
+                add("*", kind, spec, &mut problems);
+            }
+        }
+        if let Some(Value::Map(ops)) = dialect_ref.get("ops") {
+            for (name, spec) in ops {
+                let Some(name) = name.as_str() else { continue };
+                for kind in [DialectFn::Shape, DialectFn::Verify] {
+                    // Either directly on the op, or under its version key —
+                    // §07.4.2's example puts it under `v2`.
+                    let found = spec.get(kind.key()).or_else(|| {
+                        spec.get("versions")
+                            .and_then(|v| v.as_array())
+                            .and_then(|vs| vs.last())
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| spec.get(&format!("v{v}")))
+                            .and_then(|s| s.get(kind.key()))
+                    });
+                    if let Some(f) = found {
+                        add(name, kind, f, &mut problems);
+                    }
+                }
+            }
+        }
+        problems
+    }
+
+    fn find(
+        &self,
+        op: &crate::ir::Op,
+        kind: DialectFn,
+    ) -> Option<&(String, String, DialectFn, Module, String)> {
+        self.fns
+            .iter()
+            .find(|(ns, name, k, _, _)| *k == kind && ns == &op.dialect && name == &op.name)
+            .or_else(|| {
+                self.fns
+                    .iter()
+                    .find(|(ns, name, k, _, _)| *k == kind && ns == &op.dialect && name == "*")
+            })
+    }
+
+    /// The call itself: encode, run, read back.
+    fn call(
+        &self,
+        op: &crate::ir::Op,
+        ins: &[crate::ir::Type],
+        kind: DialectFn,
+    ) -> Option<Result<(i32, Vec<u8>), String>> {
+        let (_, _, _, module, export) = self.find(op, kind)?;
+        // The op as §07.3 encodes it, with its operand types resolved. Encoding
+        // the op itself rather than a summary means a shape function sees the
+        // attributes, which is where a dialect keeps the thing its shape
+        // depends on.
+        let input = Value::map(vec![
+            ("op", op.to_value()),
+            (
+                "in",
+                Value::Array(ins.iter().map(|t| t.to_value()).collect()),
+            ),
+        ])
+        .encode();
+        let env = Env {
+            objects: self.objects,
+            log: std::cell::RefCell::new(Vec::new()),
+        };
+        let run = || -> Result<(i32, Vec<u8>), String> {
+            let mut inst = Instance::new(module, &env, self.limits).map_err(|e| e.to_string())?;
+            let in_ptr = inst
+                .alloc(input.len().max(1) as u32)
+                .map_err(|e| e.to_string())?;
+            inst.write(in_ptr, &input).map_err(|e| e.to_string())?;
+            // A generous but bounded answer buffer: a type is small and a
+            // reason is a sentence.
+            let cap = 4096u32;
+            let out_ptr = inst.alloc(cap).map_err(|e| e.to_string())?;
+            let rc = inst
+                .call(
+                    export,
+                    &[
+                        crate::wasm::Value::I32(in_ptr as i32),
+                        crate::wasm::Value::I32(input.len() as i32),
+                        crate::wasm::Value::I32(out_ptr as i32),
+                        crate::wasm::Value::I32(cap as i32),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            self.calls.set(self.calls.get() + 1);
+            self.fuel.set(self.fuel.get() + inst.fuel_used());
+            let n = match rc.first() {
+                Some(crate::wasm::Value::I32(n)) => *n,
+                other => return Err(format!("the module returned {other:?}, not an i32")),
+            };
+            if n <= 0 {
+                return Ok((n, Vec::new()));
+            }
+            if n as u32 > cap {
+                return Err(format!(
+                    "the module says it wrote {n} bytes into a {cap}-byte buffer"
+                ));
+            }
+            let bytes = inst.read(out_ptr, n as usize).map_err(|e| e.to_string())?;
+            Ok((n, bytes))
+        };
+        Some(run())
+    }
+}
+
+impl crate::ir::DialectHost for Dialects<'_> {
+    fn provides(&self, op: &crate::ir::Op) -> bool {
+        self.find(op, DialectFn::Shape).is_some() || self.find(op, DialectFn::Verify).is_some()
+    }
+
+    fn shape(
+        &self,
+        op: &crate::ir::Op,
+        ins: &[crate::ir::Type],
+    ) -> Option<Result<Vec<crate::ir::Type>, String>> {
+        match self.call(op, ins, DialectFn::Shape)? {
+            Err(e) => Some(Err(e)),
+            Ok((n, _)) if n < 0 => Some(Err(format!("it declined, with code {n}"))),
+            Ok((_, bytes)) => {
+                let v = match crate::cbor::decode(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(format!("its answer is not canonical CBOR: {e}"))),
+                };
+                let Some(list) = v.as_array() else {
+                    return Some(Err("its answer is not an array of types".into()));
+                };
+                let mut out = Vec::with_capacity(list.len());
+                for t in list {
+                    match crate::ir::Type::from_value(t) {
+                        Ok(t) => out.push(t),
+                        Err(e) => {
+                            return Some(Err(format!("its answer is not a §07.3.1 type: {e}")))
+                        }
+                    }
+                }
+                Some(Ok(out))
+            }
+        }
+    }
+
+    fn check(&self, op: &crate::ir::Op, ins: &[crate::ir::Type]) -> Option<Result<(), String>> {
+        match self.call(op, ins, DialectFn::Verify)? {
+            Err(e) => Some(Err(e)),
+            Ok((0, _)) => Some(Ok(())),
+            Ok((n, _)) if n < 0 => Some(Err(format!("it declined, with code {n}"))),
+            Ok((_, bytes)) => Some(Err(String::from_utf8_lossy(&bytes).to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod dialect_tests {
+    use super::*;
+    use crate::dtype::DType;
+    use crate::expr::Dim;
+    use crate::ir::{self, Block, Function, Module as IrModule, Op, Region, Type};
+
+    fn ty(shape: &[u64]) -> Type {
+        Type::tensor(shape.iter().map(|d| Dim::N(*d)).collect(), DType::F32)
+    }
+
+    /// A `DialectRef` for `x.test` whose one op ships the two §07.4.2
+    /// functions, pointing at blobs the caller holds.
+    fn dialect_ref(shape: Option<[u8; 32]>, verify: Option<[u8; 32]>) -> Value {
+        let mut op = vec![("versions", Value::Array(vec![Value::U(1)]))];
+        if let Some(d) = shape {
+            op.push((
+                "shape_fn",
+                Value::map(vec![
+                    (
+                        "wasm",
+                        Value::Array(vec![
+                            Value::U(crate::container::otype::BLOB as u64),
+                            Value::Bytes(d.to_vec()),
+                        ]),
+                    ),
+                    ("export", Value::text("shape")),
+                ]),
+            ));
+        }
+        if let Some(d) = verify {
+            op.push((
+                "verify_fn",
+                Value::map(vec![
+                    (
+                        "wasm",
+                        Value::Array(vec![
+                            Value::U(crate::container::otype::BLOB as u64),
+                            Value::Bytes(d.to_vec()),
+                        ]),
+                    ),
+                    ("export", Value::text("verify")),
+                ]),
+            ));
+        }
+        Value::map(vec![
+            ("t", Value::text("omni.ir/dialect")),
+            ("v", Value::U(1)),
+            ("ns", Value::text("x.test")),
+            ("version", Value::U(1)),
+            (
+                "ops",
+                Value::Map(vec![(Value::text("thing"), Value::map(op))]),
+            ),
+        ])
+    }
+
+    /// A module using one op of a dialect this build has never heard of.
+    fn module_using(declared: Type) -> IrModule {
+        let mut m = IrModule::new(ir::Level::Primitive, "main");
+        m.dialects = vec![
+            ir::DialectUse {
+                ns: "omni.core".into(),
+                version: 1,
+                reference: None,
+            },
+            ir::DialectUse {
+                ns: "x.test".into(),
+                version: 1,
+                reference: None,
+            },
+        ];
+        m.functions.push((
+            "main".into(),
+            Function {
+                params: vec![("x".into(), ty(&[2, 3]))],
+                results: vec![declared.clone()],
+                attrs: Vec::new(),
+                body: Region {
+                    blocks: vec![Block {
+                        args: Vec::new(),
+                        ops: vec![
+                            Op::new("x.test", "thing", 1)
+                                .with_inputs(&[0])
+                                .with_output(1, declared),
+                            Op::new("omni.core", "return", 1).with_inputs(&[1]),
+                        ],
+                    }],
+                },
+                constraints: Vec::new(),
+            },
+        ));
+        m
+    }
+
+    /// The CBOR a shape function answers with: a list of §07.3.1 types.
+    fn answer(types: &[Type]) -> Vec<u8> {
+        Value::Array(types.iter().map(Type::to_value).collect()).encode()
+    }
+
+    #[test]
+    fn a_dialect_that_ships_its_shape_function_is_decided_rather_than_unknown() {
+        // §07.2's key move, applied to verification instead of execution: the
+        // reader has never heard of `x.test`, and can still say the graph is
+        // well-typed — because the model brought the semantics with it.
+        let wasm = constant_answer_module("shape", &answer(&[ty(&[2, 3])]), 0);
+        let digest = crate::HashAlgo::default().digest(&wasm);
+        let objects = |d: &[u8; 32]| (d == &digest).then(|| wasm.clone());
+        let mut host = Dialects::new(&objects);
+        assert!(host.load(&dialect_ref(Some(digest), None)).is_empty());
+        assert_eq!(host.len(), 1);
+
+        let m = module_using(ty(&[2, 3]));
+        // Without the semantics: indeterminate, which is correct and weak.
+        let bare = ir::verify(&m, &ir::Context::default());
+        assert_eq!(bare.unknown, 1);
+        assert!(bare.is_indeterminate());
+        assert!(bare.findings[0].message().contains("x.test"));
+
+        // With them: decided.
+        let cx = ir::Context {
+            semantics: Some(&host),
+            ..Default::default()
+        };
+        let r = ir::verify(&m, &cx);
+        assert!(r.is_valid(), "{:?}", r.findings);
+        assert_eq!(r.unknown, 0);
+        assert_eq!(r.shipped, 1);
+        assert!(host.calls.get() >= 1);
+        assert!(host.fuel.get() > 0, "a module that ran for no fuel");
+    }
+
+    #[test]
+    fn a_shipped_shape_function_can_say_the_graph_is_wrong() {
+        // The other half, and the half that makes it worth running: a dialect's
+        // own semantics disagreeing with the graph's declaration is R-I06, and
+        // R-I06 is *invalid* rather than indeterminate.
+        let wasm = constant_answer_module("shape", &answer(&[ty(&[2, 3])]), 0);
+        let digest = crate::HashAlgo::default().digest(&wasm);
+        let objects = |d: &[u8; 32]| (d == &digest).then(|| wasm.clone());
+        let mut host = Dialects::new(&objects);
+        host.load(&dialect_ref(Some(digest), None));
+
+        let m = module_using(ty(&[2, 4]));
+        let cx = ir::Context {
+            semantics: Some(&host),
+            ..Default::default()
+        };
+        let r = ir::verify(&m, &cx);
+        assert!(r.is_invalid(), "{:?}", r.findings);
+        let msg = r.findings[0].message().to_string();
+        assert!(msg.contains("shipped shape function"), "{msg}");
+        assert!(msg.contains("2×4") && msg.contains("2×3"), "{msg}");
+    }
+
+    #[test]
+    fn a_verify_function_that_objects_is_invalid_and_one_that_declines_is_not() {
+        let shape = constant_answer_module("shape", &answer(&[ty(&[2, 3])]), 0);
+        let sd = crate::HashAlgo::default().digest(&shape);
+
+        // A verify function that returns a reason: the op is invalid, and the
+        // reason is the dialect's own words.
+        let objected = constant_answer_module("verify", b"a thing needs an even width", 0);
+        let od = crate::HashAlgo::default().digest(&objected);
+        let objects = |d: &[u8; 32]| {
+            if d == &sd {
+                Some(shape.clone())
+            } else if d == &od {
+                Some(objected.clone())
+            } else {
+                None
+            }
+        };
+        let mut host = Dialects::new(&objects);
+        host.load(&dialect_ref(Some(sd), Some(od)));
+        let m = module_using(ty(&[2, 3]));
+        let r = ir::verify(
+            &m,
+            &ir::Context {
+                semantics: Some(&host),
+                ..Default::default()
+            },
+        );
+        assert!(r.is_invalid(), "{:?}", r.findings);
+        assert!(r.findings[0].message().contains("even width"));
+
+        // A function that declines: indeterminate. A plugin that will not
+        // answer says nothing about the graph, and reporting it as invalid
+        // would be §15.1's exact prohibition.
+        let declines = constant_answer_module("shape", &[], -1);
+        let dd = crate::HashAlgo::default().digest(&declines);
+        let objects2 = |d: &[u8; 32]| (d == &dd).then(|| declines.clone());
+        let mut host2 = Dialects::new(&objects2);
+        host2.load(&dialect_ref(Some(dd), None));
+        let r2 = ir::verify(
+            &m,
+            &ir::Context {
+                semantics: Some(&host2),
+                ..Default::default()
+            },
+        );
+        assert!(!r2.is_invalid(), "{:?}", r2.findings);
+        assert!(r2.is_indeterminate());
+        assert!(r2.findings[0].message().contains("did not answer"));
+    }
+
+    #[test]
+    fn a_missing_or_broken_module_is_a_problem_rather_than_a_failure() {
+        // A dialect whose module is not in the container is one this reader
+        // cannot use, which is a reason to fall back to indeterminate — not a
+        // reason to refuse the container.
+        let objects = |_: &[u8; 32]| None;
+        let mut host = Dialects::new(&objects);
+        let problems = host.load(&dialect_ref(Some([9u8; 32]), None));
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("does not have"), "{}", problems[0]);
+        assert!(host.is_empty());
+
+        let junk = b"\0asm\x01\0\0\0not a module".to_vec();
+        let d = crate::HashAlgo::default().digest(&junk);
+        let objects = |x: &[u8; 32]| (x == &d).then(|| junk.clone());
+        let mut host = Dialects::new(&objects);
+        assert_eq!(host.load(&dialect_ref(Some(d), None)).len(), 1);
+        assert!(host.is_empty());
     }
 }

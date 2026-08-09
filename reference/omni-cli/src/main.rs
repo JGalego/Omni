@@ -409,6 +409,32 @@ fn graph_of(c: &Container) -> Result<Option<omni_core::ir::Module>, Box<dyn std:
     Ok(Some(omni_core::ir::Module::from_value(&c.get_value(&g)?)?))
 }
 
+/// §07.4.2's shipped dialect semantics, loaded from the container's own
+/// `DialectRef` objects.
+///
+/// A dialect this build has never heard of is *indeterminate* by default, which
+/// is the weakest true statement a verifier can make. A dialect that ships a
+/// `shape_fn` makes it decidable, and this is where a reader picks that up —
+/// out of the container, with no network and no plugin directory.
+fn dialect_semantics<'a>(
+    c: &Container,
+    module: &omni_core::ir::Module,
+    objects: &'a dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+) -> (omni_core::plugin::Dialects<'a>, Vec<String>) {
+    let mut host = omni_core::plugin::Dialects::new(objects);
+    let mut problems = Vec::new();
+    for d in &module.dialects {
+        let Some((_, digest)) = d.reference else {
+            continue;
+        };
+        match c.get_value(&digest) {
+            Ok(v) => problems.extend(host.load(&v)),
+            Err(e) => problems.push(format!("`{}`'s DialectRef: {e}", d.ns)),
+        }
+    }
+    (host, problems)
+}
+
 /// The rewrites a module ships, read from the blobs it points at (§07.7).
 fn graph_rewrites(
     c: &Container,
@@ -1356,9 +1382,12 @@ fn cmd_verify(c: &Container, args: &[String]) -> R {
                 let shipped = graph_rewrites(c, &module).unwrap_or_default();
                 let shapes = tensor_shapes(c);
                 let lookup = |name: &str| shapes.get(name).cloned();
+                let objects = |d: &[u8; 32]| c.read(d).ok();
+                let (host, _) = dialect_semantics(c, &module, &objects);
                 let cx = omni_core::ir::Context {
                     tensor: Some(&lookup),
                     rewrites: &shipped,
+                    semantics: (!host.is_empty()).then_some(&host),
                 };
                 let r = omni_core::ir::verify(&module, &cx);
                 let bad = r.findings.iter().filter(|f| f.is_invalid()).count();
@@ -3299,9 +3328,15 @@ fn cmd_graph(args: &[String]) -> R {
             if args.iter().any(|a| a == "--verify") {
                 let shapes = tensor_shapes(&c);
                 let lookup = |name: &str| shapes.get(name).cloned();
+                let objects = |d: &[u8; 32]| c.read(d).ok();
+                let (host, problems) = dialect_semantics(&c, &module, &objects);
+                for p in &problems {
+                    prr!("omni: {p}\n");
+                }
                 let cx = ir::Context {
                     tensor: Some(&lookup),
                     rewrites: &shipped,
+                    semantics: (!host.is_empty()).then_some(&host),
                 };
                 let r = ir::verify(&module, &cx);
                 let invalid = r.findings.iter().filter(|f| f.is_invalid()).count();
@@ -3323,6 +3358,18 @@ fn cmd_graph(args: &[String]) -> R {
                     r.unknown,
                     r.recoverable
                 );
+                // §07.4.2: what the model's own semantics decided, and what
+                // deciding it cost. A dialect this build has never heard of
+                // becoming *checked* is the strongest form of §07.2's claim.
+                if r.shipped > 0 {
+                    pr!(
+                        "  decided      {} op(s) by the dialect's own §07.4.2 \
+functions, in {} call(s) and {} fuel",
+                        r.shipped,
+                        commas(host.calls.get()),
+                        commas(host.fuel.get())
+                    );
+                }
                 for f in &r.findings {
                     pr!("  {f}");
                 }
@@ -6164,6 +6211,7 @@ fn cmd_example(args: &[String]) -> R {
         "--graph",
         "--training",
         "--plugin",
+        "--dialect",
     ];
     let tune: Option<u64> = flag(args, "--tune").and_then(|s| s.parse().ok());
     let mut positional = Vec::new();
@@ -6347,6 +6395,103 @@ fn cmd_example(args: &[String]) -> R {
             }
         }
     }
+    // §07.4.2 end to end: a graph using a dialect nobody has heard of, and the
+    // WebAssembly that decides it. Without the shape function `omni graph
+    // --verify` can only say *indeterminate*; with it, the same reader says the
+    // graph is well-typed — which is §07.2's key move applied to verification.
+    if args.iter().any(|a| a == "--dialect") {
+        use omni_core::ir::{Block, DialectUse, Function, Level, Module, Op, Region, Type};
+        let t = Type::tensor(omni_core::expr::dims(&[2, 3]), DType::F32);
+        // The answer the shipped function gives: a list of §07.3.1 types, as
+        // canonical CBOR. Building it from the type keeps the module and the
+        // graph from drifting apart.
+        let answer = Value::Array(vec![t.to_value()]).encode();
+        let wasm = omni_core::plugin::constant_answer_module("shape", &answer, 0);
+        let blob = omni_core::Object::blob(wasm);
+        let wasm_ref = blob.digest(algo);
+        b.extra_objects.push(blob);
+        let dialect = Value::map(vec![
+            ("t", Value::text("omni.ir/dialect")),
+            ("v", Value::U(1)),
+            ("ns", Value::text("x.example")),
+            ("version", Value::U(1)),
+            (
+                "ops",
+                Value::Map(vec![(
+                    Value::text("thing"),
+                    Value::map(vec![
+                        ("versions", Value::Array(vec![Value::U(1)])),
+                        (
+                            "shape_fn",
+                            Value::map(vec![
+                                (
+                                    "wasm",
+                                    Value::Array(vec![
+                                        Value::U(otype::BLOB as u64),
+                                        Value::Bytes(wasm_ref.to_vec()),
+                                    ]),
+                                ),
+                                ("export", Value::text("shape")),
+                            ]),
+                        ),
+                        (
+                            "doc",
+                            Value::text(
+                                "an op this build has never heard of, whose \
+                                 semantics arrived with the model",
+                            ),
+                        ),
+                    ]),
+                )]),
+            ),
+            (
+                "requires",
+                Value::Array(vec![Value::map(vec![
+                    ("ns", Value::text("omni.core")),
+                    ("version", Value::U(1)),
+                ])]),
+            ),
+        ]);
+        let dref = omni_core::Object::structure(otype::DIALECT_REF, &dialect);
+        let dref_digest = dref.digest(algo);
+        b.extra_objects.push(dref);
+
+        let mut m = Module::new(Level::Primitive, "main");
+        m.dialects = vec![
+            DialectUse {
+                ns: "omni.core".into(),
+                version: 1,
+                reference: None,
+            },
+            DialectUse {
+                ns: "x.example".into(),
+                version: 1,
+                reference: Some((otype::DIALECT_REF, dref_digest)),
+            },
+        ];
+        m.functions.push((
+            "main".into(),
+            Function {
+                params: vec![("x".into(), t.clone())],
+                results: vec![t.clone()],
+                attrs: vec![("kind".into(), Value::text("forward"))],
+                body: Region {
+                    blocks: vec![Block {
+                        args: Vec::new(),
+                        ops: vec![
+                            Op::new("x.example", "thing", 1)
+                                .with_inputs(&[0])
+                                .with_output(1, t),
+                            Op::new("omni.core", "return", 1).with_inputs(&[1]),
+                        ],
+                    }],
+                },
+                constraints: Vec::new(),
+            },
+        ));
+        b = b.graph(m, Vec::new());
+    }
+
     let (objs, root) = b.build();
     let opts = PackOptions {
         hash: algo,

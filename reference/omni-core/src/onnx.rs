@@ -4114,6 +4114,7 @@ mod tests {
         let cx = ir::Context {
             tensor: Some(&lookup),
             rewrites: &[],
+            semantics: None,
         };
         let report = ir::verify(&m, &cx);
         assert!(
