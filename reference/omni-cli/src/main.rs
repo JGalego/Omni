@@ -209,7 +209,7 @@ VERBS:
                               be lost without writing; a lossy export needs
                               --allow-lossy, and the loss report is written
                               beside the artifact (§1.2)
-    jinja   <template.jinja> [--coverage]
+    jinja   <template.jinja> [--coverage [<dir>]]
                               Translate a Jinja2 chat template into OMNI-CT
                               (§06.9), or measure the built-in corpus. A
                               construct with no total form is refused by name
@@ -1817,6 +1817,74 @@ fn chat_template_of(
 /// to try it on real templates and read what comes back.
 fn cmd_jinja(args: &[String]) -> R {
     use omni_core::jinja;
+    // Gate 2 asks for 95 % of a *public hub snapshot*, and the built-in corpus
+    // is fifteen templates. `--coverage <dir>` runs the same measurement over
+    // whatever templates are on disk, so what stands between this figure and
+    // the gate's is a corpus rather than code.
+    if let Some(dir) = args
+        .iter()
+        .position(|a| a == "--coverage")
+        .and_then(|i| args.get(i + 1))
+        .filter(|d| !d.starts_with("--"))
+    {
+        let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        names.sort();
+        let (mut ok, mut refused) = (0usize, Vec::new());
+        let mut blockers: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for path in &names {
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                // A file that is not text is not a template; skipping it would
+                // change the denominator silently, so it is named.
+                Err(e) => {
+                    refused.push((path.display().to_string(), format!("not readable: {e}")));
+                    continue;
+                }
+            };
+            match jinja::translate(&src) {
+                Ok(_) => ok += 1,
+                Err(jinja::Error::Unsupported(r)) => {
+                    *blockers.entry(r.construct.clone()).or_default() += 1;
+                    refused.push((
+                        path.display().to_string(),
+                        format!("{}: {}", r.construct, r.reason),
+                    ));
+                }
+                Err(e) => refused.push((path.display().to_string(), e.to_string())),
+            }
+        }
+        let total = names.len();
+        pr!(
+            "{dir}: {ok} of {total} translated ({:.1} %)",
+            100.0 * ok as f64 / total.max(1) as f64
+        );
+        for (name, why) in &refused {
+            pr!("  ✗ {name}  {why}");
+        }
+        if !blockers.is_empty() {
+            pr!();
+            pr!("blocked by:");
+            let mut by: Vec<(&String, &usize)> = blockers.iter().collect();
+            by.sort_by(|a, b| b.1.cmp(a.1));
+            for (construct, n) in by {
+                pr!("  {n} x  {construct}");
+            }
+        }
+        pr!();
+        // The gate's own threshold, applied to whatever corpus this was, and
+        // said as a comparison rather than as a verdict: 95 % of a directory
+        // somebody assembled is not 95 % of the hub.
+        let rate = 100.0 * ok as f64 / total.max(1) as f64;
+        pr!(
+            "Gate 2 asks for 95 % of a public hub snapshot. This is {total} \
+template(s) from `{dir}`, so {rate:.1} % is a percentage of that."
+        );
+        return Ok(if rate >= 95.0 { 0 } else { 3 });
+    }
     if args.iter().any(|a| a == "--coverage") {
         let c = jinja::coverage();
         pr!(
