@@ -106,6 +106,7 @@ VERBS:
     graph   migrate <file.omni> -o <out.omni>
                               Apply shipped op-version rewrites (§07.4.1)
     graph   run <file.omni> --tokens 1,2,3 [--fuel N] [--max-elems N]
+                              [--json <out.json>]
                               Execute the graph over the container's own weights.
                               Verification says a graph is well-typed; this says
                               whether it computes anything. An op this build does
@@ -3674,6 +3675,73 @@ fn graph_run(c: &Container, module: &omni_core::ir::Module, args: &[String]) -> 
     }
     if !out.debug.is_empty() {
         pr!("  debug          {}", out.debug.join(", "));
+    }
+    // Gate 2 asks for outputs "matching the source framework within declared
+    // tolerance", and a comparison needs the whole tensor rather than the six
+    // values a summary prints. `--json` writes them, which is what makes the
+    // comparison somebody else's one command instead of a patch to this file.
+    if let Some(path) = flag(args, "--json") {
+        let tensor = |t: &omni_core::expr::Tensor| {
+            omni_core::json::object(vec![
+                (
+                    "shape",
+                    omni_core::json::Value::Array(
+                        t.shape
+                            .iter()
+                            .map(|d| omni_core::json::Value::U(*d))
+                            .collect(),
+                    ),
+                ),
+                ("dtype", omni_core::json::string(t.dtype.label())),
+                (
+                    "data",
+                    omni_core::json::Value::Array(
+                        t.data
+                            .iter()
+                            .map(|v| omni_core::json::Value::F(*v))
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+        let doc = omni_core::json::object(vec![
+            ("entry", omni_core::json::string(module.entry.clone())),
+            ("ops", omni_core::json::Value::U(out.ops)),
+            (
+                "dims",
+                omni_core::json::Value::Array(
+                    out.dims
+                        .iter()
+                        .map(|(n, v)| {
+                            omni_core::json::object(vec![
+                                ("name", omni_core::json::string(n.clone())),
+                                ("size", omni_core::json::Value::U(*v)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "returned",
+                omni_core::json::Value::Array(out.returned.iter().map(tensor).collect()),
+            ),
+            (
+                "outputs",
+                omni_core::json::Value::Array(
+                    out.outputs
+                        .iter()
+                        .map(|(n, t)| {
+                            omni_core::json::object(vec![
+                                ("name", omni_core::json::string(n.clone())),
+                                ("tensor", tensor(t)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]);
+        std::fs::write(path, doc.encode())?;
+        pr!("  wrote          {path}");
     }
     Ok(0)
 }

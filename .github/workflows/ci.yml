@@ -1245,6 +1245,40 @@ jobs:
           grep -q '1 of 1 imported as a §06.7 tokenizer' /tmp/tok.txt
           grep -q 'with conformance vectors  0' /tmp/tok.txt
           grep -q 'cannot fail' /tmp/tok.txt
+
+          # Gate 2's first row also asks for outputs matching the *source
+          # framework*, which needs the framework's answers as data. The harness
+          # takes them as data; what CI can check is the instrument, by handing
+          # it this build's own answers — a comparison that cannot fail on
+          # arithmetic and can fail on everything else: the tolerance handling,
+          # the shape check, the file plumbing.
+          mkdir -p /tmp/corpus/fam
+          "$OMNI" example --graph /tmp/corpus/fam/decoder.omni >/dev/null
+          echo '{"tokens": [1, 2, 3], "tolerance": 1e-9}' \
+            > /tmp/corpus/fam/decoder.inputs.json
+          "$OMNI" graph run /tmp/corpus/fam/decoder.omni --tokens 1,2,3 \
+            --json /tmp/corpus/fam/decoder.expect.json >/dev/null
+          set +e
+          python3 tools/corpus.py families /tmp/corpus/fam --omni "$OMNI" \
+            --json /tmp/fam.json | tee /tmp/fam.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          test "$rc" = 3
+          grep -q '1 of 1 match within their declared tolerance' /tmp/fam.txt
+          # A wrong expectation has to fail, or the comparison is not comparing.
+          python3 -c "
+          import json
+          p = '/tmp/corpus/fam/decoder.expect.json'
+          d = json.load(open(p))
+          d['returned'][0]['data'][0] = 12345.0
+          json.dump(d, open(p, 'w'))"
+          set +e
+          python3 tools/corpus.py families /tmp/corpus/fam --omni "$OMNI" \
+            | tee /tmp/fam2.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          test "$rc" = 3
+          grep -q 'outside tolerance    1' /tmp/fam2.txt
           echo "the gate measurements run; what is missing is a corpus"
 
       # §13.5, the transfer: the client that was the missing half of Phase 3.

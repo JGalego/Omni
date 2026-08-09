@@ -15,6 +15,7 @@ between this repository and those rows is downloading the models rather than
 writing anything.
 
     tools/corpus.py roundtrip  <dir>   [--omni ./omni] [--json out.json]
+    tools/corpus.py families   <dir>   [--omni ./omni] [--json out.json]
     tools/corpus.py delta      <pairs> [--omni ./omni] [--json out.json]
     tools/corpus.py tokenizers <dir>   [--omni ./omni] [--json out.json]
     tools/corpus.py templates  <dir>   [--omni ./omni] [--json out.json]
@@ -39,6 +40,18 @@ they are run; where it does not, the run says so rather than counting a
 tokenizer as passing something nobody checked.
 
 `templates` runs `omni jinja --coverage` over a directory of chat templates.
+
+`families` is the other half of Gate 2's first row. Ten architecture families
+being *executed* is already checked in this repository's own tests; what the
+gate also asks is that their outputs match the source framework within a
+declared tolerance, and there is no source framework here. So this takes the
+framework's answers as data: a directory of cases, each a `<name>.omni`
+container carrying a synthesized graph, a `<name>.inputs.json` of the tokens to
+run it over, and a `<name>.expect.json` holding what PyTorch (or whatever
+produced the case) computed, in the shape `omni graph run --json` writes. Each
+case declares its own `tolerance`, because a bf16 model and an f32 one do not
+deserve the same one, and a single global number would be either too loose to
+catch anything or too tight to pass.
 
 Every subcommand prints the gate's own threshold next to the figure and exits
 non-zero when the figure is short of it, so a corpus run is a check rather than
@@ -294,6 +307,82 @@ def templates(omni, root, report):
     return code
 
 
+def families(omni, root, report):
+    """Gate 2: synthesized families against a source framework's outputs."""
+    cases = sorted(pathlib.Path(root).glob("*.omni"))
+    if not cases:
+        print(f"{root}: no cases found (expected <name>.omni beside "
+              f"<name>.inputs.json and <name>.expect.json)")
+        return 1
+    matched, failed, incomplete = [], [], []
+    tmp = tempfile.mkdtemp(prefix="omni-fam-")
+    try:
+        for case in cases:
+            name = case.stem
+            inputs = case.with_suffix(".inputs.json")
+            expect = case.with_suffix(".expect.json")
+            if not inputs.exists() or not expect.exists():
+                incomplete.append({"case": name, "why": "no inputs or expectations"})
+                print(f"  · {name}: no framework answer to compare against")
+                continue
+            spec = json.loads(inputs.read_text())
+            want = json.loads(expect.read_text())
+            tol = float(spec.get("tolerance", want.get("tolerance", 1e-4)))
+            got_path = os.path.join(tmp, f"{name}.json")
+            args = ["graph", "run", str(case), "--tokens",
+                    ",".join(str(t) for t in spec["tokens"]), "--json", got_path]
+            code, out = run(omni, args)
+            if code != 0:
+                failed.append({"case": name, "why": out.strip()})
+                print(f"  ✗ {name}: {out.strip().splitlines()[0]}")
+                continue
+            got = json.loads(pathlib.Path(got_path).read_text())
+            worst, where = 0.0, ""
+            ok = True
+            if len(got["returned"]) != len(want["returned"]):
+                ok = False
+                where = (f"{len(got['returned'])} result(s) against "
+                         f"{len(want['returned'])}")
+            else:
+                for i, (g, w) in enumerate(zip(got["returned"], want["returned"])):
+                    if g["shape"] != w["shape"]:
+                        ok = False
+                        where = f"result {i}: {g['shape']} against {w['shape']}"
+                        break
+                    for a, b in zip(g["data"], w["data"]):
+                        d = abs(a - b)
+                        if d > worst:
+                            worst, where = d, f"result {i}"
+                    if worst > tol:
+                        ok = False
+                        break
+            if ok:
+                matched.append({"case": name, "worst": worst, "tolerance": tol})
+                print(f"  ✓ {name}: worst {worst:.3e} within {tol:.0e}")
+            else:
+                failed.append({"case": name, "worst": worst, "tolerance": tol,
+                               "why": where})
+                print(f"  ✗ {name}: {where}, worst {worst:.3e} over {tol:.0e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    total = len(cases)
+    print(f"\n{root}: {len(matched)} of {total} match within their declared "
+          f"tolerance")
+    print(f"  no framework answer  {len(incomplete)}")
+    print(f"  outside tolerance    {len(failed)}")
+    print(
+        "\nGate 2 asks for ten architecture families executed with outputs "
+        "matching the source framework within declared tolerance. This run "
+        f"compared {len(matched) + len(failed)} against answers somebody else "
+        "computed."
+    )
+    write(report, {"gate": 2, "measure": "families", "corpus": str(root),
+                   "cases": total, "matched": matched, "failed": failed,
+                   "incomplete": incomplete})
+    return 0 if (len(matched) >= 10 and not failed) else 3
+
+
 def write(path, obj):
     if path:
         pathlib.Path(path).write_text(json.dumps(obj, indent=2))
@@ -318,6 +407,7 @@ def main(argv):
         "delta": delta,
         "tokenizers": tokenizers,
         "templates": templates,
+        "families": families,
     }.get(cmd)
     if fn is None:
         print(f"unknown measurement `{cmd}`")

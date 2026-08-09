@@ -289,7 +289,12 @@ and three kinds do not — `omni.nn/attention` and `omni.nn/rope`, which are the
 semantic ops §07.2 exists to keep, and `omni.tensor/rsqrt`, which ONNX has no
 operator for.
 
-**Gate 2's two corpus measurements have an instrument too.**
+**Gate 2's corpus measurements have instruments too.**
+[`tools/corpus.py`](../../tools/corpus.py) `families` compares a synthesized
+family's outputs with a source framework's, taking the framework's answers as
+data — a container, the tokens, and what PyTorch computed, each case with its own
+declared tolerance. Making that possible needed one CLI change: `omni graph run
+--json` writes the whole result rather than the six values a summary prints.
 `omni jinja --coverage <dir>` runs the translation over a directory of chat
 templates instead of the built-in fifteen, and
 [`tools/corpus.py`](../../tools/corpus.py) `tokenizers` walks a directory of
