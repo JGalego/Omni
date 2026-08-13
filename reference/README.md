@@ -132,7 +132,9 @@ implemented:
   measured error, and parent chains with R-O06
 - §03.7 compression: `raw`, `zstd` (RFC 8878, both directions — FSE, Huffman,
   sequences, repeat offsets, the window, multi-frame streams and the XXH64
-  content checksum), `deflate` (RFC 1951, both directions), `bitshuffle`, and
+  content checksum), `deflate` (RFC 1951, both directions), `lz4` (the block
+  format, both directions — the token nibbles, the `255` continuations and the
+  overlapping match that is how LZ4 spells a run), `bitshuffle`, and
   both `bitshuffle+zstd` and `bitshuffle+deflate`, with the §03.7.4
   decompression bounds; a compressed container holds the same object identities
   as an uncompressed one, the superblock names the codecs a reader will meet and
@@ -485,8 +487,8 @@ implemented:
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §03.7's MAY-level codecs `lz4`, `brotli`, `xz`, `ans-lut` and the two lossy
-  ones: reported as unsupported rather than half-decoded
+- §03.7's MAY-level codecs `brotli`, `xz`, `ans-lut` and the two lossy
+  ones: reported as unsupported rather than half-decoded. `lz4` is implemented
 - `https://`. §13.4's HTTP range store is here and speaks HTTP/1.1 over a
   socket, but TLS needs a cryptographic transport stack and this crate has no
   dependencies to provide one. An `https://` URL is refused with that reason
@@ -580,7 +582,7 @@ expectation.
 
 ## Tests
 
-498 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+558 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -878,7 +880,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 498 passed; 0 failed
+test result: ok. 558 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
