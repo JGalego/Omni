@@ -3795,8 +3795,8 @@ jobs:
           # this check, it silently stops being covered by it, which is the worse
           # of the two outcomes because it looks like a pass.
           paths = re.findall(r'^  ([A-Za-z0-9_.\-/]+(?:\*\*)?)\s{2,}\S', text, re.M)
-          if len(paths) != 12:
-              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 12; the table has '
+          if len(paths) != 13:
+              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 13; the table has '
                                      'changed shape and this check may no longer read all of it'))
           for p in paths:
               root = p.split('/')[0].replace('**', '')

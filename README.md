@@ -220,6 +220,12 @@ unsupported at run time rather than guessed at. See
 [the roadmap](docs/design/roadmap.md) for what the gates have and have not
 proven.
 
+[`SECURITY.md`](SECURITY.md) is the other half of that honesty: §12.4 calls the
+parser the largest attack surface and makes twelve normative demands of it, so
+there is somewhere to send the case where one of them does not hold — and, just as
+usefully, a list of the reports that are already answered by §12.12 rather than
+open, starting with the one no format can do anything about.
+
 One claim gets a second opinion rather than a louder assertion. The design says a
 conforming reader at the lowest profile fits in about three thousand lines with no
 dependencies beyond a hash function — so
