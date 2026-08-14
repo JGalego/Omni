@@ -180,6 +180,11 @@ verification. To run the test suite: `cd reference && cargo test`.
 - [Reference Implementation Roadmap](docs/design/roadmap.md) — phases, governance, conformance corpus
 - [Design Rationale](docs/rationale/tradeoffs.md) — every major decision and what was rejected
 
+Working on it: [`CONTRIBUTING.md`](CONTRIBUTING.md) has the rules that are not
+obvious from reading the code — zero dependencies in `omni-core`, differential
+testing against somebody else's implementation rather than round-tripping through
+your own, and stating what you did not implement in the same place you claimed it.
+
 ## Status
 
 **OMNI/1.0 — Draft.** This is a proposal, not a ratified standard. The binary

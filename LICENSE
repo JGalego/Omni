@@ -19,6 +19,7 @@ Under CC BY 4.0 (see LICENSE-SPEC):
   docs/rationale/**       the design rationale
   README.md               this repository's own prose
   SECURITY.md             the vulnerability reporting policy
+  CONTRIBUTING.md         the contributor guide
   assets/**               the logo and diagrams
 
 Under Apache-2.0 OR MIT (see LICENSE-APACHE and LICENSE-MIT):
