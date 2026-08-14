@@ -199,11 +199,12 @@ of them, checked by dequantizing every layer and comparing against arithmetic
 done in Python, and GGUF byte-for-byte in both directions across its eleven
 block types — PyTorch `.bin` import through a restricted unpickler, a whole Hugging
 Face repo (weights, config, tokenizer and chat template) as one container, and a
-[C ABI](reference/omni-ffi/include/omni.h) that a C program drives end to end,
-DLPack included. What is *not* implemented is stated in
+[C ABI](reference/omni-ffi/include/omni.h) that a C program drives end to end
+in both directions — reading a container, and *writing* one, with DLPack going
+in as well as out. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
-it — every importer but those seven, the writer side of the C ABI, `https://` (TLS
-needs a dependency), the registry client behind §13.5's mapping, `mount`, SIMD in the
+it — every importer but those seven, `https://` (TLS
+needs a dependency), `mount`, SIMD in the
 plugin host, and the remaining MAY-level codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See
 [the roadmap](docs/design/roadmap.md) for what the gates have and have not

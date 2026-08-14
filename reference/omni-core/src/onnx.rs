@@ -2419,7 +2419,7 @@ fn assemble(
             // ONNX says nothing about what a tensor *is*: an initializer is a
             // value a node reads, and calling them all weights would be a guess
             // §04.2 does not need made.
-            semantic: "",
+            semantic: "".into(),
             data: w.data.clone(),
             layout: Some(layout_of(&w.dtype)),
         });

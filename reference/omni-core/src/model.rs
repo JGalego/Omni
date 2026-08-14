@@ -20,7 +20,7 @@ pub struct TensorSpec {
     pub shape: Vec<u64>,
     pub dtype: DType,
     pub axes: Option<Vec<String>>,
-    pub semantic: &'static str,
+    pub semantic: String,
     pub data: Vec<u8>,
     /// How `data` is arranged. `None` means dense row-major, which is what
     /// almost every tensor is.
@@ -278,7 +278,7 @@ impl ModelBuilder {
                 ),
                 ("dtype", t.dtype.to_value()),
                 ("layout", layout.to_value()),
-                ("semantic", Value::text(t.semantic)),
+                ("semantic", Value::text(&t.semantic)),
                 (
                     "value",
                     Value::map(vec![
@@ -547,7 +547,7 @@ mod tests {
                 shape,
                 dtype: DType::BF16,
                 axes: Some(vec!["out_features".into(), "in_features".into()]),
-                semantic: "weight",
+                semantic: "weight".into(),
                 data,
                 layout: None,
             })

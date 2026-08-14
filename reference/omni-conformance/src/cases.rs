@@ -70,7 +70,7 @@ fn base(hash: HashAlgo, align: u8) -> (Vec<u8>, Vec<Object>, Digest) {
             shape: vec![8, 8],
             dtype: DType::F32,
             axes: None,
-            semantic: "weight",
+            semantic: "weight".into(),
             data: (0..8 * 8 * 4).map(|i| (i % 251) as u8).collect(),
             layout: None,
         })
@@ -184,7 +184,7 @@ fn roundtrip() -> Vec<Case> {
             shape: vec![*n, 4],
             dtype: DType::F32,
             axes: None,
-            semantic: "weight",
+            semantic: "weight".into(),
             data: (0..n * 4 * 4).map(|k| (k % 251) as u8).collect(),
             layout: None,
         });
@@ -269,7 +269,7 @@ fn valid_features() -> Vec<Case> {
             shape: vec![64, 4],
             dtype: DType::F32,
             axes: None,
-            semantic: "weight",
+            semantic: "weight".into(),
             data: (0..64 * 4 * 4).map(|i| (i % 251) as u8).collect(),
             layout: None,
         })
@@ -387,7 +387,7 @@ fn valid_features() -> Vec<Case> {
             shape: vec![fan_out, fan_in],
             dtype: DType::F32,
             axes: None,
-            semantic: "weight",
+            semantic: "weight".into(),
             data: (0..fan_in * fan_out * 4).map(|k| (k % 251) as u8).collect(),
             layout: None,
         });
@@ -422,7 +422,7 @@ fn base_objects(hash: HashAlgo, chunk: usize) -> (Vec<Object>, Digest) {
             shape: vec![8, 8],
             dtype: DType::F32,
             axes: None,
-            semantic: "weight",
+            semantic: "weight".into(),
             data: (0..8 * 8 * 4).map(|i| (i % 251) as u8).collect(),
             layout: None,
         })
@@ -516,7 +516,7 @@ fn numeric() -> Vec<Case> {
                 shape: vec![n],
                 dtype: dtype.clone(),
                 axes: None,
-                semantic: "",
+                semantic: "".into(),
                 data: data.clone(),
                 layout: None,
             })
@@ -560,7 +560,7 @@ fn numeric() -> Vec<Case> {
             shape: vec![16],
             dtype,
             axes: None,
-            semantic: "",
+            semantic: "".into(),
             data,
             layout: None,
         })

@@ -1003,7 +1003,7 @@ mod tests {
                     shape: vec![8, 8],
                     dtype: DType::BF16,
                     axes: Some(vec!["out".into(), "in".into()]),
-                    semantic: "weight",
+                    semantic: "weight".into(),
                     data: (0..128u32).map(|i| (i % 251) as u8).collect(),
                     layout: None,
                 });

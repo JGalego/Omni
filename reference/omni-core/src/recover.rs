@@ -284,7 +284,7 @@ mod tests {
                 shape: vec![128, 64],
                 dtype: DType::F32,
                 axes: None,
-                semantic: "weight",
+                semantic: "weight".into(),
                 data: (0..128 * 64 * 4).map(|i| (i % 251) as u8).collect(),
                 layout: None,
             })
@@ -293,7 +293,7 @@ mod tests {
                 shape: vec![64],
                 dtype: DType::F32,
                 axes: None,
-                semantic: "bias",
+                semantic: "bias".into(),
                 data: (0..64 * 4).map(|i| (i % 97) as u8).collect(),
                 layout: None,
             })

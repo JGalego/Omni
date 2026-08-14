@@ -332,5 +332,111 @@ class TestAgainstTheOtherReader(unittest.TestCase):
             print(f"\n  {checked} tensors agree byte for byte across both readers")
 
 
+
+class TestBuilder(unittest.TestCase):
+    """The writer half of the ABI, exercised the way a binding user would."""
+
+    def test_a_container_written_from_python_is_read_by_both_readers(self):
+        b = omni_ffi.Builder("acme/py-built")
+        b.license("Apache-2.0").arch("transformer.decoder", {"n_layers": 1})
+        b.chunk_size(4096).meta("description", "written by the ctypes binding")
+        payload = struct.pack("<6f", 1.0, -2.0, 0.5, 3.25, -0.125, 8.0)
+        b.add_tensor(
+            "w", "f32", [2, 3], payload, axes=["out_features", "in_features"],
+            semantic="weight",
+        )
+        predicted = b.root_digest
+        path = os.path.join(_TMP, "py-built.omni")
+        b.write(path)
+        raw = b.to_bytes()
+        self.assertEqual(raw, open(path, "rb").read())
+
+        # The CLI — a different program — must accept it at the deepest level.
+        r = subprocess.run(
+            [OMNI_BIN, "verify", path, "--level", "6"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+        with omni_ffi.open(path) as model:
+            self.assertEqual(model.store.root_digest, predicted)
+            self.assertEqual(list(model), ["w"])
+            t = model["w"]
+            self.assertEqual(t.dtype, "f32")
+            self.assertEqual(list(t.shape), [2, 3])
+            self.assertEqual(
+                [round(v, 6) for v in t.values()],
+                [1.0, -2.0, 0.5, 3.25, -0.125, 8.0],
+            )
+            t.close()
+
+        # And the from-specification reader, which shares no code with the
+        # writer, must agree about the bytes.
+        try:
+            import omni as pure
+        except ImportError:  # pragma: no cover
+            self.skipTest("the pure-Python reader is not importable")
+        c = pure.open_file(path)
+        theirs, _desc = c.tensor_bytes("w")
+        self.assertEqual(theirs, payload)
+        b.close()
+
+    def test_the_same_calls_produce_the_same_bytes(self):
+        def build():
+            b = omni_ffi.Builder("acme/reproducible")
+            b.arch("mlp", {"d_model": 4})
+            b.add_tensor("w", "bf16", [2, 2], bytes(8))
+            return b
+
+        first, second = build(), build()
+        self.assertEqual(first.to_bytes(), second.to_bytes())
+        self.assertEqual(first.root_digest, second.root_digest)
+        first.close()
+        second.close()
+
+    def test_a_wrong_byte_count_is_refused_by_the_call_that_made_it(self):
+        b = omni_ffi.Builder("acme/short")
+        with self.assertRaises(omni_ffi.OmniError) as cm:
+            b.add_tensor("w", "f32", [4, 4], bytes(8))
+        self.assertEqual(cm.exception.status, omni_ffi.EINVALID)
+        self.assertIn("R-T02", str(cm.exception))
+        self.assertEqual(len(b), 0)
+        b.close()
+
+    def test_an_unimplemented_codec_is_indeterminate_not_a_silent_downgrade(self):
+        b = omni_ffi.Builder("acme/codec")
+        with self.assertRaises(omni_ffi.OmniError) as cm:
+            b.codec("brotli")
+        self.assertEqual(cm.exception.status, omni_ffi.INDETERMINATE)
+        b.codec("zstd:9")
+        b.add_tensor("w", "f32", [64], bytes(256))
+        with omni_ffi.open_bytes(b.to_bytes()) as model:
+            t = model["w"]
+            self.assertEqual(len(t.values()), 64)
+            t.close()
+        b.close()
+
+    def test_a_dlpack_array_round_trips_through_the_builder(self):
+        # The producer here is this library's own reader, which makes the test
+        # a closed loop: bytes out over DLPack, back in over DLPack, and the
+        # tensor that comes out the far side must be the one that went in.
+        with omni_ffi.open(PLAIN) as model:
+            name = next(iter(model))
+            source = model[name]
+            try:
+                original = bytes(source.memory())
+            except omni_ffi.OmniError:
+                self.skipTest("the first tensor has no stored bytes")
+            capsule = source.__dlpack__()
+            b = omni_ffi.Builder("acme/dlpack")
+            b.add_dlpack("copied", capsule)
+            source.close()
+        with omni_ffi.open_bytes(b.to_bytes()) as copy:
+            t = copy["copied"]
+            self.assertEqual(bytes(t.memory()), original)
+            t.close()
+        b.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

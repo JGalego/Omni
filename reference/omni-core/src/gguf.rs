@@ -1449,7 +1449,7 @@ pub fn import(bytes: &[u8], opts: &ImportOpts) -> Res<Imported> {
                 shape: shape.clone(),
                 dtype,
                 axes: None,
-                semantic: "",
+                semantic: "".into(),
                 data: raw.to_vec(),
                 layout: None,
             });

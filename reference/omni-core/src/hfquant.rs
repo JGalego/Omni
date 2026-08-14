@@ -477,7 +477,7 @@ pub fn import(
             shape: e.shape.clone(),
             dtype: e.dtype.clone(),
             axes: None,
-            semantic: "",
+            semantic: "".into(),
             data: f.tensor(e).to_vec(),
             layout: Some(safetensors::layout_of(&e.dtype)),
         });

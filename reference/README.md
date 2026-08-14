@@ -59,7 +59,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 |---|---|---|
 | `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), PEFT, GPTQ and AWQ import and export, whole-Hugging-Face-repo import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
-| `omni-ffi` | the C ABI (`omni.h`): opaque handles, panic-proof entry points, CLI-matching status codes, DLPack export. Built as `cdylib` + `staticlib`. The only crate here that uses `unsafe` | design/sdk.md §3 |
+| `omni-ffi` | the C ABI (`omni.h`): opaque handles, panic-proof entry points, CLI-matching status codes, DLPack in *and* out, and a container writer. Built as `cdylib` + `staticlib`. The only crate here that uses `unsafe` | design/sdk.md §3 |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
 | `fuzz` | coverage-guided fuzz targets (nightly; outside the workspace) | §12.4 |
 
@@ -484,6 +484,24 @@ implemented:
   graph
 - §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
   reached through `omni sign --verify`
+- **The writer side of the C ABI**, which was the half that decided whether a
+  binding is a binding or a viewer: a language that can only read has to go back
+  through Rust to publish anything. `omni_builder_*` sets the metadata, the
+  digest algorithm, the chunk size, the storage codec and the alignment — every
+  decision §01–§03 leaves to a writer — and takes tensors either as bytes with a
+  declared §04.3 dtype or **through DLPack**, which is the inverse of the export
+  path and so the way an array from PyTorch, JAX, NumPy or MLX gets in. It
+  refuses the three things the export refuses, for the same reasons: a non-CPU
+  device, a lane count §04.3 spells as a shape, and a strided array that is not
+  dense row-major — copying a transposed view as dense would store a different
+  tensor with the right length. R-T02 is checked by the call that adds the
+  tensor rather than by the write, so a wrong byte count is reported where the
+  mistake was made. `omni_builder_root_digest` answers before anything is
+  written, because identity is a function of content (§01.2) and packing decides
+  only placement. CI builds a container from a C program and has three other
+  programs read it: the CLI verifies it at V6, the ctypes binding reads its
+  values back, and the from-specification Python reader — which shares no code
+  with the writer — reads its bytes
 
 What is **not** implemented, and is reported as such rather than faked:
 
@@ -529,9 +547,6 @@ What is **not** implemented, and is reported as such rather than faked:
   the argument that there is nothing to confine: it is a parser for a data
   language, not an evaluator with a filter in front of it. A build that ever
   grows a general evaluator needs the sandbox back
-- The **writer** side of the C ABI. `omni-ffi` reads: open, verify, walk, bytes,
-  values, plan, DLPack. A C caller cannot yet *build* a container, so
-  `ModelBuilder` is Rust-only
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
@@ -582,7 +597,7 @@ expectation.
 
 ## Tests
 
-558 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+564 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -880,7 +895,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 558 passed; 0 failed
+test result: ok. 564 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

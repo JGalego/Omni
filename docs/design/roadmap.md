@@ -406,9 +406,11 @@ COSE_Sign1, trust policies) and has had no third-party review. The distribution
   **The C ABI this phase depends on is built** (`reference/omni-ffi`,
   `omni.h`): opaque handles, no panic across the boundary, CLI-matching status
   codes, and DLPack out to PyTorch/JAX/NumPy without a copy, with a C program
-  in CI driving open → verify → walk → bytes → plan → DLPack. It reads only;
-  writing a container from C is still Rust-side. Every binding in this list is
-  now a layer over an existing ABI rather than a new parser.
+  in CI driving open → verify → walk → bytes → plan → DLPack — and, since the
+  writer landed, a second C program building a container the CLI verifies at V6,
+  with DLPack going in as well as out. Every binding in this list is
+  now a layer over an existing ABI rather than a new parser, and a layer that
+  can publish rather than only consume.
 - Upstream integrations: PyTorch, JAX/Orbax, vLLM, SGLang, llama.cpp, MLX,
   Ollama, Transformers, PEFT, TensorRT-LLM.
 - Training-side: DCP/DeepSpeed/Megatron/NeMo import and export; parallel writer.

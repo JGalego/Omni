@@ -1368,7 +1368,7 @@ fn assemble(
             axes: None,
             // A `state_dict` key is a convention, not a declaration. Calling
             // every entry a weight would be a guess.
-            semantic: "",
+            semantic: "".into(),
             data: data.clone(),
             layout: Some(layout.clone()),
         });

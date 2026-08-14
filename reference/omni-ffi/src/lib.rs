@@ -71,7 +71,10 @@ use omni_core::{json, DType, Layout};
 /// The ABI version. The high 16 bits are the incompatible-change counter; the
 /// low 16 bits are the additive-change counter. A caller that finds a different
 /// high half than it was compiled against must not proceed (§14).
-pub const OMNI_ABI_VERSION: u32 = 0x0001_0000;
+///
+/// 1.1 added the writer (`omni_builder_*`). Every symbol from 1.0 kept its
+/// signature and its meaning, which is what the low half is for.
+pub const OMNI_ABI_VERSION: u32 = 0x0001_0001;
 
 // ---------------------------------------------------------------- statuses --
 
@@ -1375,6 +1378,653 @@ pub unsafe extern "C" fn omni_tensor_dlpack(
     })
 }
 
+// ------------------------------------------------------------------ writer --
+
+/// A container being built (`docs/design/sdk.md` §3.4).
+///
+/// The read path above was the whole of this ABI for a draft, and the gap was
+/// stated where it mattered: a C caller could open, verify, walk, evaluate and
+/// hand out a model and could not *make* one, so every binding that wanted to
+/// write went back through Rust. This is the other half. It is deliberately the
+/// small half — [`ModelBuilder`] already turns named byte buffers into the
+/// object graph of §00.4, and what a C ABI adds is a way to name the buffers.
+///
+/// Nothing here decides anything the format leaves to a writer. The digest
+/// algorithm, the chunk size, the storage codec and the alignment are all the
+/// caller's, and packing stays reproducible (§01.10, writer rule W1): the same
+/// calls in the same order produce the same bytes, and so do the same calls in
+/// a different order, because objects are placed by digest and not by arrival.
+pub struct omni_builder {
+    b: RefCell<omni_core::ModelBuilder>,
+    codec: RefCell<omni_core::codec::Codec>,
+    log2_align: std::cell::Cell<u8>,
+    /// The last `omni_builder_write_bytes` result, kept alive for the caller.
+    bytes: RefCell<Option<Arc<Vec<u8>>>>,
+}
+
+/// Parses a §04.3.6 alias, or a full §04.3 structural descriptor as JSON.
+///
+/// The alias is what a caller writing `"bf16"` means, and it covers the dtypes
+/// that have one. A dtype without an alias — a fixed-point type, a codebook, a
+/// struct — has to be spelled structurally, and §04.3.6 requires readers to
+/// accept the expanded form anyway, so the JSON door is the same door and not a
+/// second one.
+fn dtype_from_c(spec: &str) -> R<DType> {
+    let spec = spec.trim();
+    if spec.starts_with('{') {
+        let j = json::parse(spec.as_bytes())
+            .map_err(|e| usage(format!("dtype: not valid JSON: {e}")))?;
+        return DType::from_value(&from_json(&j)).map_err(|e| usage(format!("dtype: {e}")));
+    }
+    DType::from_alias(spec).ok_or_else(|| {
+        usage(format!(
+            "dtype: `{spec}` is not a §04.3.6 alias; pass the structural \
+             descriptor of §04.3 as a JSON object instead"
+        ))
+    })
+}
+
+fn builder_mut<'a>(p: *mut omni_builder) -> R<&'a omni_builder> {
+    if p.is_null() {
+        return Err(usage("builder is null"));
+    }
+    // SAFETY: the contract.
+    Ok(unsafe { &*p })
+}
+
+/// Starts a container for a model named `name` (§06.2's `meta.name`).
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_new(name: *const c_char, o: *mut *mut omni_builder) -> c_int {
+    guard(|| {
+        // SAFETY: the contract.
+        let name = unsafe { as_str(name, "name")? };
+        let h = Box::new(omni_builder {
+            b: RefCell::new(omni_core::ModelBuilder::new(name)),
+            codec: RefCell::new(omni_core::codec::Codec::Raw),
+            log2_align: std::cell::Cell::new(12),
+            bytes: RefCell::new(None),
+        });
+        // SAFETY: the contract.
+        unsafe { out(o, "out", Box::into_raw(h)) }
+    })
+}
+
+/// Releases a builder. Freeing `NULL` does nothing.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_free(b: *mut omni_builder) {
+    if !b.is_null() {
+        // SAFETY: the contract: a live handle from `omni_builder_new`.
+        drop(unsafe { Box::from_raw(b) });
+    }
+}
+
+/// Sets the container's digest algorithm: `"blake3-256"` or `"sha2-256"`
+/// (§03.5.1). Object identities depend on it, so it must be chosen before
+/// anything is written and cannot be changed afterwards.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_hash(b: *mut omni_builder, algo: *const c_char) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let algo = unsafe { as_str(algo, "algo")? };
+        let a = match algo {
+            "blake3-256" | "blake3" | "b3" => omni_core::HashAlgo::Blake3_256,
+            "sha2-256" | "sha256" => omni_core::HashAlgo::Sha256,
+            other => {
+                return Err(usage(format!(
+                    "hash: `{other}` is not one of §03.5.1's two mandatory algorithms"
+                )))
+            }
+        };
+        h.b.borrow_mut().hash = a;
+        Ok(())
+    })
+}
+
+/// Sets `meta.license` to an SPDX identifier.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_license(
+    b: *mut omni_builder,
+    spdx: *const c_char,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let spdx = unsafe { as_str(spdx, "spdx")? };
+        h.b.borrow_mut().license_spdx = Some(spdx.to_string());
+        Ok(())
+    })
+}
+
+/// Sets `meta.arch.family` and, from a JSON object, `meta.arch.params`
+/// (§06.2). `params_json` may be null.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_arch(
+    b: *mut omni_builder,
+    family: *const c_char,
+    params_json: *const c_char,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let family = unsafe { as_str(family, "family")? };
+        let mut params: Vec<(String, Value)> = Vec::new();
+        if !params_json.is_null() {
+            // SAFETY: the contract.
+            let text = unsafe { as_str(params_json, "params_json")? };
+            let j = json::parse(text.as_bytes())
+                .map_err(|e| usage(format!("params_json: not valid JSON: {e}")))?;
+            match j {
+                json::Value::Object(map) => {
+                    for (k, v) in map {
+                        params.push((k, from_json(&v)));
+                    }
+                }
+                _ => return Err(usage("params_json: expected a JSON object")),
+            }
+        }
+        let mut bb = h.b.borrow_mut();
+        bb.arch_family = Some(family.to_string());
+        bb.arch_params = params;
+        Ok(())
+    })
+}
+
+/// Adds one key to `meta` from a JSON value — the escape hatch for the §06
+/// fields this ABI has no dedicated setter for.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_add_meta(
+    b: *mut omni_builder,
+    key: *const c_char,
+    value_json: *const c_char,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let key = unsafe { as_str(key, "key")? };
+        // SAFETY: the contract.
+        let text = unsafe { as_str(value_json, "value_json")? };
+        let j = json::parse(text.as_bytes())
+            .map_err(|e| usage(format!("value_json: not valid JSON: {e}")))?;
+        h.b.borrow_mut()
+            .extra
+            .push((key.to_string(), from_json(&j)));
+        Ok(())
+    })
+}
+
+/// Sets the chunk size in bytes (§03.6's `fixed` chunker). Deduplication and
+/// range reads happen at this granularity, so it is the caller's decision.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_chunk_size(b: *mut omni_builder, bytes: u64) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        if bytes == 0 {
+            return Err(usage("chunk size must not be zero"));
+        }
+        h.b.borrow_mut().chunk_size = bytes as usize;
+        Ok(())
+    })
+}
+
+/// Sets the storage codec for data objects, as `"raw"`, `"zstd:9"`,
+/// `"bitshuffle+zstd:9:2"`, `"deflate:6"` or `"lz4:9"` (§03.7.1).
+///
+/// A codec in the registry this build cannot produce is refused by name rather
+/// than silently downgraded to `raw`, because a caller that asked for
+/// compression and got none should be told.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_codec(
+    b: *mut omni_builder,
+    codec: *const c_char,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let spec = unsafe { as_str(codec, "codec")? };
+        let mut parts = spec.split(':');
+        let id = parts.next().unwrap_or("");
+        let level: u64 = match parts.next() {
+            None => 3,
+            Some(l) => l
+                .parse()
+                .map_err(|_| usage(format!("codec: `{l}` is not a level")))?,
+        };
+        let elem: u64 = match parts.next() {
+            None => 2,
+            Some(e) => e
+                .parse()
+                .map_err(|_| usage(format!("codec: `{e}` is not an element width")))?,
+        };
+        let c = omni_core::codec::Codec::from_value(&Value::map(vec![
+            ("id", Value::text(id)),
+            ("level", Value::U(level)),
+            ("elem_size", Value::U(elem)),
+        ]));
+        if let omni_core::codec::Codec::Unsupported(name) = c {
+            return Err(if name == "unknown" {
+                usage(format!("codec: `{id}` is not in the §03.7.1 registry"))
+            } else {
+                Fail::new(
+                    OMNI_INDETERMINATE,
+                    format!("codec: `{name}` is registered but not implemented in this build"),
+                )
+            });
+        }
+        *h.codec.borrow_mut() = c;
+        Ok(())
+    })
+}
+
+/// Sets the page alignment as a power of two, 6 to 30 (§02.4). The default of
+/// 12 is a 4 KiB page; 16 suits a device that reads in 64 KiB units.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_alignment(b: *mut omni_builder, log2: u32) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        if !(6..=30).contains(&log2) {
+            return Err(usage(format!(
+                "alignment: log2 {log2} is outside §02.4's 6..=30"
+            )));
+        }
+        h.log2_align.set(log2 as u8);
+        Ok(())
+    })
+}
+
+/// Adds a tensor from bytes laid out exactly as §04.3.5 says: dense row-major,
+/// little-endian, the dtype's own packing for sub-byte types.
+///
+/// `dtype` is a §04.3.6 alias (`"bf16"`, `"i4"`, `"f32"`) or the structural
+/// descriptor of §04.3 as a JSON object. `data` is copied, so the caller may
+/// free it on return. The declared shape and dtype must account for exactly
+/// `len` bytes — R-T02 is checked here rather than at pack time, so a wrong
+/// length is a usage error at the call that made it and not a failed write
+/// afterwards.
+///
+/// # Safety
+/// See the module-level contract; `data` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_add_tensor(
+    b: *mut omni_builder,
+    name: *const c_char,
+    dtype: *const c_char,
+    shape: *const u64,
+    ndim: u32,
+    data: *const c_void,
+    len: usize,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let name = unsafe { as_str(name, "name")? };
+        // SAFETY: the contract.
+        let dtype = dtype_from_c(unsafe { as_str(dtype, "dtype")? })?;
+        if shape.is_null() && ndim > 0 {
+            return Err(usage("shape is null"));
+        }
+        if data.is_null() && len > 0 {
+            return Err(usage("data is null"));
+        }
+        // SAFETY: the contract requires `ndim` readable extents.
+        let dims: Vec<u64> = unsafe { std::slice::from_raw_parts(shape, ndim as usize) }.to_vec();
+        // SAFETY: the contract requires `len` readable bytes.
+        let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
+        add_tensor(h, name, dtype, dims, bytes, None)
+    })
+}
+
+/// The shared tail of the two tensor entry points: check R-T02 before storing,
+/// so a wrong byte count is reported by the call that made it.
+fn add_tensor(
+    h: &omni_builder,
+    name: &str,
+    dtype: DType,
+    shape: Vec<u64>,
+    data: Vec<u8>,
+    layout: Option<Layout>,
+) -> R<()> {
+    if name.is_empty() {
+        return Err(usage("tensor name is empty"));
+    }
+    {
+        let bb = h.b.borrow();
+        if bb.tensors.iter().any(|t| t.name == name) {
+            return Err(usage(format!("tensor `{name}` was already added")));
+        }
+    }
+    let numel: u64 = shape.iter().product();
+    let lay = layout.clone().unwrap_or_default();
+    let expected = lay
+        .stored_bytes(&shape, &dtype)
+        .unwrap_or_else(|| dtype.packed_bytes(numel));
+    if expected != data.len() as u64 {
+        return Err(Fail::new(
+            OMNI_EINVALID,
+            format!(
+                "R-T02: tensor `{name}` of {} elements at `{}` needs {expected} bytes, got {}",
+                numel,
+                dtype.label(),
+                data.len()
+            ),
+        ));
+    }
+    h.b.borrow_mut().tensors.push(omni_core::TensorSpec {
+        name: name.to_string(),
+        shape,
+        dtype,
+        axes: None,
+        semantic: String::new(),
+        data,
+        layout,
+    });
+    Ok(())
+}
+
+/// Names a tensor's axes (§04.2). Comma-separated, one name per dimension.
+///
+/// Axis names are what make an adapter's rank requirement checkable (§08.2), so
+/// they are worth stating — and stating them wrongly is worse than leaving them
+/// out, which is why the count is checked against the tensor's rank.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_tensor_axes(
+    b: *mut omni_builder,
+    name: *const c_char,
+    axes_csv: *const c_char,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let name = unsafe { as_str(name, "name")? };
+        // SAFETY: the contract.
+        let csv = unsafe { as_str(axes_csv, "axes_csv")? };
+        let axes: Vec<String> = csv.split(',').map(|s| s.trim().to_string()).collect();
+        let mut bb = h.b.borrow_mut();
+        let t = bb
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == name)
+            .ok_or_else(|| usage(format!("no tensor named `{name}` has been added")))?;
+        if axes.len() != t.shape.len() {
+            return Err(usage(format!(
+                "tensor `{name}` has rank {} and {} axis names were given",
+                t.shape.len(),
+                axes.len()
+            )));
+        }
+        t.axes = Some(axes);
+        Ok(())
+    })
+}
+
+/// Sets a tensor's §04.2 semantic role: `"weight"`, `"bias"`, `"embedding"`, …
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_set_tensor_semantic(
+    b: *mut omni_builder,
+    name: *const c_char,
+    semantic: *const c_char,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let name = unsafe { as_str(name, "name")? };
+        // SAFETY: the contract.
+        let sem = unsafe { as_str(semantic, "semantic")? };
+        let mut bb = h.b.borrow_mut();
+        let t = bb
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == name)
+            .ok_or_else(|| usage(format!("no tensor named `{name}` has been added")))?;
+        t.semantic = sem.to_string();
+        Ok(())
+    })
+}
+
+/// Adds a tensor from a DLPack `DLTensor`, which is how a PyTorch, JAX, NumPy,
+/// CuPy or MLX array gets into a container without the caller flattening it
+/// first.
+///
+/// This is the inverse of [`omni_tensor_dlpack`] and it refuses the same three
+/// things, for the same reasons: a device that is not the CPU (there are no
+/// bytes here to read), a dtype DLPack spells and §04.3 does not (`lanes > 1`),
+/// and a strided array that is not dense row-major — because copying it as if
+/// it were dense would store a different tensor with the right length. The
+/// caller keeps ownership of the array; the bytes are copied.
+///
+/// # Safety
+/// See the module-level contract; `t` must point to a valid `DLTensor` whose
+/// `data`, `shape` and `strides` are readable for its `ndim`.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_add_dlpack(
+    b: *mut omni_builder,
+    name: *const c_char,
+    t: *const DLTensor,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let name = unsafe { as_str(name, "name")? };
+        if t.is_null() {
+            return Err(usage("dltensor is null"));
+        }
+        // SAFETY: the contract.
+        let dl = unsafe { &*t };
+        if dl.device.device_type != OMNI_DLPACK_CPU {
+            return Err(usage(format!(
+                "DLPack device type {} is not CPU; there are no bytes here to read",
+                dl.device.device_type
+            )));
+        }
+        if dl.ndim < 0 {
+            return Err(usage("DLPack ndim is negative"));
+        }
+        let ndim = dl.ndim as usize;
+        if dl.shape.is_null() && ndim > 0 {
+            return Err(usage("DLPack shape is null"));
+        }
+        // SAFETY: the contract.
+        let dims_i64 = unsafe { std::slice::from_raw_parts(dl.shape, ndim) };
+        if dims_i64.iter().any(|d| *d < 0) {
+            return Err(usage("DLPack shape has a negative extent"));
+        }
+        let dims: Vec<u64> = dims_i64.iter().map(|d| *d as u64).collect();
+
+        // A null `strides` means dense row-major, which is what §04.3.5 wants.
+        // A non-null one has to *be* dense row-major, checked rather than
+        // assumed: an array that is a transposed view has the same bytes in a
+        // different order, and storing it as dense would be a different tensor.
+        if !dl.strides.is_null() {
+            // SAFETY: the contract.
+            let strides = unsafe { std::slice::from_raw_parts(dl.strides, ndim) };
+            let mut want = 1i64;
+            for i in (0..ndim).rev() {
+                if dims[i] > 1 && strides[i] != want {
+                    return Err(Fail::new(
+                        OMNI_EUSAGE,
+                        format!(
+                            "DLPack strides {strides:?} are not dense row-major for shape \
+                             {dims:?}; make the array contiguous first"
+                        ),
+                    ));
+                }
+                want *= dims[i].max(1) as i64;
+            }
+        }
+
+        let dtype = dl_dtype_in(&dl.dtype)?;
+        let numel: u64 = dims.iter().product();
+        let len = dtype.packed_bytes(numel) as usize;
+        if dl.data.is_null() && len > 0 {
+            return Err(usage("DLPack data is null"));
+        }
+        // SAFETY: the contract: `data + byte_offset` is readable for the
+        // array's extent, which for a dense array is `len` bytes.
+        let bytes: Vec<u8> = unsafe {
+            std::slice::from_raw_parts((dl.data as *const u8).add(dl.byte_offset as usize), len)
+        }
+        .to_vec();
+        add_tensor(h, name, dtype, dims, bytes, None)
+    })
+}
+
+/// The inverse of [`dl_dtype`]: DLPack's encoding onto a §04.3 dtype.
+///
+/// DLPack's `bits` and `lanes` describe whole-byte lanes, so the mapping is
+/// narrow on purpose. A `lanes > 1` vector type is refused rather than
+/// flattened, because §04.3 would spell it as a different shape and silently
+/// changing a caller's rank is not a conversion.
+fn dl_dtype_in(d: &DLDataType) -> R<DType> {
+    if d.lanes != 1 {
+        return Err(usage(format!(
+            "DLPack lanes {} has no §04.3 dtype; a vector lane is a shape there, not a type",
+            d.lanes
+        )));
+    }
+    let bits = d.bits as u16;
+    Ok(match (d.code, bits) {
+        (0, 8) | (0, 16) | (0, 32) | (0, 64) => DType::Int {
+            w: bits,
+            signed: true,
+        },
+        (1, 8) | (1, 16) | (1, 32) | (1, 64) => DType::Int {
+            w: bits,
+            signed: false,
+        },
+        (2, 16) => DType::F16,
+        (2, 32) => DType::F32,
+        (2, 64) => DType::F64,
+        (4, 16) => DType::BF16,
+        (6, 8) => DType::Bool,
+        (code, bits) => {
+            return Err(usage(format!(
+                "DLPack dtype code {code} at {bits} bits has no §04.3 spelling here"
+            )))
+        }
+    })
+}
+
+/// Copies the digest of the root manifest the current calls would produce.
+///
+/// It is available before anything is written because the identity is a
+/// function of the content and nothing else (§01.2): building the graph twice
+/// gives the same digest, and packing it decides only where the bytes sit.
+///
+/// # Safety
+/// See the module-level contract; `d32` must point to 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_root_digest(b: *mut omni_builder, d32: *mut u8) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        if d32.is_null() {
+            return Err(usage("d32 is null"));
+        }
+        let (_, root) = h.b.borrow().build();
+        // SAFETY: the contract requires 32 writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(root.as_ptr(), d32, 32) };
+        Ok(())
+    })
+}
+
+/// How many tensors have been added.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_tensor_count(b: *mut omni_builder) -> usize {
+    match builder_mut(b) {
+        Ok(h) => h.b.borrow().tensors.len(),
+        Err(_) => 0,
+    }
+}
+
+fn pack_options(h: &omni_builder) -> omni_core::PackOptions {
+    omni_core::PackOptions {
+        log2_align: h.log2_align.get(),
+        hash: h.b.borrow().hash,
+        codec: h.codec.borrow().clone(),
+        ..Default::default()
+    }
+}
+
+/// Writes the container to `path`.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_write(b: *mut omni_builder, path: *const c_char) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        // SAFETY: the contract.
+        let path = unsafe { as_str(path, "path")? };
+        let (objects, root) = h.b.borrow().build();
+        let bytes = omni_core::pack(&objects, &root, &pack_options(h)).map_err(from_container)?;
+        std::fs::write(path, &bytes)
+            .map_err(|e| Fail::new(OMNI_EINVALID, format!("{path}: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Writes the container into memory. The bytes stay valid until the next call
+/// to this function on the same builder, or until the builder is freed.
+///
+/// # Safety
+/// See the module-level contract.
+#[no_mangle]
+pub unsafe extern "C" fn omni_builder_write_bytes(
+    b: *mut omni_builder,
+    ptr: *mut *const u8,
+    len: *mut usize,
+) -> c_int {
+    guard(|| {
+        let h = builder_mut(b)?;
+        let (objects, root) = h.b.borrow().build();
+        let bytes = omni_core::pack(&objects, &root, &pack_options(h)).map_err(from_container)?;
+        let arc = Arc::new(bytes);
+        *h.bytes.borrow_mut() = Some(arc.clone());
+        // SAFETY: the contract.
+        unsafe { out(ptr, "ptr", arc.as_ptr())? };
+        if !len.is_null() {
+            // SAFETY: the contract.
+            unsafe { out(len, "len", arc.len())? };
+        }
+        Ok(())
+    })
+}
+
 // ------------------------------------------------------------------- tests --
 
 #[cfg(test)]
@@ -1392,7 +2042,7 @@ mod tests {
             shape: vec![8, 8],
             dtype: DType::BF16,
             axes: Some(vec!["out".into(), "in".into()]),
-            semantic: "weight",
+            semantic: "weight".into(),
             data,
             layout: None,
         });
@@ -1412,6 +2062,335 @@ mod tests {
         unsafe { CStr::from_ptr(omni_last_error()) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    // ------------------------------------------------------------- writer --
+
+    /// Builds a two-tensor model through the C entry points alone.
+    fn build_through_c() -> *mut omni_builder {
+        let mut b: *mut omni_builder = std::ptr::null_mut();
+        let name = cstring("test/from-c");
+        assert_eq!(unsafe { omni_builder_new(name.as_ptr(), &mut b) }, OMNI_OK);
+        let spdx = cstring("Apache-2.0");
+        assert_eq!(
+            unsafe { omni_builder_set_license(b, spdx.as_ptr()) },
+            OMNI_OK
+        );
+        let fam = cstring("transformer.decoder");
+        let params = cstring("{\"n_layers\": 2, \"d_model\": 8}");
+        assert_eq!(
+            unsafe { omni_builder_set_arch(b, fam.as_ptr(), params.as_ptr()) },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+        let tname = cstring("w");
+        let dtype = cstring("bf16");
+        let shape = [4u64, 8];
+        let data = [0x3fu8; 4 * 8 * 2];
+        assert_eq!(
+            unsafe {
+                omni_builder_add_tensor(
+                    b,
+                    tname.as_ptr(),
+                    dtype.as_ptr(),
+                    shape.as_ptr(),
+                    2,
+                    data.as_ptr() as *const c_void,
+                    data.len(),
+                )
+            },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+        let axes = cstring("out_features,in_features");
+        assert_eq!(
+            unsafe { omni_builder_set_tensor_axes(b, tname.as_ptr(), axes.as_ptr()) },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+        let sem = cstring("weight");
+        assert_eq!(
+            unsafe { omni_builder_set_tensor_semantic(b, tname.as_ptr(), sem.as_ptr()) },
+            OMNI_OK
+        );
+        let bname = cstring("b");
+        let f32ty = cstring("f32");
+        let bshape = [4u64];
+        let bdata = [0u8; 16];
+        assert_eq!(
+            unsafe {
+                omni_builder_add_tensor(
+                    b,
+                    bname.as_ptr(),
+                    f32ty.as_ptr(),
+                    bshape.as_ptr(),
+                    1,
+                    bdata.as_ptr() as *const c_void,
+                    bdata.len(),
+                )
+            },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+        b
+    }
+
+    #[test]
+    fn a_container_built_from_c_opens_verifies_and_reads_back() {
+        let b = build_through_c();
+        assert_eq!(unsafe { omni_builder_tensor_count(b) }, 2);
+        let mut ptr: *const u8 = std::ptr::null();
+        let mut len: usize = 0;
+        assert_eq!(
+            unsafe { omni_builder_write_bytes(b, &mut ptr, &mut len) },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+        assert!(len > 0);
+        // The digest the builder predicted must be the root of what it wrote:
+        // identity is a function of content, not of when it was computed.
+        let mut want = [0u8; 32];
+        assert_eq!(
+            unsafe { omni_builder_root_digest(b, want.as_mut_ptr()) },
+            OMNI_OK
+        );
+
+        let mut s: *mut omni_store = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { omni_store_open_bytes(ptr, len, &mut s) },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+        let mut got = [0u8; 32];
+        assert_eq!(
+            unsafe { omni_store_root_digest(s, got.as_mut_ptr()) },
+            OMNI_OK
+        );
+        assert_eq!(got, want);
+        assert_eq!(
+            unsafe { omni_store_verify(s, std::ptr::null_mut()) },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+
+        let mut m: *mut omni_model = std::ptr::null_mut();
+        assert_eq!(unsafe { omni_store_root(s, &mut m) }, OMNI_OK);
+        assert_eq!(unsafe { omni_model_tensor_count(m) }, 2);
+        let n = cstring("w");
+        let mut t: *mut omni_tensor = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { omni_model_tensor(m, n.as_ptr(), &mut t) },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+        let mut info = std::mem::MaybeUninit::<omni_tensor_info>::zeroed();
+        assert_eq!(
+            unsafe { omni_tensor_get_info(t, info.as_mut_ptr()) },
+            OMNI_OK
+        );
+        let info = unsafe { info.assume_init() };
+        assert_eq!(
+            unsafe { CStr::from_ptr(info.dtype) }.to_str().unwrap(),
+            "bf16"
+        );
+        assert_eq!(info.numel, 32);
+        unsafe { omni_tensor_release(t) };
+        unsafe { omni_model_free(m) };
+        unsafe { omni_store_close(s) };
+        unsafe { omni_builder_free(b) };
+    }
+
+    #[test]
+    fn the_same_calls_produce_the_same_bytes() {
+        // §01.10 writer rule W1. Two builders, same calls, byte-identical
+        // output — the property that makes a container reproducible at all.
+        let b1 = build_through_c();
+        let b2 = build_through_c();
+        let (mut p1, mut l1) = (std::ptr::null(), 0usize);
+        let (mut p2, mut l2) = (std::ptr::null(), 0usize);
+        assert_eq!(
+            unsafe { omni_builder_write_bytes(b1, &mut p1, &mut l1) },
+            OMNI_OK
+        );
+        assert_eq!(
+            unsafe { omni_builder_write_bytes(b2, &mut p2, &mut l2) },
+            OMNI_OK
+        );
+        let a = unsafe { std::slice::from_raw_parts(p1, l1) };
+        let c = unsafe { std::slice::from_raw_parts(p2, l2) };
+        assert_eq!(a, c);
+        unsafe { omni_builder_free(b1) };
+        unsafe { omni_builder_free(b2) };
+    }
+
+    #[test]
+    fn a_wrong_byte_count_is_caught_by_the_call_that_made_it() {
+        let mut b: *mut omni_builder = std::ptr::null_mut();
+        let name = cstring("test/short");
+        assert_eq!(unsafe { omni_builder_new(name.as_ptr(), &mut b) }, OMNI_OK);
+        let tname = cstring("w");
+        let dtype = cstring("f32");
+        let shape = [4u64, 4];
+        let data = [0u8; 8]; // 64 bytes are needed.
+        let rc = unsafe {
+            omni_builder_add_tensor(
+                b,
+                tname.as_ptr(),
+                dtype.as_ptr(),
+                shape.as_ptr(),
+                2,
+                data.as_ptr() as *const c_void,
+                data.len(),
+            )
+        };
+        assert_eq!(rc, OMNI_EINVALID);
+        assert!(last().contains("R-T02"), "{}", last());
+        // Nothing was added, so the builder is still usable.
+        assert_eq!(unsafe { omni_builder_tensor_count(b) }, 0);
+        unsafe { omni_builder_free(b) };
+    }
+
+    #[test]
+    fn an_unspellable_dtype_and_an_unimplemented_codec_are_told_apart() {
+        let mut b: *mut omni_builder = std::ptr::null_mut();
+        let name = cstring("test/refusals");
+        assert_eq!(unsafe { omni_builder_new(name.as_ptr(), &mut b) }, OMNI_OK);
+        // A dtype with no alias is a usage error naming the way to spell it.
+        let tname = cstring("w");
+        let bogus = cstring("float37");
+        let shape = [1u64];
+        let data = [0u8; 8];
+        let rc = unsafe {
+            omni_builder_add_tensor(
+                b,
+                tname.as_ptr(),
+                bogus.as_ptr(),
+                shape.as_ptr(),
+                1,
+                data.as_ptr() as *const c_void,
+                data.len(),
+            )
+        };
+        assert_eq!(rc, OMNI_EUSAGE);
+        assert!(last().contains("§04.3"), "{}", last());
+        // A registered codec this build cannot produce is indeterminate, not
+        // invalid, and never a silent downgrade to raw.
+        let brotli = cstring("brotli");
+        assert_eq!(
+            unsafe { omni_builder_set_codec(b, brotli.as_ptr()) },
+            OMNI_INDETERMINATE
+        );
+        let nonsense = cstring("gzip9000");
+        assert_eq!(
+            unsafe { omni_builder_set_codec(b, nonsense.as_ptr()) },
+            OMNI_EUSAGE
+        );
+        // And one it can.
+        let zstd = cstring("zstd:9");
+        assert_eq!(unsafe { omni_builder_set_codec(b, zstd.as_ptr()) }, OMNI_OK);
+        unsafe { omni_builder_free(b) };
+    }
+
+    #[test]
+    fn a_dlpack_array_becomes_a_tensor_and_a_transposed_view_is_refused() {
+        let mut b: *mut omni_builder = std::ptr::null_mut();
+        let name = cstring("test/dlpack-in");
+        assert_eq!(unsafe { omni_builder_new(name.as_ptr(), &mut b) }, OMNI_OK);
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let mut shape = [3i64, 4i64];
+        let dl = DLTensor {
+            data: data.as_ptr() as *mut c_void,
+            device: DLDevice {
+                device_type: OMNI_DLPACK_CPU,
+                device_id: 0,
+            },
+            ndim: 2,
+            dtype: DLDataType {
+                code: 2,
+                bits: 32,
+                lanes: 1,
+            },
+            shape: shape.as_mut_ptr(),
+            strides: std::ptr::null_mut(),
+            byte_offset: 0,
+        };
+        let tn = cstring("x");
+        assert_eq!(
+            unsafe { omni_builder_add_dlpack(b, tn.as_ptr(), &dl) },
+            OMNI_OK,
+            "{}",
+            last()
+        );
+
+        // The same buffer described as a transposed view: the bytes are the
+        // same and the tensor is not, so it is refused rather than copied.
+        let mut strides = [1i64, 3i64];
+        let mut view = dl;
+        view.strides = strides.as_mut_ptr();
+        let tn2 = cstring("xT");
+        assert_eq!(
+            unsafe { omni_builder_add_dlpack(b, tn2.as_ptr(), &view) },
+            OMNI_EUSAGE
+        );
+        assert!(last().contains("row-major"), "{}", last());
+
+        // A lane count DLPack allows and §04.3 spells as a shape.
+        let mut vec4 = view;
+        vec4.strides = std::ptr::null_mut();
+        vec4.dtype.lanes = 4;
+        let tn3 = cstring("v");
+        assert_eq!(
+            unsafe { omni_builder_add_dlpack(b, tn3.as_ptr(), &vec4) },
+            OMNI_EUSAGE
+        );
+
+        // What went in comes back out through the read path, values and all.
+        let (mut p, mut l) = (std::ptr::null(), 0usize);
+        assert_eq!(
+            unsafe { omni_builder_write_bytes(b, &mut p, &mut l) },
+            OMNI_OK
+        );
+        let mut s: *mut omni_store = std::ptr::null_mut();
+        assert_eq!(unsafe { omni_store_open_bytes(p, l, &mut s) }, OMNI_OK);
+        let mut m: *mut omni_model = std::ptr::null_mut();
+        assert_eq!(unsafe { omni_store_root(s, &mut m) }, OMNI_OK);
+        let mut t: *mut omni_tensor = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { omni_model_tensor(m, tn.as_ptr(), &mut t) },
+            OMNI_OK
+        );
+        let (mut vp, mut vl) = (std::ptr::null(), 0usize);
+        assert_eq!(unsafe { omni_tensor_values(t, &mut vp, &mut vl) }, OMNI_OK);
+        let values = unsafe { std::slice::from_raw_parts(vp, vl) };
+        assert_eq!(values.len(), 12);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(*v, i as f64);
+        }
+        unsafe { omni_tensor_release(t) };
+        unsafe { omni_model_free(m) };
+        unsafe { omni_store_close(s) };
+        unsafe { omni_builder_free(b) };
+    }
+
+    #[test]
+    fn a_null_builder_handle_is_a_usage_error_and_freeing_null_does_nothing() {
+        assert_eq!(
+            unsafe { omni_builder_set_chunk_size(std::ptr::null_mut(), 4096) },
+            OMNI_EUSAGE
+        );
+        assert_eq!(
+            unsafe { omni_builder_tensor_count(std::ptr::null_mut()) },
+            0
+        );
+        unsafe { omni_builder_free(std::ptr::null_mut()) };
     }
 
     #[test]

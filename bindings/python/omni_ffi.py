@@ -52,6 +52,7 @@ __all__ = [
     "Model",
     "Plan",
     "Tensor",
+    "Builder",
     "VerifyReport",
     "open",
     "open_bytes",
@@ -62,8 +63,8 @@ __all__ = [
     "OBJECTIVES",
 ]
 
-# The major half must match the library's; see omni.h.
-ABI_VERSION = 0x0001_0000
+# The major half must match the library's; see omni.h. 1.1 added the writer.
+ABI_VERSION = 0x0001_0001
 
 OK = 0
 EINVALID = 1
@@ -400,6 +401,60 @@ class Library:
             "omni_tensor_dlpack",
             ctypes.c_int,
             [_VOID, _P(_P(_DLManagedTensor))],
+        )
+
+        sig("omni_builder_new", ctypes.c_int, [ctypes.c_char_p, _P(_VOID)])
+        sig("omni_builder_free", None, [_VOID])
+        sig("omni_builder_set_hash", ctypes.c_int, [_VOID, ctypes.c_char_p])
+        sig("omni_builder_set_license", ctypes.c_int, [_VOID, ctypes.c_char_p])
+        sig(
+            "omni_builder_set_arch",
+            ctypes.c_int,
+            [_VOID, ctypes.c_char_p, ctypes.c_char_p],
+        )
+        sig(
+            "omni_builder_add_meta",
+            ctypes.c_int,
+            [_VOID, ctypes.c_char_p, ctypes.c_char_p],
+        )
+        sig("omni_builder_set_chunk_size", ctypes.c_int, [_VOID, ctypes.c_uint64])
+        sig("omni_builder_set_codec", ctypes.c_int, [_VOID, ctypes.c_char_p])
+        sig("omni_builder_set_alignment", ctypes.c_int, [_VOID, ctypes.c_uint32])
+        sig(
+            "omni_builder_add_tensor",
+            ctypes.c_int,
+            [
+                _VOID,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                _P(ctypes.c_uint64),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ],
+        )
+        sig(
+            "omni_builder_set_tensor_axes",
+            ctypes.c_int,
+            [_VOID, ctypes.c_char_p, ctypes.c_char_p],
+        )
+        sig(
+            "omni_builder_set_tensor_semantic",
+            ctypes.c_int,
+            [_VOID, ctypes.c_char_p, ctypes.c_char_p],
+        )
+        sig(
+            "omni_builder_add_dlpack",
+            ctypes.c_int,
+            [_VOID, ctypes.c_char_p, _P(_DLTensor)],
+        )
+        sig("omni_builder_tensor_count", ctypes.c_size_t, [_VOID])
+        sig("omni_builder_root_digest", ctypes.c_int, [_VOID, _P(ctypes.c_uint8)])
+        sig("omni_builder_write", ctypes.c_int, [_VOID, ctypes.c_char_p])
+        sig(
+            "omni_builder_write_bytes",
+            ctypes.c_int,
+            [_VOID, _P(_P(ctypes.c_uint8)), _P(ctypes.c_size_t)],
         )
 
         got = d.omni_abi_version()
@@ -827,6 +882,210 @@ class Tensor(_Handle):
             f"<Tensor {self.name!r} {self.dtype} {shape} "
             f"{self.layout} {self.value_op}>"
         )
+
+
+class Builder(_Handle):
+    """A container being written (`omni_builder_*`).
+
+    The binding was a reader for a draft, which meant anything that wanted to
+    *publish* an OMNI container from Python had to shell out to the CLI or go
+    through Rust. This is the writer, over the same ABI.
+
+    Arrays arrive either as raw bytes with a declared dtype and shape, or —
+    more usefully — through DLPack, which is how a `torch.Tensor`, a
+    `numpy.ndarray`, a JAX array or an MLX array gets in without being flattened
+    by hand first:
+
+        with omni_ffi.Builder("acme/tiny") as b:
+            b.arch("transformer.decoder", {"n_layers": 2})
+            b.add_dlpack("model.embed_tokens.weight", weights)
+            b.write("tiny.omni")
+
+    The bytes are copied on the way in. A zero-copy writer would have to keep
+    the caller's array alive until the pack, and a binding that holds a
+    reference to a tensor somebody else may mutate is a worse bargain than a
+    copy.
+    """
+
+    _free_name = "omni_builder_free"
+
+    def __init__(self, name: str, lib: "Library | None" = None):
+        lib = lib or _default_library()
+        out = ctypes.c_void_p()
+        lib.check(lib.dll.omni_builder_new(name.encode(), ctypes.byref(out)), name)
+        super().__init__(lib, out)
+
+    def __len__(self) -> int:
+        return self._lib.dll.omni_builder_tensor_count(self._live())
+
+    # -- metadata ----------------------------------------------------------
+
+    def hash(self, algo: str) -> "Builder":
+        """`"blake3-256"` or `"sha2-256"` (§03.5.1)."""
+        self._lib.check(
+            self._lib.dll.omni_builder_set_hash(self._live(), algo.encode()), algo
+        )
+        return self
+
+    def license(self, spdx: str) -> "Builder":
+        self._lib.check(
+            self._lib.dll.omni_builder_set_license(self._live(), spdx.encode()), spdx
+        )
+        return self
+
+    def arch(self, family: str, params: "dict | None" = None) -> "Builder":
+        blob = json.dumps(params).encode() if params is not None else None
+        self._lib.check(
+            self._lib.dll.omni_builder_set_arch(self._live(), family.encode(), blob),
+            family,
+        )
+        return self
+
+    def meta(self, key: str, value) -> "Builder":
+        self._lib.check(
+            self._lib.dll.omni_builder_add_meta(
+                self._live(), key.encode(), json.dumps(value).encode()
+            ),
+            key,
+        )
+        return self
+
+    def chunk_size(self, n: int) -> "Builder":
+        self._lib.check(self._lib.dll.omni_builder_set_chunk_size(self._live(), n))
+        return self
+
+    def codec(self, spec: str) -> "Builder":
+        """`"raw"`, `"zstd:9"`, `"lz4:9"`, `"bitshuffle+zstd:9:2"` (§03.7.1)."""
+        self._lib.check(
+            self._lib.dll.omni_builder_set_codec(self._live(), spec.encode()), spec
+        )
+        return self
+
+    def alignment(self, log2: int) -> "Builder":
+        self._lib.check(self._lib.dll.omni_builder_set_alignment(self._live(), log2))
+        return self
+
+    # -- tensors -----------------------------------------------------------
+
+    def add_tensor(
+        self,
+        name: str,
+        dtype: str,
+        shape,
+        data,
+        axes=None,
+        semantic: "str | None" = None,
+    ) -> "Builder":
+        """Adds a tensor from bytes laid out as §04.3.5 says.
+
+        `dtype` is a §04.3.6 alias (`"bf16"`, `"i4"`) or a §04.3 structural
+        descriptor as a JSON string.
+        """
+        dims = (ctypes.c_uint64 * len(shape))(*shape)
+        buf = bytes(data)
+        self._lib.check(
+            self._lib.dll.omni_builder_add_tensor(
+                self._live(),
+                name.encode(),
+                dtype.encode(),
+                dims,
+                len(shape),
+                ctypes.cast(ctypes.c_char_p(buf), ctypes.c_void_p),
+                len(buf),
+            ),
+            name,
+        )
+        if axes is not None:
+            self.axes(name, axes)
+        if semantic is not None:
+            self.semantic(name, semantic)
+        return self
+
+    def add_dlpack(
+        self, name: str, array, axes=None, semantic: "str | None" = None
+    ) -> "Builder":
+        """Adds a tensor from anything that speaks DLPack.
+
+        Takes an object with `__dlpack__` (torch, numpy ≥ 1.23, jax, cupy,
+        mlx), a raw capsule, or a `DLManagedTensor *`. The capsule is consumed
+        the way DLPack requires — renamed and deleted — so the caller does not
+        also free it.
+        """
+        managed = None
+        capsule = None
+        if hasattr(array, "__dlpack__"):
+            capsule = array.__dlpack__()
+        elif isinstance(array, ctypes.POINTER(_DLManagedTensor)):
+            managed = array
+        else:
+            capsule = array
+        if capsule is not None:
+            managed = consume_capsule(capsule)
+        try:
+            self._lib.check(
+                self._lib.dll.omni_builder_add_dlpack(
+                    self._live(),
+                    name.encode(),
+                    ctypes.byref(managed.contents.dl_tensor),
+                ),
+                name,
+            )
+        finally:
+            if capsule is not None and managed.contents.deleter:
+                managed.contents.deleter(managed)
+        if axes is not None:
+            self.axes(name, axes)
+        if semantic is not None:
+            self.semantic(name, semantic)
+        return self
+
+    def axes(self, name: str, axes) -> "Builder":
+        csv = axes if isinstance(axes, str) else ",".join(axes)
+        self._lib.check(
+            self._lib.dll.omni_builder_set_tensor_axes(
+                self._live(), name.encode(), csv.encode()
+            ),
+            name,
+        )
+        return self
+
+    def semantic(self, name: str, semantic: str) -> "Builder":
+        self._lib.check(
+            self._lib.dll.omni_builder_set_tensor_semantic(
+                self._live(), name.encode(), semantic.encode()
+            ),
+            name,
+        )
+        return self
+
+    # -- writing -----------------------------------------------------------
+
+    @property
+    def root_digest(self) -> bytes:
+        """The root digest these calls would produce, before anything is
+        written: identity is a function of content (§01.2)."""
+        buf = (ctypes.c_uint8 * 32)()
+        self._lib.check(self._lib.dll.omni_builder_root_digest(self._live(), buf))
+        return bytes(buf)
+
+    def write(self, path) -> "Builder":
+        self._lib.check(
+            self._lib.dll.omni_builder_write(self._live(), str(path).encode()), str(path)
+        )
+        return self
+
+    def to_bytes(self) -> bytes:
+        ptr = ctypes.POINTER(ctypes.c_uint8)()
+        n = ctypes.c_size_t()
+        self._lib.check(
+            self._lib.dll.omni_builder_write_bytes(
+                self._live(), ctypes.byref(ptr), ctypes.byref(n)
+            )
+        )
+        return bytes(bytearray(ctypes.cast(ptr, _P(ctypes.c_uint8 * n.value)).contents))
+
+    def __repr__(self) -> str:
+        return f"<Builder {len(self)} tensors>"
 
 
 # ---------------------------------------------------------------- entry API --

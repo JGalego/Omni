@@ -546,7 +546,7 @@ mod tests {
                 shape: vec![256],
                 dtype: crate::dtype::DType::F32,
                 axes: None,
-                semantic: "weight",
+                semantic: "weight".into(),
                 data: (0..1024u32).map(|i| (i % 251) as u8).collect(),
                 layout: None,
             })

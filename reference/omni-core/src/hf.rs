@@ -942,7 +942,7 @@ pub fn import(files: &Files, opts: &ImportOpts) -> Res<Imported> {
                         shape: e.shape.clone(),
                         dtype: e.dtype.clone(),
                         axes: None,
-                        semantic: "",
+                        semantic: "".into(),
                         data: f.tensor(e).to_vec(),
                         layout: Some(crate::safetensors::layout_of(&e.dtype)),
                     });
@@ -1142,7 +1142,7 @@ fn respec(out: &Imported) -> Res<(Vec<crate::model::TensorSpec>, usize, u64)> {
             shape: desc.sizes().unwrap_or_default(),
             dtype: desc.dtype.clone(),
             axes: None,
-            semantic: "",
+            semantic: "".into(),
             data,
             layout: Some(desc.layout.clone()),
         });

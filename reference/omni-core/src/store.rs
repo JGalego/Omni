@@ -617,7 +617,7 @@ mod tests {
                 shape: vec![64, 64],
                 dtype: crate::DType::F32,
                 axes: None,
-                semantic: "weight",
+                semantic: "weight".into(),
                 data: (0..64 * 64 * 4).map(|i| (i % 251) as u8).collect(),
                 layout: None,
             })
@@ -1079,7 +1079,7 @@ mod file_store_tests {
                 shape: vec![1024, 1024],
                 dtype: crate::dtype::DType::BF16,
                 axes: None,
-                semantic: "weight",
+                semantic: "weight".into(),
                 data,
                 layout: None,
             })

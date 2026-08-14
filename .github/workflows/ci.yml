@@ -1694,6 +1694,39 @@ jobs:
 
           echo "a C program read a container end to end through the C ABI"
 
+          # The other half of docs/design/sdk.md §3: a binding that can only
+          # read is a viewer. A C program builds a container — including one
+          # tensor handed over as DLPack, which is the path a torch or numpy
+          # array takes — and the CLI, a different program, verifies it at V6.
+          cc -Wall -Wextra -Werror -std=c11 -pedantic \
+            reference/omni-ffi/examples/write.c \
+            -I reference/omni-ffi/include \
+            reference/target/release/libomni.a -lpthread -ldl -lm -o /tmp/omni-write
+          /tmp/omni-write /tmp/from-c.omni | tee /tmp/write.txt
+          grep -q 'the C ABI wrote a container end to end' /tmp/write.txt
+          # §01.10 writer rule W1, checked from the C side.
+          grep -q 'reproducible=1' /tmp/write.txt
+          # DLPack in, values out, exactly.
+          grep -q 'dlpack_roundtrip=1' /tmp/write.txt
+          # R-T02 is checked by the call that made the mistake.
+          grep -q 'short buffer: R-T02' /tmp/write.txt
+          "$OMNI" verify /tmp/from-c.omni --level 6
+          "$OMNI" inspect /tmp/from-c.omni | tee /tmp/from-c.txt
+          grep -q 'acme/from-c' /tmp/from-c.txt
+          # The pure-Python reader, which shares nothing with the writer, must
+          # read what C wrote — that is the check with teeth.
+          PYTHONPATH=bindings/python python3 - <<'PY_READ'
+          import omni
+          c = omni.open_file('/tmp/from-c.omni')
+          names = list(c.tensors())
+          assert names, "the from-specification reader found no tensors"
+          for n in names:
+              data, desc = c.tensor_bytes(n)
+              print(f"  {n}: {len(data)} bytes, {desc.get('dtype', {}).get('alias')}")
+          print("the from-specification reader reads what C wrote")
+          PY_READ
+          echo "a C program wrote a container end to end through the C ABI"
+
       # `docs/design/sdk.md` §5 claims a conforming C0 reader needs only a header
       # parse, an index lookup, canonical CBOR, BLAKE3 and literal tensors. The
       # Rust implementation is evidence for that, but it also *wrote* these

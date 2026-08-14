@@ -610,7 +610,7 @@ fn assemble(
             // safetensors says nothing about what a tensor *is*. Calling
             // everything a weight would be a guess; §04.2's `semantic` is left
             // for a caller who knows.
-            semantic: "",
+            semantic: "".into(),
             data: f.tensor(e).to_vec(),
             layout: Some(layout_of(&e.dtype)),
         });
@@ -1658,7 +1658,7 @@ mod tests {
                 shape: vec![8],
                 dtype: DType::I4,
                 axes: None,
-                semantic: "weight",
+                semantic: "weight".into(),
                 // Eight 4-bit elements in four bytes.
                 data: vec![0x21, 0x43, 0x65, 0x07],
                 layout: None,

@@ -11,7 +11,8 @@
  * ---------
  * Handles are opaque. Every call that produces one has exactly one call that
  * releases it: omni_store_close, omni_model_free, omni_plan_free,
- * omni_tensor_release. Releasing NULL is defined and does nothing. The handles
+ * omni_tensor_release, omni_builder_free. Releasing NULL is defined and does
+ * nothing. The handles
  * are reference-counted internally, so a tensor outliving the store it came
  * from is fine — that is deliberate, because a Python object outliving a
  * borrow is the classic zero-copy-binding bug.
@@ -50,8 +51,11 @@ extern "C" {
 /*
  * High 16 bits: incompatible changes. Low 16 bits: additive ones. A caller
  * whose compiled-in high half differs from omni_abi_version()'s must stop.
+ *
+ * 1.1 added the writer (omni_builder_*): every earlier symbol is unchanged, so
+ * a program compiled against 1.0 links and runs against this unmodified.
  */
-#define OMNI_ABI_VERSION 0x00010000u
+#define OMNI_ABI_VERSION 0x00010001u
 
 uint32_t    omni_abi_version(void);
 const char *omni_spec_version(void);
@@ -86,10 +90,11 @@ const char *omni_status_name(omni_status status);
 
 /* ----------------------------------------------------------------- handles */
 
-typedef struct omni_store  omni_store;
-typedef struct omni_model  omni_model;
-typedef struct omni_plan   omni_plan;
-typedef struct omni_tensor omni_tensor;
+typedef struct omni_store   omni_store;
+typedef struct omni_model   omni_model;
+typedef struct omni_plan    omni_plan;
+typedef struct omni_tensor  omni_tensor;
+typedef struct omni_builder omni_builder;
 
 /* -------------------------------------------------------------------- store */
 
@@ -271,6 +276,98 @@ typedef struct DLManagedTensor {
  * that and a packed buffer described as dense would be read wrongly.
  */
 omni_status omni_tensor_dlpack(omni_tensor *t, DLManagedTensor **out);
+
+
+/* ------------------------------------------------------------------ writer */
+
+/*
+ * Building a container from C (docs/design/sdk.md §3.4).
+ *
+ * The read path above was this ABI for a draft, and a caller that could open,
+ * verify, walk and hand out a model still could not make one. These are the
+ * other half.
+ *
+ * Nothing here decides what the format leaves to a writer: the digest
+ * algorithm, the chunk size, the storage codec and the alignment are all
+ * yours. Packing is reproducible (§01.10, writer rule W1) — the same calls
+ * produce the same bytes, and so does a different order of the same calls,
+ * because objects are placed by digest rather than by arrival.
+ *
+ *   omni_builder *b;
+ *   omni_builder_new("acme/tiny", &b);
+ *   uint64_t shape[2] = {4, 8};
+ *   omni_builder_add_tensor(b, "w", "bf16", shape, 2, bytes, sizeof bytes);
+ *   omni_builder_write(b, "tiny.omni");
+ *   omni_builder_free(b);
+ */
+omni_status omni_builder_new(const char *name, omni_builder **out);
+void        omni_builder_free(omni_builder *b);
+
+/* "blake3-256" or "sha2-256" (§03.5.1). Object identities depend on it. */
+omni_status omni_builder_set_hash(omni_builder *b, const char *algo);
+omni_status omni_builder_set_license(omni_builder *b, const char *spdx);
+/* `params_json` may be NULL; otherwise a JSON object -> meta.arch.params. */
+omni_status omni_builder_set_arch(omni_builder *b, const char *family,
+                                  const char *params_json);
+/* One meta key from a JSON value — the escape hatch for the rest of §06. */
+omni_status omni_builder_add_meta(omni_builder *b, const char *key,
+                                  const char *value_json);
+/* §03.6 `fixed` chunking: the granularity of dedup and of range reads. */
+omni_status omni_builder_set_chunk_size(omni_builder *b, uint64_t bytes);
+/*
+ * "raw", "zstd:9", "deflate:6", "lz4:9", "bitshuffle+zstd:9:2" (§03.7.1). A
+ * registered codec this build cannot produce returns OMNI_INDETERMINATE rather
+ * than quietly writing raw.
+ */
+omni_status omni_builder_set_codec(omni_builder *b, const char *codec);
+/* Page alignment as a power of two, 6..30 (§02.4). Default 12. */
+omni_status omni_builder_set_alignment(omni_builder *b, uint32_t log2);
+
+/*
+ * A tensor from bytes laid out as §04.3.5 says: dense row-major,
+ * little-endian, the dtype's own packing for sub-byte types. `dtype` is a
+ * §04.3.6 alias ("bf16", "i4", "f32") or a §04.3 structural descriptor as a
+ * JSON object. `data` is copied.
+ *
+ * The shape and dtype must account for exactly `len` bytes: R-T02 is checked
+ * by this call, so a wrong length is reported where it was made rather than at
+ * write time.
+ */
+omni_status omni_builder_add_tensor(omni_builder *b, const char *name,
+                                    const char *dtype,
+                                    const uint64_t *shape, uint32_t ndim,
+                                    const void *data, size_t len);
+/* Comma-separated axis names, one per dimension (§04.2). */
+omni_status omni_builder_set_tensor_axes(omni_builder *b, const char *name,
+                                         const char *axes_csv);
+/* "weight", "bias", "embedding", … (§04.2). */
+omni_status omni_builder_set_tensor_semantic(omni_builder *b, const char *name,
+                                             const char *semantic);
+/*
+ * A tensor from a DLPack array — the inverse of omni_tensor_dlpack, and how a
+ * PyTorch, JAX, NumPy, CuPy or MLX array gets in. The bytes are copied and the
+ * caller keeps ownership. Refuses a non-CPU device, `lanes > 1`, and a strided
+ * array that is not dense row-major, because copying a transposed view as if
+ * it were dense would store a different tensor with the right length.
+ */
+omni_status omni_builder_add_dlpack(omni_builder *b, const char *name,
+                                    const DLTensor *t);
+
+size_t      omni_builder_tensor_count(omni_builder *b);
+/*
+ * The root digest the current calls would produce, available before anything
+ * is written: identity is a function of content (§01.2), not of when it was
+ * computed. Copies 32 bytes.
+ */
+omni_status omni_builder_root_digest(omni_builder *b, uint8_t *d32);
+
+omni_status omni_builder_write(omni_builder *b, const char *path);
+/*
+ * Writes into memory. The bytes stay valid until the next call to this
+ * function on the same builder, or until it is freed.
+ */
+omni_status omni_builder_write_bytes(omni_builder *b, const uint8_t **ptr,
+                                     size_t *len);
 
 #ifdef __cplusplus
 }  /* extern "C" */

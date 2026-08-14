@@ -1805,7 +1805,7 @@ mod tests {
                     shape: vec![4],
                     dtype: crate::dtype::DType::F32,
                     axes: None,
-                    semantic: "weight",
+                    semantic: "weight".into(),
                     data: vec![0u8; 16],
                     layout: None,
                 })
@@ -1849,7 +1849,7 @@ mod tests {
                     shape: vec![64, 64],
                     dtype: crate::dtype::DType::F32,
                     axes: None,
-                    semantic: "weight",
+                    semantic: "weight".into(),
                     data,
                     layout: None,
                 })

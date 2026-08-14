@@ -6417,7 +6417,7 @@ fn cmd_example(args: &[String]) -> R {
         shape: vec![vocab, hidden],
         dtype: DType::BF16,
         axes: Some(vec!["vocab".into(), "hidden".into()]),
-        semantic: "embedding",
+        semantic: "embedding".into(),
         data: embed.clone(),
         layout: None,
     });
@@ -6426,7 +6426,7 @@ fn cmd_example(args: &[String]) -> R {
         shape: vec![vocab, hidden],
         dtype: DType::BF16,
         axes: Some(vec!["vocab".into(), "hidden".into()]),
-        semantic: "weight",
+        semantic: "weight".into(),
         data: embed,
         layout: None,
     });
@@ -6458,7 +6458,7 @@ fn cmd_example(args: &[String]) -> R {
                 shape: vec![out_dim, hidden],
                 dtype: DType::BF16,
                 axes: Some(vec!["out_features".into(), "in_features".into()]),
-                semantic: "weight",
+                semantic: "weight".into(),
                 data,
                 layout: None,
             });
@@ -6470,7 +6470,7 @@ fn cmd_example(args: &[String]) -> R {
             shape: vec![hidden],
             dtype: DType::F32,
             axes: Some(vec!["hidden".into()]),
-            semantic: "scale",
+            semantic: "scale".into(),
             data,
             layout: None,
         });
@@ -8171,7 +8171,7 @@ fn cmd_convert(args: &[String]) -> R {
             shape,
             dtype: want.clone(),
             axes: desc.axes.clone(),
-            semantic: "",
+            semantic: "".into(),
             data,
             layout: None,
         });

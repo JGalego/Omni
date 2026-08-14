@@ -1561,7 +1561,7 @@ mod tests {
             shape: vec![32, 32],
             dtype: DType::BF16,
             axes: None,
-            semantic: "weight",
+            semantic: "weight".into(),
             data: weight,
             layout: None,
         });

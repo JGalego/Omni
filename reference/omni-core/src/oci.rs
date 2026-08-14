@@ -620,7 +620,7 @@ mod tests {
                 shape: vec![ELEMS],
                 dtype: crate::dtype::DType::F32,
                 axes: None,
-                semantic: "weight",
+                semantic: "weight".into(),
                 data: weights(fill, i),
                 layout: None,
             });
@@ -770,7 +770,7 @@ mod tests {
                     shape: vec![ELEMS],
                     dtype: crate::dtype::DType::F32,
                     axes: None,
-                    semantic: "weight",
+                    semantic: "weight".into(),
                     data,
                     layout: None,
                 });
