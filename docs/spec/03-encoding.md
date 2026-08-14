@@ -246,6 +246,102 @@ pre-allocate exactly `logical_len`, MUST abort if the codec produces more, and
 MUST reject a declared ratio above 1000:1 unless `features.optional` contains
 `omni.codec/high-ratio.1`. See §12.4.
 
+### 3.7.5 `ans-lut`
+
+Every other codec in §3.7.1 is somebody else's format, and its bitstream is
+defined by their specification. `ans-lut` is OMNI's own, and until it was
+written down the registry named an identifier no two implementations could have
+agreed on. This is the definition.
+
+**What it is for.** A codebook-quantized weight (§5.2) is a stream of small
+indices whose distribution is strongly skewed — an NF4 tensor's indices are not
+uniform over sixteen values, and neither are a k-means codebook's. A
+general-purpose LZ coder finds no matches in such a stream and spends its
+entropy coder on a byte alphabet it models badly. Range-coding the indices
+against a table measured from the block itself is the operation that fits, and
+it is cheap in both directions: one multiply, one shift and one table lookup per
+symbol.
+
+**The stream.** All integers are little-endian.
+
+```
+u8      version               ; 1
+u8      log2_scale            ; 8..16; the frequency table sums to 1 << log2_scale
+u32     block_elems           ; symbols per block, the last block may be shorter
+varint  block_count
+block*                        ; block_count of them
+```
+
+Each block is:
+
+```
+u8      kind                  ; 0 = stored, 1 = coded
+u32     symbol_count          ; symbols in this block
+if kind == 0:
+    u8  bytes[symbol_count]   ; the block verbatim
+if kind == 1:
+    u8  used                  ; distinct symbols, minus one (so 1..256)
+    (u8 symbol, u16 freq)*    ; `used + 1` pairs, symbols strictly increasing
+    u32 payload_len
+    u8  payload[payload_len]  ; the rANS stream
+```
+
+A block whose entropy coding would not be smaller than the block MUST be written
+`stored`, so the codec never expands its input by more than five bytes a block.
+
+**The coder.** A single-state rANS over a 32-bit state, renormalizing sixteen
+bits at a time, with `L = 1 << 16` as the lower bound of the normalized
+interval — so the state lives in `[L, L << 16)` and fits a 32-bit word exactly. `freq[s]` is the block's measured frequency of `s`, scaled so the
+frequencies sum to exactly `1 << log2_scale`, and every symbol that occurs has
+`freq[s] ≥ 1`. `cum[s]` is the exclusive prefix sum. The **LUT** the name refers
+to is the inverse map — `1 << log2_scale` entries, `slot → symbol` — which is
+what makes decoding one lookup rather than a search, and which a decoder builds
+from the frequency table rather than reading from the stream.
+
+Encoding processes the block's symbols **in reverse**, so that decoding runs
+forwards:
+
+```
+x ← L
+for s in reverse(symbols):
+    while x ≥ ((L >> log2_scale) << 16) × freq[s]:
+        emit16(x & 0xFFFF); x ← x >> 16
+    x ← ((x ÷ freq[s]) << log2_scale) + (x mod freq[s]) + cum[s]
+emit32(x)
+```
+
+The payload is then **reversed byte-wise**, so a decoder reads it forwards:
+
+```
+x ← read32()
+repeat symbol_count times:
+    slot ← x & ((1 << log2_scale) − 1)
+    s    ← lut[slot]
+    x    ← freq[s] × (x >> log2_scale) + slot − cum[s]
+    while x < L: x ← (x << 16) | read16()
+    emit s
+```
+
+**Reader rules.**
+
+* **R-C20** the frequencies MUST sum to exactly `1 << log2_scale`; a table that
+  does not is invalid, not a decoding hint.
+* **R-C21** a symbol listed in the table MUST have `freq ≥ 1`, and the listed
+  symbols MUST be strictly increasing, so the table has one canonical form and
+  two writers produce the same bytes for the same block.
+* **R-C22** the decoder MUST stop after `symbol_count` symbols and MUST NOT
+  read past `payload_len`; a stream that ends early is invalid rather than
+  padded.
+* **R-C23** `log2_scale` MUST be between 8 and 16. Below 8 a 256-symbol
+  alphabet cannot be represented; above 16 the LUT stops fitting in cache,
+  which is the only reason this codec is worth having.
+
+**What it is not.** `ans-lut` has no match finder and no context modelling: it
+is an order-0 coder over one block. On text it loses to `deflate`; on a
+bitshuffled float tensor it loses to `zstd`. It exists for the case the registry
+names, and a writer that applies it to anything else is choosing badly rather
+than doing something forbidden.
+
 ## 3.8 Encryption (summary)
 
 Optional; see §12.8. Applied per-object, after compression, using AEAD

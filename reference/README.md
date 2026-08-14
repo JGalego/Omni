@@ -138,6 +138,9 @@ implemented:
   over LZMA2, both directions — the range coder, the eleven probability arrays,
   matched literals, the position-slot distance model, the four reset modes and
   all four integrity checks including the SHA-256 one this crate already had),
+  `ans-lut` (§03.7.5, which this work also had to *write*: it is the one codec
+  in the registry that belongs to OMNI, and until the section existed the
+  registry named an identifier no two implementations could have agreed on),
   `bitshuffle`, and
   both `bitshuffle+zstd` and `bitshuffle+deflate`, with the §03.7.4
   decompression bounds; a compressed container holds the same object identities
@@ -535,12 +538,15 @@ implemented:
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §03.7's MAY-level codecs `brotli`, `ans-lut` and the two lossy ones:
-  reported as unsupported rather than half-decoded. `lz4` and `xz` are
-  implemented; `xz`'s BCJ and `delta` filters are not, and a stream that uses
-  one is reported *unsupported* by the filter's own name rather than decoded
-  without it, because a filter changes the bytes and skipping it produces a
-  plausible wrong answer
+- §03.7's MAY-level codec `brotli` and the two lossy ones: reported as
+  unsupported rather than half-decoded. `brotli` is the one where the reason is
+  not effort — RFC 7932 decoding requires the 122 KiB static dictionary, and a
+  decoder without it answers wrongly on any stream that references it rather
+  than refusing, so half of it is worse than none. `lz4`, `xz` and `ans-lut`
+  are implemented; `xz`'s BCJ and `delta` filters are not, and a stream that
+  uses one is reported *unsupported* by the filter's own name rather than
+  decoded without it, because a filter changes the bytes and skipping it
+  produces a plausible wrong answer
 - `https://`. §13.4's HTTP range store is here and speaks HTTP/1.1 over a
   socket, but TLS needs a cryptographic transport stack and this crate has no
   dependencies to provide one. An `https://` URL is refused with that reason
@@ -631,7 +637,7 @@ expectation.
 
 ## Tests
 
-578 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+590 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -929,7 +935,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 578 passed; 0 failed
+test result: ok. 590 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

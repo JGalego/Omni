@@ -12,8 +12,7 @@
 //! §03.7.2 cares about, because transposing to byte-plane order groups the
 //! highly redundant exponent bytes of a float tensor together.
 //!
-//! Still unimplemented and reported as such: the MAY-level codecs `brotli`,
-//! `ans-lut` and the two lossy ones. A registered codec this build cannot
+//! Still unimplemented and reported as such: `brotli` and the two lossy ones. A registered codec this build cannot
 //! decode makes an object *indeterminate* (§15.1), never invalid — and never
 //! silently half-decoded.
 //!
@@ -101,6 +100,9 @@ pub enum Codec {
     Xz {
         level: u8,
     },
+    /// §03.7.5's rANS over a per-block lookup table, for codebook-quantized
+    /// weights. An order-0 coder has no effort knob, so there is no level.
+    AnsLut,
     /// Byte-plane transpose with the given element width, then deflate.
     BitshuffleDeflate {
         elem_size: usize,
@@ -123,6 +125,7 @@ impl Codec {
             Codec::Deflate { .. } => id::DEFLATE,
             Codec::Lz4 { .. } => id::LZ4,
             Codec::Xz { .. } => id::XZ,
+            Codec::AnsLut => id::ANS_LUT,
             Codec::BitshuffleDeflate { .. } => id::BITSHUFFLE_DEFLATE,
             // A pure filter has no registry id of its own; it is only meaningful
             // paired with an entropy coder, and is exposed here for testing.
@@ -146,6 +149,7 @@ impl Codec {
             Codec::Deflate { .. } => "deflate",
             Codec::Lz4 { .. } => "lz4",
             Codec::Xz { .. } => "xz",
+            Codec::AnsLut => "ans-lut",
             Codec::BitshuffleDeflate { .. } => "bitshuffle+deflate",
             Codec::Bitshuffle { .. } => "bitshuffle",
             Codec::Unsupported(n) => n,
@@ -168,6 +172,7 @@ impl Codec {
             id::DEFLATE => Codec::Deflate { level: 6 },
             id::LZ4 => Codec::Lz4 { level: 6 },
             id::XZ => Codec::Xz { level: 6 },
+            id::ANS_LUT => Codec::AnsLut,
             id::BITSHUFFLE_DEFLATE => Codec::BitshuffleDeflate {
                 elem_size: 2,
                 level: 6,
@@ -175,7 +180,6 @@ impl Codec {
             id::BROTLI => Codec::Unsupported("brotli"),
             id::ZFP => Codec::Unsupported("zfp"),
             id::SZ3 => Codec::Unsupported("sz3"),
-            id::ANS_LUT => Codec::Unsupported("ans-lut"),
             _ => Codec::Unsupported("unknown"),
         }
     }
@@ -238,12 +242,12 @@ impl Codec {
             "deflate" => Codec::Deflate { level },
             "lz4" => Codec::Lz4 { level },
             "xz" => Codec::Xz { level },
+            "ans-lut" => Codec::AnsLut,
             "bitshuffle+deflate" => Codec::BitshuffleDeflate { elem_size, level },
             "bitshuffle" => Codec::Bitshuffle { elem_size },
             "brotli" => Codec::Unsupported("brotli"),
             "zfp" => Codec::Unsupported("zfp"),
             "sz3" => Codec::Unsupported("sz3"),
-            "ans-lut" => Codec::Unsupported("ans-lut"),
             _ => Codec::Unsupported("unknown"),
         }
     }
@@ -260,6 +264,7 @@ impl Codec {
             Codec::Deflate { level } => Ok(deflate(logical, *level)),
             Codec::Lz4 { level } => Ok(crate::lz4::compress(logical, *level)),
             Codec::Xz { level } => Ok(crate::xz::compress(logical, *level)),
+            Codec::AnsLut => Ok(crate::ans::compress(logical, 0)),
             Codec::Bitshuffle { elem_size } => Ok(bitshuffle(logical, *elem_size)),
             Codec::BitshuffleDeflate { elem_size, level } => {
                 Ok(deflate(&bitshuffle(logical, *elem_size), *level))
@@ -295,6 +300,7 @@ impl Codec {
             Codec::Deflate { .. } => inflate(stored, n)?,
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, n)?,
             Codec::Xz { .. } => crate::xz::decompress(stored, n)?,
+            Codec::AnsLut => crate::ans::decompress(stored, n)?,
             Codec::Bitshuffle { elem_size } => unbitshuffle(stored, *elem_size),
             Codec::BitshuffleDeflate { elem_size, .. } => {
                 unbitshuffle(&inflate(stored, n)?, *elem_size)
@@ -329,6 +335,7 @@ impl Codec {
             Codec::Deflate { .. } => inflate(stored, cap),
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, cap),
             Codec::Xz { .. } => crate::xz::decompress(stored, cap),
+            Codec::AnsLut => crate::ans::decompress(stored, cap),
             Codec::Bitshuffle { elem_size } => Ok(unbitshuffle(stored, *elem_size)),
             Codec::BitshuffleDeflate { elem_size, .. } => {
                 Ok(unbitshuffle(&inflate(stored, cap)?, *elem_size))
@@ -562,7 +569,6 @@ pub fn deflate(data: &[u8], level: u8) -> Vec<u8> {
             if i + MIN_MATCH <= data.len() {
                 let h = hash(data, i);
                 prev[i] = head[h];
-                head[i] = 0; // placeholder, overwritten below
                 head[h] = i;
             }
             i += 1;
@@ -856,6 +862,25 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_past_the_window_is_not_an_index_error() {
+        // The hash table is indexed by hash and the chain by position, and a
+        // stray write indexed the *table* by position — which is in range only
+        // while the input is shorter than the window. It took an input over
+        // 32 KiB with literals past that point to reach it, which no corpus
+        // here had. Regression: any input this long must simply round-trip.
+        let mut state = 0x2026_0814u32;
+        let data: Vec<u8> = (0..70000)
+            .map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                (state >> 16) as u8
+            })
+            .collect();
+        for level in [1u8, 6, 9] {
+            roundtrip(&data, level);
+        }
+    }
+
+    #[test]
     fn repetitive_data_actually_compresses() {
         let data: Vec<u8> = std::iter::repeat_n(b"omni".to_vec(), 4096)
             .flatten()
@@ -1018,7 +1043,7 @@ mod tests {
 
     #[test]
     fn unimplemented_codecs_say_so_rather_than_guessing() {
-        for name in ["brotli", "ans-lut", "zfp", "sz3"] {
+        for name in ["brotli", "zfp", "sz3"] {
             let c = Codec::from_value(&Value::map(vec![("id", Value::text(name))]));
             assert_eq!(c.name(), name);
             assert!(matches!(c.encode(b"x"), Err(Error::Unsupported(_))));
@@ -1052,6 +1077,7 @@ mod tests {
             },
             Codec::Lz4 { level: 6 },
             Codec::Xz { level: 6 },
+            Codec::AnsLut,
             Codec::Unsupported("brotli"),
         ] {
             let v = c.to_value();
@@ -1063,6 +1089,8 @@ mod tests {
         assert_eq!(Codec::Deflate { level: 6 }.id(), id::DEFLATE);
         assert_eq!(Codec::Lz4 { level: 6 }.id(), id::LZ4);
         assert_eq!(Codec::Xz { level: 6 }.id(), id::XZ);
+        assert_eq!(Codec::AnsLut.id(), id::ANS_LUT);
+        assert_eq!(Codec::from_id(id::ANS_LUT), Codec::AnsLut);
         assert_eq!(Codec::from_id(id::XZ), Codec::Xz { level: 6 });
         assert_eq!(Codec::from_id(id::LZ4), Codec::Lz4 { level: 6 });
         assert_eq!(Codec::from_id(id::ZSTD), Codec::Zstd { level: 3 });

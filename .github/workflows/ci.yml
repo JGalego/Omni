@@ -3013,6 +3013,77 @@ jobs:
           PY
           echo "zstd interoperates with libzstd in both directions"
 
+      # `ans-lut` is the one codec in §03.7.1 that belongs to OMNI, so there is
+      # no library to disagree with. The question a second implementation
+      # answers here is a different and better one: is §03.7.5 enough to
+      # implement from? tools/ans-fixture.py was written from the section text
+      # and not from the Rust, and the two must agree byte for byte.
+      - name: ans-lut agrees with an implementation written from the section
+        run: |
+          python3 tools/ans-fixture.py selftest
+          CONF=reference/target/release/omni-conformance
+          python3 - "$CONF" <<'PY'
+          import importlib.util, random, subprocess, sys
+
+          spec = importlib.util.spec_from_file_location("ansfix", "tools/ans-fixture.py")
+          fix = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(fix)
+
+          CONF = sys.argv[1]
+          rng = random.Random(20260814)
+          # The distribution the codec exists for: NF4-shaped codebook indices.
+          weights = [1, 2, 5, 12, 26, 52, 92, 140, 140, 92, 52, 26, 12, 5, 2, 1]
+          pop = [i for i, w in enumerate(weights) for _ in range(w)]
+          cases = {
+              "empty": b"",
+              "one byte": b"\x07",
+              "codebook indices": bytes(rng.choice(pop) for _ in range(60000)),
+              "one value": bytes(50000),
+              "uniform bytes": bytes(rng.randrange(256) for _ in range(70000)),
+              "every symbol": bytes(range(256)) * 8,
+              "two blocks": bytes(rng.choice(pop) for _ in range((1 << 16) + 17)),
+          }
+
+          bad = 0
+          for name, data in cases.items():
+              open('/tmp/a-in.bin', 'wb').write(data)
+              r = subprocess.run([CONF, 'codec', 'ans-lut', 'encode', '/tmp/a-in.bin',
+                                  '/tmp/a-ours.ans'], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"::error::encode failed for {name}: {r.stderr}")
+                  bad += 1
+                  continue
+              ours = open('/tmp/a-ours.ans', 'rb').read()
+              try:
+                  back = fix.decode(ours, max(len(data), 1))
+              except Exception as e:
+                  print(f"::error::the fixture rejected our stream for {name}: {e}")
+                  bad += 1
+                  back = None
+              if back is not None and back != data:
+                  print(f"::error::the fixture decoded our stream for {name} differently")
+                  bad += 1
+              theirs = fix.encode(data)
+              open('/tmp/a-ref.ans', 'wb').write(theirs)
+              r = subprocess.run([CONF, 'codec', 'ans-lut', 'decode', '/tmp/a-ref.ans',
+                                  '/tmp/a-back.bin', '--logical-len', str(len(data)),
+                                  '--high-ratio'], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"::error::we rejected the fixture's stream for {name}: {r.stderr}")
+                  bad += 1
+              elif open('/tmp/a-back.bin', 'rb').read() != data:
+                  print(f"::error::we decoded the fixture's stream for {name} differently")
+                  bad += 1
+              # The strong form: §03.7.5 leaves no choices, so two
+              # implementations of it produce the same bytes.
+              if theirs != ours:
+                  print(f"::error::the two implementations disagree on the bytes for {name}")
+                  bad += 1
+              print(f"{name}: {len(data)} B -> {len(ours)} B, identical in both")
+          sys.exit(1 if bad else 0)
+          PY
+          echo "ans-lut agrees with a second implementation, byte for byte"
+
       # `xz` has liblzma on every runner through Python's standard library,
       # which is the strongest kind of check available: the reference
       # implementation, written by somebody else, on both sides.
@@ -3181,7 +3252,7 @@ jobs:
           # The baseline: the same objects packed raw, from the same directory
           # store, so a raw repack has something byte-exact to be compared with.
           "$OMNI" pack /tmp/comp.omnid -o /tmp/base.omni >/dev/null
-          for codec in zstd:9 bitshuffle+zstd:9:2 deflate:9 lz4:9 xz:6; do
+          for codec in zstd:9 bitshuffle+zstd:9:2 deflate:9 lz4:9 xz:6 ans-lut; do
             "$OMNI" pack /tmp/comp.omnid -o /tmp/packed.omni --codec "$codec" >/dev/null
             "$OMNI" verify /tmp/packed.omni --level 6 >/dev/null
             "$OMNI" repack /tmp/packed.omni -o /tmp/re.omni --codec raw | tee /tmp/repack.txt

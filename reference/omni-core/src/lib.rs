@@ -35,9 +35,10 @@
 //! registry wanting a bearer token from an https realm is told apart from one
 //! that does not rather than guessed at. `omni mount` (§13.9) is unimplemented;
 //! [`serve`] is the object server of §13.4.3 and [`oci`] the §13.5 mapping.
-//! Of §03.7's codecs, `zstd` (the MUST), `deflate`, `lz4` and `xz` are here;
-//! the remaining MAY-level ones are reported as unsupported rather than
-//! half-decoded. The WebAssembly
+//! Of §03.7's codecs, `zstd` (the MUST), `deflate`, `lz4`, `xz` and `ans-lut`
+//! are here — the last of which needed §03.7.5 written before it could exist,
+//! since the registry named it and nothing defined its bitstream. `brotli` and
+//! the two lossy ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
 //! in `docs/design/import-export.md` §3, eight are implemented —
 //! [`safetensors`], [`pytorch`], [`gguf`], [`onnx`], [`peft`], GPTQ and AWQ in
@@ -53,6 +54,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod adapter;
+pub mod ans;
 pub mod bao;
 pub mod blake3;
 pub mod cbor;
