@@ -1,0 +1,38 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+
+Copyright (c) 2026 The OMNI Authors
+
+The OMNI specification — the normative text in `docs/spec/`, together with the
+design and rationale documents in `docs/design/` and `docs/rationale/` — is
+licensed under the Creative Commons Attribution 4.0 International License.
+
+    SPDX-License-Identifier: CC-BY-4.0
+
+    Human-readable summary:  https://creativecommons.org/licenses/by/4.0/
+    The licence itself:      https://creativecommons.org/licenses/by/4.0/legalcode
+
+The full legal code is not reproduced here. That is Creative Commons' own
+recommendation — a licence identified by name, version and URI is unambiguous,
+while a copy in a repository is a copy that can drift from the licence it claims
+to be. The URI above is the authoritative text, and the SPDX identifier is the
+machine-readable form of the same statement.
+
+You are free to share and adapt this specification for any purpose, including
+commercially, provided you give appropriate credit, link to the licence, and
+indicate whether you made changes. The following attribution satisfies the
+licence for an unmodified copy:
+
+    "OMNI: Open Model Neutral Interchange, version 1.0 (Draft)" by The OMNI
+    Authors, https://github.com/jgalego/Omni, licensed under CC BY 4.0.
+
+Why this licence, and not a more restrictive one: a format specification is
+worth exactly as much as the number of independent implementations of it, and
+every clause that makes reimplementation a legal question rather than an
+engineering one reduces that number. CC BY 4.0 asks for credit and nothing
+else. It does not require that a derived specification be called OMNI, and it
+does not grant permission to describe a modified format as conforming to this
+one — that is what the conformance profiles in `docs/spec/15-conformance.md`
+are for, and they are a technical test rather than a licence term.
+
+The reference implementation is licensed separately and more permissively still;
+see `LICENSE` for which files fall under which terms.

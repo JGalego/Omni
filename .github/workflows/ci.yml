@@ -3689,3 +3689,63 @@ jobs:
             echo "::error::trailing whitespace in docs"; exit 1
           fi
           echo "clean"
+
+      # A licence is the one claim in this repository that cannot be checked by
+      # running anything, so it gets checked as a claim: every licence a manifest
+      # names must be a file that exists, and every path LICENSE assigns terms to
+      # must be a path that exists. A `license =` field pointing at nothing is
+      # not a licensing subtlety — it is an unlicensed repository with a badge.
+      - name: Every licence claimed is a licence shipped
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+          bad = []
+
+          # SPDX expressions from the crate manifests, resolved through the
+          # workspace's `license.workspace = true` indirection.
+          spdx = set()
+          for f in sorted(glob.glob('reference/**/Cargo.toml', recursive=True)) + ['reference/Cargo.toml']:
+              for m in re.finditer(r'^license\s*=\s*"([^"]+)"', open(f, encoding='utf-8').read(), re.M):
+                  spdx.add((f, m.group(1)))
+          if not spdx:
+              bad.append(('reference/Cargo.toml', 'no manifest declares a license at all'))
+
+          # The file each identifier has to be backed by.
+          backing = {
+              'Apache-2.0': 'LICENSE-APACHE',
+              'MIT': 'LICENSE-MIT',
+              'CC-BY-4.0': 'LICENSE-SPEC',
+          }
+          for f, expr in sorted(spdx):
+              for ident in re.split(r'\s+(?:OR|AND)\s+', expr):
+                  ident = ident.strip('()')
+                  if ident not in backing:
+                      bad.append((f, f'license "{ident}" is not one this check knows how to back'))
+                  elif not os.path.exists(backing[ident]):
+                      bad.append((f, f'license "{ident}" has no {backing[ident]} in the repository'))
+
+          # The README's badges name the same two things the manifests do.
+          readme = open('README.md', encoding='utf-8').read()
+          for want in ('LICENSE-SPEC', 'LICENSE-APACHE', 'LICENSE-MIT', 'LICENSE'):
+              if want not in readme:
+                  bad.append(('README.md', f'the licence section does not point at {want}'))
+
+          # LICENSE assigns terms per path; a stale path assigns terms to nothing.
+          text = open('LICENSE', encoding='utf-8').read()
+          # `-` belongs in the class: without it a hyphenated path does not fail
+          # this check, it silently stops being covered by it, which is the worse
+          # of the two outcomes because it looks like a pass.
+          paths = re.findall(r'^  ([A-Za-z0-9_.\-/]+(?:\*\*)?)\s{2,}\S', text, re.M)
+          if len(paths) != 12:
+              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 12; the table has '
+                                     'changed shape and this check may no longer read all of it'))
+          for p in paths:
+              root = p.split('/')[0].replace('**', '')
+              if not os.path.exists(root):
+                  bad.append(('LICENSE', f'assigns terms to {p}, which does not exist'))
+
+          for f, why in bad:
+              print(f"::error file={f}::{why}")
+          print(f"checked {len(spdx)} manifest licence fields and {len(paths)} assigned paths, {len(bad)} problems")
+          sys.exit(1 if bad else 0)
+          PY

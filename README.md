@@ -248,6 +248,14 @@ that it and the from-specification reader agree on every tensor's bytes.
 
 ## License
 
-The specification is offered under CC BY 4.0; the reference implementation under
-Apache-2.0 OR MIT. Standards need patent-safe, permissive licensing to be
-adopted, and dual licensing removes the last excuse.
+The specification is offered under [CC BY 4.0](LICENSE-SPEC); the reference
+implementation under [Apache-2.0](LICENSE-APACHE) OR [MIT](LICENSE-MIT), the
+choice being the licensee's rather than ours. Standards need patent-safe,
+permissive licensing to be adopted, and dual licensing removes the last excuse.
+
+[`LICENSE`](LICENSE) says which files fall under which terms, because the line
+that matters is not documentation versus code but *the part you reimplement*
+versus the part you reuse — and CI checks that every licence the two badges above
+and every crate manifest name is a file that exists, since a licence claimed and
+not shipped is the one kind of missing file that cannot be worked around
+downstream.

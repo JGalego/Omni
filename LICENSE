@@ -1,0 +1,57 @@
+OMNI is licensed under two different licences, because it is two different
+things in one repository: a specification that other people are meant to
+implement, and an implementation of it.
+
+  The specification            CC BY 4.0            LICENSE-SPEC
+  The reference implementation Apache-2.0 OR MIT    LICENSE-APACHE, LICENSE-MIT
+
+"OR" is the licensee's choice, not the licensor's: you may use the code under
+the Apache License 2.0, or under the MIT licence, whichever suits you, and you
+need not say which.
+
+Which files are which
+---------------------
+
+Under CC BY 4.0 (see LICENSE-SPEC):
+
+  docs/spec/**            the normative specification
+  docs/design/**          the engineering proposals
+  docs/rationale/**       the design rationale
+  README.md               this repository's own prose
+  assets/**               the logo and diagrams
+
+Under Apache-2.0 OR MIT (see LICENSE-APACHE and LICENSE-MIT):
+
+  reference/**            the Rust reference implementation
+  bindings/**             the Python reader and the ctypes binding
+  tools/**                the corpus instrument and the differential fixtures
+  examples/**             the committed example containers and their sources
+  conformance/**          the conformance corpus and its manifests
+  docs/explorer.html      a program that happens to live under docs/
+  .github/**              the CI workflow
+
+A file's own header wins over this list where the two disagree, and a
+`SPDX-License-Identifier` line is the header that says so. Where a directory
+above contains a file taken from somewhere else, that file names its origin and
+its terms at the top; there is no vendored third-party code in this repository
+at present, because there are no dependencies to vendor.
+
+Why the split is drawn here
+---------------------------
+
+The line is not "documentation versus code" — it is "the part you reimplement
+versus the part you reuse". A specification under a permissive code licence
+invites a subtly different question than the one it should ("may I copy this
+text?" rather than "may I build this?"), while an implementation under CC BY 4.0
+would be a licence with no patent grant and no warranty disclaimer written for
+software, which is a worse answer for anyone shipping it. Dual-licensing the
+code as Apache-2.0 OR MIT is the Rust ecosystem's convention and removes the
+last two objections a downstream user can raise: Apache-2.0 for its explicit
+patent grant, MIT for those whose policies predate it.
+
+The specification's licence deliberately does not restrict reimplementation,
+including of parts of it, including in a format that is not OMNI. Conformance is
+a technical claim tested by docs/spec/15-conformance.md and the corpus in
+conformance/, and it stays a technical claim: nothing in either licence lets a
+modified format describe itself as conforming, and nothing in either licence
+stops anyone from building one.
