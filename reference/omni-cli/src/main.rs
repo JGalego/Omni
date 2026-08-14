@@ -106,11 +106,14 @@ VERBS:
     graph   migrate <file.omni> -o <out.omni>
                               Apply shipped op-version rewrites (§07.4.1)
     graph   run <file.omni> --tokens 1,2,3 [--fuel N] [--max-elems N]
-                              [--json <out.json>]
+                              [--json <out.json>] [--no-shipped]
                               Execute the graph over the container's own weights.
                               Verification says a graph is well-typed; this says
                               whether it computes anything. An op this build does
-                              not implement is refused by name and exits 3
+                              not implement runs from a `ref_impl` the model
+                              ships (§07.4.2) if there is one, and is otherwise
+                              refused by name with exit 3. `--no-shipped` uses
+                              only what this build implements
     plugin  list <file.omni>
                               Embedded plugins (§11.5): what they provide, which
                               modules run under the §11.6 profile
@@ -3502,7 +3505,7 @@ fn module_digest(c: &Container) -> Result<Digest, Box<dyn std::error::Error>> {
 /// resolved through the tensor table, so the graph cannot be fed anything but the
 /// model it ships with.
 fn graph_run(c: &Container, module: &omni_core::ir::Module, args: &[String]) -> R {
-    use omni_core::interp::{run, Limits, Weights};
+    use omni_core::interp::{run_with, Limits, Weights};
 
     /// The container's tensors, materialized on demand. A graph mentions a
     /// handful of the model's tensors per layer and materializing all of them up
@@ -3594,8 +3597,33 @@ fn graph_run(c: &Container, module: &omni_core::ir::Module, args: &[String]) -> 
             .unwrap_or(1 << 22),
         ..Default::default()
     };
+    // §07.4.2's `ref_impl`, out of the container: an op this build does not
+    // implement is asked of the model before it is refused. `--no-shipped`
+    // turns that off, because "would this run without the model's help?" is a
+    // question worth being able to ask.
+    let objects = |d: &[u8; 32]| c.read(d).ok();
+    let (host, problems) = dialect_semantics(c, module, &objects);
+    let use_shipped = !args.iter().any(|a| a == "--no-shipped");
+    for p in &problems {
+        pr!("  note           {p}");
+    }
+    let semantics: Option<&dyn omni_core::ir::DialectHost> = if use_shipped && !host.is_empty() {
+        Some(&host)
+    } else {
+        None
+    };
+    if !use_shipped && !host.is_empty() {
+        // Said out loud, because the refusal below would otherwise read as a
+        // statement about the model rather than about this run.
+        pr!(
+            "  note           --no-shipped: the model ships {} §07.4.2 function(s), \
+             and this run did not use them",
+            host.len()
+        );
+    }
+
     let t0 = std::time::Instant::now();
-    let out = match run(module, &[arg], &w, &limits) {
+    let out = match run_with(module, &[arg], &w, &limits, semantics) {
         Ok(o) => o,
         Err(e) => {
             // An op this build does not implement is not a wrong answer; it is a
@@ -3610,6 +3638,23 @@ fn graph_run(c: &Container, module: &omni_core::ir::Module, args: &[String]) -> 
     let elapsed = t0.elapsed();
 
     pr!("ran {} over {} op(s)", module.entry, commas(out.ops));
+    if !out.shipped.is_empty() {
+        // Where the answer came from is part of the answer: these ops were
+        // computed by WebAssembly that arrived with the model, not by this
+        // build (§07.4.2, §07.6 tier 2).
+        let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+        for op in &out.shipped {
+            *counts.entry(op.as_str()).or_default() += 1;
+        }
+        for (op, n) in &counts {
+            pr!("  shipped        {op} ×{n} — run from the model's own `ref_impl`");
+        }
+        pr!(
+            "     fuel        {} instruction(s) in {} call(s)",
+            commas(host.fuel.get()),
+            commas(host.calls.get())
+        );
+    }
     if !out.dims.is_empty() {
         pr!(
             "  dims           {}",
@@ -6546,6 +6591,14 @@ fn cmd_example(args: &[String]) -> R {
         let blob = omni_core::Object::blob(wasm);
         let wasm_ref = blob.digest(algo);
         b.extra_objects.push(blob);
+        // §07.4.2's third slot and §07.6's tier 2: semantics that can be *run*,
+        // not only consulted. This one computes rather than answering a
+        // constant, because a `ref_impl` that returns the same bytes whatever
+        // it is handed would test the calling convention and not the claim.
+        let refwasm = omni_core::plugin::ref_impl_example_module("run");
+        let refblob = omni_core::Object::blob(refwasm);
+        let ref_digest = refblob.digest(algo);
+        b.extra_objects.push(refblob);
         let dialect = Value::map(vec![
             ("t", Value::text("omni.ir/dialect")),
             ("v", Value::U(1)),
@@ -6571,10 +6624,24 @@ fn cmd_example(args: &[String]) -> R {
                             ]),
                         ),
                         (
+                            "ref_impl",
+                            Value::map(vec![
+                                (
+                                    "wasm",
+                                    Value::Array(vec![
+                                        Value::U(otype::BLOB as u64),
+                                        Value::Bytes(ref_digest.to_vec()),
+                                    ]),
+                                ),
+                                ("export", Value::text("run")),
+                            ]),
+                        ),
+                        (
                             "doc",
                             Value::text(
                                 "an op this build has never heard of, whose \
-                                 semantics arrived with the model",
+                                 semantics arrived with the model: it computes \
+                                 2x + 1 elementwise",
                             ),
                         ),
                     ]),

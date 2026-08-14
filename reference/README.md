@@ -482,6 +482,32 @@ implemented:
   and a function that declines, traps or runs out of fuel leaves it
   indeterminate — because a plugin that will not answer says nothing about the
   graph
+- §07.6 tier 2, **`ref_impl` execution**, which was the last of §07.2's three
+  claims still asserted rather than tested. A runtime meeting an op it has never
+  heard of has three moves before giving up, in decreasing order of speed: apply
+  a lowering the model ships, run a `ref_impl` the model ships, or say so. The
+  middle one is now here — `omni graph run` executes an op from a dialect this
+  build has never heard of, out of the container, with no toolchain from the year
+  the dialect was written. §07.4.2 had named the slot and defined the calling
+  convention for the other two; **it now defines this one** — elements cross as
+  little-endian binary64 with the dtype beside them rather than in them, because
+  a reference implementation is a correctness oracle and not a storage format,
+  and making every dialect author reimplement §04.3's packing is asking for as
+  many answers as there are authors.
+
+  Three rules keep it from being a hole in the format rather than a feature. A
+  shipped implementation **never shadows a built-in op** — a model that could
+  redefine `omni.tensor/add` by shipping WebAssembly for it would make the core
+  dialects meaningless, so that arm is reached only for ops nothing else claimed.
+  A module that declines, traps or overruns its buffer leaves the op **unrun**,
+  which is indeterminate, and never a guess. And the answer is checked against
+  the type the op *declared*: a shipped implementation is untrusted input like
+  everything else in the container, and one whose result disagrees with what the
+  graph verified against would make verification a lie. `omni example --dialect`
+  ships a module that computes `2x + 1` rather than one returning a constant,
+  because a `ref_impl` answering the same bytes whatever it is handed would test
+  the calling convention and not the claim, and `omni graph run --no-shipped`
+  runs the same graph without it so the difference is measured on both sides
 - §15.1 validation levels V0–V6 in the CLI; the V7 rules are implemented and
   reached through `omni sign --verify`
 - **The writer side of the C ABI**, which was the half that decided whether a
@@ -597,7 +623,7 @@ expectation.
 
 ## Tests
 
-564 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+568 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -895,7 +921,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 564 passed; 0 failed
+test result: ok. 568 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

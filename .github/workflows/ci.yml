@@ -2793,7 +2793,28 @@ jobs:
           # uses the dialect — which is the difference between "install this
           # dialect" and "the model is self-describing".
           "$OMNI" ls /tmp/dial.omni | grep -q 'DialectRef'
-          echo "an unknown dialect decided its own graph"
+
+          # §07.6 tier 2, which is the same move applied to *running* the op
+          # rather than deciding it: the interpreter has never heard of
+          # `x.example/thing`, the model ships WebAssembly that computes it, and
+          # the graph executes. The module computes 2x + 1, so the answer is
+          # arithmetic nothing in this build knows.
+          "$OMNI" graph run /tmp/dial.omni --tokens 1,2,3,4,5,6 | tee /tmp/dialrun.txt
+          grep -q "run from the model's own \`ref_impl\`" /tmp/dialrun.txt
+          grep -qE 'fuel        [0-9]+ instruction\(s\)' /tmp/dialrun.txt
+          grep -q '\[3.00000, 5.00000, 7.00000, 9.00000, 11.00000, 13.00000\]' /tmp/dialrun.txt
+
+          # And without it, the same graph is a refusal by name rather than a
+          # wrong answer — which is what makes the line above a measurement of
+          # the shipped semantics rather than of this build.
+          set +e
+          "$OMNI" graph run /tmp/dial.omni --tokens 1,2,3,4,5,6 --no-shipped \
+            > /tmp/dialno.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 3
+          grep -q 'x.example/thing' /tmp/dialno.txt
+          echo "an unknown dialect decided its own graph, and then ran it"
 
       # §10: resolution is a function of the model and the capability set, so a
       # CI job can answer "will this run on our fleet?" without the fleet.

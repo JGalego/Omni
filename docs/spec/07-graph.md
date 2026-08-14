@@ -214,6 +214,50 @@ A `shape_fn` that answers decides R-I06 for that op: its result types are
 compared with the declared ones exactly as a built-in shape function's are. A
 `verify_fn` that objects makes the op **invalid**, in the dialect's own words.
 
+#### `ref_impl`'s calling convention
+
+`ref_impl` is the third slot and the one that *computes* rather than decides. It
+takes the same four arguments, for the same reason — the host owns the buffers
+and the module owns its memory:
+
+```
+ref_impl(in: i32, in_len: i32, out: i32, out_cap: i32) -> i32
+```
+
+`in` points at canonical OMNI-CBOR of
+
+```cbor-diag
+{ "op": <the Op, exactly as §7.3 encodes it>,
+  "in": [ {"shape":[…], "dtype":<§4.3 descriptor>, "data":h'…'} … ] }
+```
+
+`data` holds the operand's elements in row-major order as little-endian IEEE
+**binary64**, one value per element, whatever the tensor's own `dtype` says. The
+dtype travels beside the data rather than in it because a reference
+implementation is a correctness oracle, not a storage format: making every
+`ref_impl` re-implement §4.3's packing would be asking each dialect author to
+reimplement the part of OMNI that is already specified, and getting a different
+answer from each of them is the failure this slot exists to prevent. An op that
+genuinely depends on the stored representation — a bit-packing, a codebook — is
+a §4.7.7 expression plugin, which is handed the bytes.
+
+| Return | `ref_impl` |
+|---|---|
+| `n > 0` | `n` bytes of CBOR at `out`: `[{"shape":…,"dtype":…,"data":h'…'} …]`, the op's results in order |
+| `0` | the op produces no results |
+| `n < 0` | the function **declines**: the op is *unrun*, exactly as if there were no `ref_impl` |
+
+The three outcomes of the other two functions apply unchanged: a module that
+traps, exhausts its fuel or overruns `out_cap` has declined, with the reason. A
+declined `ref_impl` never makes a graph invalid — it leaves the op unexecuted,
+which is §15.1's indeterminate and the honest answer.
+
+A runtime MUST prefer a `lower_to` rule to a `ref_impl` when both exist (§7.6's
+ordering: a declarative composite runs at native speed and a WASM oracle does
+not), and MUST NOT use `ref_impl` for an op it implements natively — the shipped
+implementation is a fallback and a reference, not an override. A model cannot
+change what `omni.tensor/add` means by shipping WebAssembly for it.
+
 ## 7.5 Weights-only models
 
 A `Model` with `tensors` but no `graph` is legal and common (the safetensors
@@ -237,8 +281,9 @@ In decreasing order of portability:
 
 1. **Declarative composite** — the op is defined by a `lower_to` rule expressed
    in `omni.core` + `omni.tensor`. Fully portable; any C2 runtime can run it.
-2. **WASM reference** — `ref_impl` gives executable semantics. Portable but
-   slow; suitable as a correctness oracle and as a last-resort execution path.
+2. **WASM reference** — `ref_impl` gives executable semantics, under the calling
+   convention in §7.4.2. Portable but slow; suitable as a correctness oracle and
+   as a last-resort execution path.
 3. **Native plugin** — a runtime-specific kernel identified by name. Not
    portable; the model MUST also provide tier 1 or 2 if it wants to be loadable
    elsewhere, and `omni verify --portable` fails if it does not.

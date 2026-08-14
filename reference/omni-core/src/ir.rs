@@ -34,10 +34,12 @@
 //!   ships its semantics, which is §07.2's key move applied to verification.
 //!   The host is [`crate::plugin::Dialects`]; the ABI is in §07.4.2.
 //!
-//! What is not: `ref_impl` execution — the interpreter runs the ops it knows and
-//! refuses the rest by name rather than falling back to a shipped reference
-//! implementation — machine-level graphs, and autodiff, which §07.10 puts
-//! outside the IR on purpose.
+//! * WASM `ref_impl` execution (§07.4.2, §07.6 tier 2): the same move applied to
+//!   *running* an op, through [`DialectHost::compute`] and
+//!   [`crate::interp::run_with`].
+//!
+//! What is not: machine-level graphs, and autodiff, which §07.10 puts outside
+//! the IR on purpose.
 
 use crate::cbor::Value;
 use crate::container::Digest;
@@ -2477,6 +2479,21 @@ pub trait DialectHost {
     /// A shipped `verify_fn`'s finding: `Some(Ok(()))` valid, `Some(Err(msg))`
     /// invalid with a reason, `None` when there is no function.
     fn check(&self, op: &Op, ins: &[Type]) -> Option<Result<(), String>>;
+
+    /// A shipped `ref_impl`'s results (§07.4.2, §07.6 tier 2): `None` when the
+    /// dialect ships no implementation for this op, `Some(Err)` when the one it
+    /// ships declined, trapped or answered badly.
+    ///
+    /// The default is `None`, so a host that only decides types is still a
+    /// [`DialectHost`]. Deciding an op and running it are different questions,
+    /// and a verifier is entitled to answer only the first.
+    fn compute(
+        &self,
+        _op: &Op,
+        _ins: &[crate::expr::Tensor],
+    ) -> Option<Result<Vec<crate::expr::Tensor>, String>> {
+        None
+    }
 }
 
 /// What a verifier may consult beyond the module itself.

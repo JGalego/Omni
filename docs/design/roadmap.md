@@ -227,9 +227,16 @@ the `shape_fn` and `verify_fn` a dialect ships with the model. That closes the
 gap between §07.2's claim about *execution* (an unknown op is recoverable if its
 lowering is shipped) and the same claim about *verification*: a dialect this
 build has never heard of is now decided rather than indeterminate when the model
-brought its semantics. What is still absent is `ref_impl` execution — the
-interpreter refuses an op it does not know by name rather than falling back to a
-shipped reference implementation. A reference interpreter (`omni graph run`) executes all of
+brought its semantics. **`ref_impl` execution closes the last of the three**: an
+op this build does not implement now runs from the reference implementation the
+model shipped, and is refused by name only when there is none. §07.4.2 had
+defined the calling convention for `shape_fn` and `verify_fn` and named
+`ref_impl` without one; it now defines that one too — which is the same shape of
+gap §07.8.1 closed for `ssm_scan`, closed the same way, by writing it down before
+implementing it. A shipped implementation never shadows a built-in op, a module
+that declines leaves the op unrun rather than guessed at, and an answer that
+disagrees with the type the op declared is an error rather than a tensor.
+A reference interpreter (`omni graph run`) executes all of
 `omni.core` including its control flow, all 31 `omni.tensor` ops with a general
 `einsum`, `omni.quant`'s four, and **all** of `omni.nn` — `ssm_scan` included,
 which was refused for a draft because §07 named it without defining it. §07.8.1

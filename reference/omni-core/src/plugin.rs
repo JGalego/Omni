@@ -659,6 +659,209 @@ pub fn constant_answer_module(export: &str, answer: &[u8], code: i32) -> Vec<u8>
     b.finish()
 }
 
+/// A `ref_impl` module for §07.4.2's third slot: elementwise `2x + 1` over one
+/// six-element operand, answering in the CBOR the calling convention names.
+///
+/// It exists so the `ref_impl` path is exercised by a module that *computes*
+/// rather than by one that returns a constant, which is the only way to tell
+/// "the ABI is wired up" from "the ABI carries an answer". Two things about it
+/// are deliberately narrow, and a real dialect would not be either:
+///
+/// * It **scans** for its operand's `data` key rather than parsing the CBOR it
+///   is handed. Hand-assembling a CBOR parser here would make this file a test
+///   of the parser instead of a test of the calling convention; a dialect
+///   author compiles from C or Rust with a library.
+/// * It is written for one operand length and **declines** — the negative
+///   return, not a wrong answer — for any other, because a module that guesses
+///   at a shape it was not written for is the failure §15.1 is about.
+///
+/// The answer's `dtype` is omitted, which the convention allows: elements cross
+/// as binary64 and the host defaults the dtype accordingly.
+pub fn ref_impl_example_module(export: &str) -> Vec<u8> {
+    /// The operand this module is written for: six elements, 48 bytes.
+    const ELEMS: i32 = 6;
+    const DATA_BYTES: i32 = ELEMS * 8;
+    /// `81 A2 64 "data" 58 30` — array(1), map(2), the key, a 48-byte string.
+    const PREFIX: [u8; 9] = [0x81, 0xa2, 0x64, b'd', b'a', b't', b'a', 0x58, 0x30];
+    /// `65 "shape" 82 02 03` — the key and `[2, 3]`.
+    const SUFFIX: [u8; 9] = [0x65, b's', b'h', b'a', b'p', b'e', 0x82, 0x02, 0x03];
+    const ANSWER: i32 = PREFIX.len() as i32 + DATA_BYTES + SUFFIX.len() as i32;
+
+    let mut b = Enc::default();
+    bump_allocator(&mut b);
+    // (in, in_len, out, out_cap) -> i32
+    let t = b.ty(&[I32, I32, I32, I32], &[I32]);
+    // locals: 4 = p, 5 = data pointer, 6 = length, 7 = i, 8 = header byte,
+    //         9 = v (f64)
+    let mut f = Vec::new();
+
+    // An answer that would not fit is a refusal, not an overrun. This is the
+    // one bug the ABI can actually have, so it is the first thing checked.
+    f.extend([0x20, 3]);
+    f.extend(i32const(ANSWER));
+    f.extend([0x48]); // i32.lt_s
+    f.extend([0x04, 0x40]);
+    f.extend(i32const(-2));
+    f.extend([0x0f]);
+    f.push(0x0b);
+
+    // p = in
+    f.extend([0x20, 0, 0x21, 4]);
+    f.extend([0x02, 0x40]); // block: found
+    f.extend([0x03, 0x40]); // loop
+                            // if p + 5 > in + in_len { return -1 }
+    f.extend([0x20, 4]);
+    f.extend(i32const(5));
+    f.extend([0x6a]);
+    f.extend([0x20, 0, 0x20, 1, 0x6a]);
+    f.extend([0x4a]); // i32.gt_s
+    f.extend([0x04, 0x40]);
+    f.extend(i32const(-1));
+    f.extend([0x0f]);
+    f.push(0x0b);
+    // The five bytes of the canonical text key "data".
+    for (k, byte) in [0x64u8, b'd', b'a', b't', b'a'].iter().enumerate() {
+        f.extend([0x20, 4]);
+        f.extend([0x2d, 0x00, k as u8]); // i32.load8_u offset=k
+        f.extend(i32const(*byte as i32));
+        f.extend([0x46]); // i32.eq
+        if k > 0 {
+            f.extend([0x71]); // i32.and
+        }
+    }
+    f.extend([0x0d, 0x01]); // br_if 1 — out of the block
+    f.extend([0x20, 4]);
+    f.extend(i32const(1));
+    f.extend([0x6a, 0x21, 4]);
+    f.extend([0x0c, 0x00]); // br 0
+    f.push(0x0b); // end loop
+    f.push(0x0b); // end block
+
+    // Past the key, at the byte-string header.
+    f.extend([0x20, 4]);
+    f.extend(i32const(5));
+    f.extend([0x6a, 0x21, 4]);
+    f.extend([0x20, 4]);
+    f.extend([0x2d, 0x00, 0x00]);
+    f.extend([0x21, 8]); // header = mem8[p]
+                         // 0x40..=0x57: the length is in the header byte.
+    f.extend([0x20, 8]);
+    f.extend(i32const(0x40));
+    f.extend([0x4f]); // i32.ge_u
+    f.extend([0x20, 8]);
+    f.extend(i32const(0x57));
+    f.extend([0x4d]); // i32.le_u
+    f.extend([0x71]);
+    f.extend([0x04, 0x40]);
+    f.extend([0x20, 8]);
+    f.extend(i32const(0x40));
+    f.extend([0x6b, 0x21, 6]);
+    f.extend([0x20, 4]);
+    f.extend(i32const(1));
+    f.extend([0x6a, 0x21, 5]);
+    f.push(0x05); // else
+                  // 0x58: one length byte.
+    f.extend([0x20, 8]);
+    f.extend(i32const(0x58));
+    f.extend([0x46]);
+    f.extend([0x04, 0x40]);
+    f.extend([0x20, 4]);
+    f.extend([0x2d, 0x00, 0x01]);
+    f.extend([0x21, 6]);
+    f.extend([0x20, 4]);
+    f.extend(i32const(2));
+    f.extend([0x6a, 0x21, 5]);
+    f.push(0x05); // else
+                  // 0x59: two length bytes, big-endian as CBOR spells them.
+    f.extend([0x20, 8]);
+    f.extend(i32const(0x59));
+    f.extend([0x46]);
+    f.extend([0x04, 0x40]);
+    f.extend([0x20, 4]);
+    f.extend([0x2d, 0x00, 0x01]);
+    f.extend(i32const(8));
+    f.extend([0x74]); // i32.shl
+    f.extend([0x20, 4]);
+    f.extend([0x2d, 0x00, 0x02]);
+    f.extend([0x72, 0x21, 6]); // i32.or
+    f.extend([0x20, 4]);
+    f.extend(i32const(3));
+    f.extend([0x6a, 0x21, 5]);
+    f.push(0x05); // else — a length form this example does not implement
+    f.extend(i32const(-3));
+    f.extend([0x0f]);
+    f.push(0x0b);
+    f.push(0x0b);
+    f.push(0x0b);
+
+    // A shape this module was not written for is declined rather than guessed.
+    f.extend([0x20, 6]);
+    f.extend(i32const(DATA_BYTES));
+    f.extend([0x47]); // i32.ne
+    f.extend([0x04, 0x40]);
+    f.extend(i32const(-1));
+    f.extend([0x0f]);
+    f.push(0x0b);
+
+    // The constant framing.
+    for (k, byte) in PREFIX.iter().enumerate() {
+        f.extend([0x20, 2]);
+        f.extend(i32const(*byte as i32));
+        f.extend([0x3a, 0x00, k as u8]); // i32.store8 offset=k
+    }
+    for (k, byte) in SUFFIX.iter().enumerate() {
+        f.extend([0x20, 2]);
+        f.extend(i32const(*byte as i32));
+        f.extend([
+            0x3a,
+            0x00,
+            (PREFIX.len() as i32 + DATA_BYTES) as u8 + k as u8,
+        ]);
+    }
+
+    // for i in 0..ELEMS { out[i] = 2 * in[i] + 1 }
+    f.extend(i32const(0));
+    f.extend([0x21, 7]);
+    f.extend([0x02, 0x40]);
+    f.extend([0x03, 0x40]);
+    f.extend([0x20, 7]);
+    f.extend(i32const(ELEMS));
+    f.extend([0x4e]); // i32.ge_s
+    f.extend([0x0d, 0x01]);
+    // v = in[i]
+    f.extend([0x20, 5]);
+    f.extend([0x20, 7]);
+    f.extend(i32const(8));
+    f.extend([0x6c, 0x6a]);
+    f.extend([0x2b, 0x00, 0x00]); // f64.load, byte alignment
+    f.extend([0x21, 9]);
+    // out + 9 + i*8
+    f.extend([0x20, 2]);
+    f.extend([0x20, 7]);
+    f.extend(i32const(8));
+    f.extend([0x6c, 0x6a]);
+    // 2v + 1
+    f.extend([0x20, 9]);
+    f.push(0x44);
+    f.extend(2.0f64.to_le_bytes());
+    f.extend([0xa2]); // f64.mul
+    f.push(0x44);
+    f.extend(1.0f64.to_le_bytes());
+    f.extend([0xa0]); // f64.add
+    f.extend([0x39, 0x00, PREFIX.len() as u8]); // f64.store offset=9
+    f.extend([0x20, 7]);
+    f.extend(i32const(1));
+    f.extend([0x6a, 0x21, 7]);
+    f.extend([0x0c, 0x00]);
+    f.push(0x0b);
+    f.push(0x0b);
+
+    f.extend(i32const(ANSWER));
+    b.func(export, t, &[I32, I32, I32, I32, I32, F64], f);
+    b.memory(2);
+    b.finish()
+}
+
 const I32: u8 = 0x7f;
 const F64: u8 = 0x7c;
 
@@ -893,13 +1096,16 @@ mod tests {
 
 // ---------------------------------------------- §07.4.2 dialect semantics --
 
-/// The two §07.4.2 functions a dialect may ship.
+/// The three §07.4.2 functions a dialect may ship.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DialectFn {
     /// Computes an op's result types.
     Shape,
     /// Decides whether an op is well formed beyond its types.
     Verify,
+    /// Computes an op's *results*: §07.6's tier 2, executable semantics that
+    /// arrived with the model.
+    Ref,
 }
 
 impl DialectFn {
@@ -907,8 +1113,12 @@ impl DialectFn {
         match self {
             DialectFn::Shape => "shape_fn",
             DialectFn::Verify => "verify_fn",
+            DialectFn::Ref => "ref_impl",
         }
     }
+
+    /// Every slot, in the order a `DialectRef` is scanned for them.
+    const ALL: [DialectFn; 3] = [DialectFn::Shape, DialectFn::Verify, DialectFn::Ref];
 }
 
 /// §07.4.2's shipped semantics, run in the §11.6 host.
@@ -1014,7 +1224,7 @@ impl<'a> Dialects<'a> {
         // Dialect-wide functions, then per-op ones. A per-op function wins,
         // which is the order a reader would expect and the order they are
         // searched in below.
-        for kind in [DialectFn::Shape, DialectFn::Verify] {
+        for kind in DialectFn::ALL {
             if let Some(spec) = dialect_ref.get(kind.key()) {
                 add("*", kind, spec, &mut problems);
             }
@@ -1022,7 +1232,7 @@ impl<'a> Dialects<'a> {
         if let Some(Value::Map(ops)) = dialect_ref.get("ops") {
             for (name, spec) in ops {
                 let Some(name) = name.as_str() else { continue };
-                for kind in [DialectFn::Shape, DialectFn::Verify] {
+                for kind in DialectFn::ALL {
                     // Either directly on the op, or under its version key —
                     // §07.4.2's example puts it under `v2`.
                     let found = spec.get(kind.key()).or_else(|| {
@@ -1064,7 +1274,6 @@ impl<'a> Dialects<'a> {
         ins: &[crate::ir::Type],
         kind: DialectFn,
     ) -> Option<Result<(i32, Vec<u8>), String>> {
-        let (_, _, _, module, export) = self.find(op, kind)?;
         // The op as §07.3 encodes it, with its operand types resolved. Encoding
         // the op itself rather than a summary means a shape function sees the
         // attributes, which is where a dialect keeps the thing its shape
@@ -1077,6 +1286,26 @@ impl<'a> Dialects<'a> {
             ),
         ])
         .encode();
+        // A generous but bounded answer buffer: a type is small and a reason is
+        // a sentence.
+        self.invoke(op, kind, input, 4096)
+    }
+
+    /// Runs one shipped function over an already-encoded argument, with the
+    /// answer buffer the caller sized.
+    ///
+    /// The two type-level functions and `ref_impl` differ only in what they are
+    /// handed and how much room the answer needs, so they share everything
+    /// else: the instance, the module's own allocator, the fuel accounting and
+    /// the rule that a module which overruns its buffer has declined.
+    fn invoke(
+        &self,
+        op: &crate::ir::Op,
+        kind: DialectFn,
+        input: Vec<u8>,
+        cap: u32,
+    ) -> Option<Result<(i32, Vec<u8>), String>> {
+        let (_, _, _, module, export) = self.find(op, kind)?;
         let env = Env {
             objects: self.objects,
             log: std::cell::RefCell::new(Vec::new()),
@@ -1087,9 +1316,6 @@ impl<'a> Dialects<'a> {
                 .alloc(input.len().max(1) as u32)
                 .map_err(|e| e.to_string())?;
             inst.write(in_ptr, &input).map_err(|e| e.to_string())?;
-            // A generous but bounded answer buffer: a type is small and a
-            // reason is a sentence.
-            let cap = 4096u32;
             let out_ptr = inst.alloc(cap).map_err(|e| e.to_string())?;
             let rc = inst
                 .call(
@@ -1125,7 +1351,66 @@ impl<'a> Dialects<'a> {
 
 impl crate::ir::DialectHost for Dialects<'_> {
     fn provides(&self, op: &crate::ir::Op) -> bool {
-        self.find(op, DialectFn::Shape).is_some() || self.find(op, DialectFn::Verify).is_some()
+        DialectFn::ALL.iter().any(|k| self.find(op, *k).is_some())
+    }
+
+    /// §07.4.2's `ref_impl`: the op's *results*, computed by semantics the
+    /// model shipped.
+    ///
+    /// This is §07.6's tier 2, and it is the last of §07.2's claims to be
+    /// tested rather than asserted: a runtime that has never heard of an op can
+    /// verify it (a shipped `shape_fn`), lower it (a shipped rewrite), or —
+    /// when the dialect ships neither a lowering nor an implementation this
+    /// build has — *run* it, out of the container, with no toolchain from the
+    /// year the dialect was written.
+    ///
+    /// Elements cross as little-endian binary64 with the dtype beside them
+    /// rather than in them, because a reference implementation is a correctness
+    /// oracle and not a storage format: asking every dialect author to
+    /// reimplement §04.3's packing is asking for as many answers as there are
+    /// authors. An op that genuinely depends on the stored representation is a
+    /// §04.7.7 expression plugin, which is handed the bytes.
+    fn compute(&self, op: &crate::ir::Op, ins: &[Tensor]) -> Option<Result<Vec<Tensor>, String>> {
+        self.find(op, DialectFn::Ref)?;
+        let input = Value::map(vec![
+            ("op", op.to_value()),
+            ("in", Value::Array(ins.iter().map(tensor_value).collect())),
+        ])
+        .encode();
+        // Room for the declared results, when they are concrete, and a floor
+        // for when they are not. Bounded either way: the buffer is the
+        // module's own allocation and the host will not grow it.
+        let declared: u64 = op
+            .outputs
+            .iter()
+            .filter_map(|(_, t)| t.as_tensor())
+            .filter_map(|(shape, _)| crate::expr::concrete(shape))
+            .map(|s| crate::layout::numel(&s))
+            .sum();
+        let cap = (declared.saturating_mul(8).saturating_add(4096))
+            .clamp(64 << 10, REF_IMPL_MAX_ANSWER) as u32;
+        match self.invoke(op, DialectFn::Ref, input, cap)? {
+            Err(e) => Some(Err(e)),
+            Ok((n, _)) if n < 0 => Some(Err(format!("it declined, with code {n}"))),
+            Ok((0, _)) => Some(Ok(Vec::new())),
+            Ok((_, bytes)) => {
+                let v = match crate::cbor::decode(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(format!("its answer is not canonical CBOR: {e}"))),
+                };
+                let Some(list) = v.as_array() else {
+                    return Some(Err("its answer is not an array of tensors".into()));
+                };
+                let mut out = Vec::with_capacity(list.len());
+                for t in list {
+                    match value_tensor(t) {
+                        Ok(t) => out.push(t),
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                Some(Ok(out))
+            }
+        }
     }
 
     fn shape(
@@ -1168,6 +1453,65 @@ impl crate::ir::DialectHost for Dialects<'_> {
     }
 }
 
+/// The largest answer a `ref_impl` may write: 64 MiB of binary64, which is
+/// eight million elements. A reference implementation is an oracle rather than
+/// a kernel, and a graph is untrusted input (§12.4).
+const REF_IMPL_MAX_ANSWER: u64 = 64 << 20;
+
+/// A tensor as §07.4.2's `ref_impl` payload spells it.
+fn tensor_value(t: &Tensor) -> Value {
+    Value::map(vec![
+        (
+            "shape",
+            Value::Array(t.shape.iter().map(|d| Value::U(*d)).collect()),
+        ),
+        ("dtype", t.dtype.to_value()),
+        (
+            "data",
+            Value::Bytes(t.data.iter().flat_map(|x| x.to_le_bytes()).collect()),
+        ),
+    ])
+}
+
+/// The other direction, with every field checked rather than assumed: a module
+/// that returns a shape its data cannot fill is refused, because a tensor the
+/// host silently reshaped is a wrong answer wearing a right one's clothes.
+fn value_tensor(v: &Value) -> Result<Tensor, String> {
+    let shape: Vec<u64> = v
+        .get("shape")
+        .and_then(|s| s.as_array())
+        .ok_or("a returned tensor has no `shape`")?
+        .iter()
+        .map(|d| d.as_u64().ok_or("a shape extent is not an integer"))
+        .collect::<Result<_, _>>()?;
+    let dtype = match v.get("dtype") {
+        Some(d) => crate::dtype::DType::from_value(d)?,
+        None => crate::dtype::DType::F64,
+    };
+    let raw = v
+        .get("data")
+        .and_then(|d| d.as_bytes())
+        .ok_or("a returned tensor has no `data`")?;
+    if raw.len() % 8 != 0 {
+        return Err(format!(
+            "a returned tensor's data is {} bytes, which is not a whole number of binary64 values",
+            raw.len()
+        ));
+    }
+    let want = crate::layout::numel(&shape);
+    if raw.len() as u64 / 8 != want {
+        return Err(format!(
+            "a returned tensor declares {shape:?} — {want} element(s) — and carries {}",
+            raw.len() / 8
+        ));
+    }
+    let data = raw
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+        .collect();
+    Ok(Tensor::new(shape, dtype, data))
+}
+
 #[cfg(test)]
 mod dialect_tests {
     use super::*;
@@ -1177,6 +1521,38 @@ mod dialect_tests {
 
     fn ty(shape: &[u64]) -> Type {
         Type::tensor(shape.iter().map(|d| Dim::N(*d)).collect(), DType::F32)
+    }
+
+    /// A `DialectRef` whose one op ships only a `ref_impl`.
+    fn ref_impl_ref(digest: [u8; 32]) -> Value {
+        Value::map(vec![
+            ("t", Value::text("omni.ir/dialect")),
+            ("v", Value::U(1)),
+            ("ns", Value::text("x.test")),
+            ("version", Value::U(1)),
+            (
+                "ops",
+                Value::Map(vec![(
+                    Value::text("thing"),
+                    Value::map(vec![
+                        ("versions", Value::Array(vec![Value::U(1)])),
+                        (
+                            "ref_impl",
+                            Value::map(vec![
+                                (
+                                    "wasm",
+                                    Value::Array(vec![
+                                        Value::U(crate::container::otype::BLOB as u64),
+                                        Value::Bytes(digest.to_vec()),
+                                    ]),
+                                ),
+                                ("export", Value::text("run")),
+                            ]),
+                        ),
+                    ]),
+                )]),
+            ),
+        ])
     }
 
     /// A `DialectRef` for `x.test` whose one op ships the two §07.4.2
@@ -1266,6 +1642,184 @@ mod dialect_tests {
     /// The CBOR a shape function answers with: a list of §07.3.1 types.
     fn answer(types: &[Type]) -> Vec<u8> {
         Value::Array(types.iter().map(Type::to_value).collect()).encode()
+    }
+
+    #[test]
+    fn an_op_this_build_cannot_run_runs_from_the_semantics_the_model_shipped() {
+        // §07.6 tier 2, end to end. The interpreter has never heard of
+        // `x.test/thing`; the model ships WebAssembly that computes it; the
+        // graph runs. This is the claim §07.2 makes about *execution*, which
+        // until now was tested for lowering and not for a `ref_impl`.
+        let wasm = ref_impl_example_module("run");
+        let digest = crate::HashAlgo::default().digest(&wasm);
+        let objects = |d: &[u8; 32]| (d == &digest).then(|| wasm.clone());
+        let mut host = Dialects::new(&objects);
+        assert!(host.load(&ref_impl_ref(digest)).is_empty());
+
+        let m = module_using(ty(&[2, 3]));
+        let x = Tensor::new(vec![2, 3], DType::F32, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // Without the shipped semantics it is a refusal, by name.
+        let err = crate::interp::run(
+            &m,
+            std::slice::from_ref(&x),
+            &(),
+            &crate::interp::Limits::default(),
+        )
+        .expect_err("nothing here implements x.test/thing");
+        assert!(matches!(err, crate::interp::Error::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("x.test/thing"), "{err}");
+
+        // With them it computes, and the answer is the module's arithmetic
+        // rather than anything this build knows: 2x + 1.
+        let out = crate::interp::run_with(
+            &m,
+            &[x],
+            &(),
+            &crate::interp::Limits::default(),
+            Some(&host),
+        )
+        .expect("the model brought its own semantics");
+        assert_eq!(out.returned.len(), 1);
+        assert_eq!(out.returned[0].shape, vec![2, 3]);
+        assert_eq!(
+            out.returned[0].data,
+            vec![3.0, 5.0, 7.0, 9.0, 11.0, 13.0],
+            "the shipped module computes 2x + 1"
+        );
+        // Where the answer came from is part of the answer.
+        assert_eq!(out.shipped, vec!["x.test/thing@1".to_string()]);
+        assert!(host.fuel.get() > 0, "a module that ran for no fuel");
+    }
+
+    #[test]
+    fn a_ref_impl_that_declines_leaves_the_op_unrun_rather_than_wrong() {
+        // The module is written for six elements. Handed anything else it
+        // returns a negative code, and §07.4.2 says that is a refusal — the op
+        // is unrun, which is indeterminate, and never a guess at the answer.
+        let wasm = ref_impl_example_module("run");
+        let digest = crate::HashAlgo::default().digest(&wasm);
+        let objects = |d: &[u8; 32]| (d == &digest).then(|| wasm.clone());
+        let mut host = Dialects::new(&objects);
+        host.load(&ref_impl_ref(digest));
+
+        let mut m = module_using(ty(&[2, 2]));
+        if let Some((_, f)) = m.functions.first_mut() {
+            f.params = vec![("x".into(), ty(&[2, 2]))];
+        }
+        let x = Tensor::new(vec![2, 2], DType::F32, vec![1.0, 2.0, 3.0, 4.0]);
+        let err = crate::interp::run_with(
+            &m,
+            &[x],
+            &(),
+            &crate::interp::Limits::default(),
+            Some(&host),
+        )
+        .expect_err("the module was not written for this shape");
+        assert!(matches!(err, crate::interp::Error::Unsupported(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("did not answer"), "{msg}");
+    }
+
+    #[test]
+    fn a_ref_impl_never_shadows_an_op_this_build_implements() {
+        // A model that could redefine `omni.tensor/add` by shipping
+        // WebAssembly for it would make the core dialects meaningless, so the
+        // shipped implementation is only ever reached for ops nothing else
+        // claimed. The dialect below ships a `*` implementation — every op in
+        // the namespace — and `omni.tensor/add` still adds.
+        let wasm = ref_impl_example_module("run");
+        let digest = crate::HashAlgo::default().digest(&wasm);
+        let objects = |d: &[u8; 32]| (d == &digest).then(|| wasm.clone());
+        let mut host = Dialects::new(&objects);
+        let mut dref = ref_impl_ref(digest);
+        if let Value::Map(pairs) = &mut dref {
+            for (k, v) in pairs.iter_mut() {
+                if k.as_str() == Some("ns") {
+                    *v = Value::text("omni.tensor");
+                }
+            }
+        }
+        host.load(&dref);
+
+        let t = ty(&[2, 3]);
+        let mut m = IrModule::new(ir::Level::Primitive, "main");
+        m.dialects = vec![
+            ir::DialectUse {
+                ns: "omni.core".into(),
+                version: 1,
+                reference: None,
+            },
+            ir::DialectUse {
+                ns: "omni.tensor".into(),
+                version: 1,
+                reference: None,
+            },
+        ];
+        m.functions.push((
+            "main".into(),
+            Function {
+                params: vec![("x".into(), t.clone())],
+                results: vec![t.clone()],
+                attrs: Vec::new(),
+                body: Region {
+                    blocks: vec![Block {
+                        args: Vec::new(),
+                        ops: vec![
+                            Op::new("omni.tensor", "add", 1)
+                                .with_inputs(&[0, 0])
+                                .with_output(1, t),
+                            Op::new("omni.core", "return", 1).with_inputs(&[1]),
+                        ],
+                    }],
+                },
+                constraints: Vec::new(),
+            },
+        ));
+        let x = Tensor::new(vec![2, 3], DType::F32, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let out = crate::interp::run_with(
+            &m,
+            &[x],
+            &(),
+            &crate::interp::Limits::default(),
+            Some(&host),
+        )
+        .expect("add is add");
+        assert_eq!(out.returned[0].data, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]);
+        assert!(
+            out.shipped.is_empty(),
+            "a built-in op was taken from the container"
+        );
+    }
+
+    #[test]
+    fn a_ref_impl_answer_that_disagrees_with_the_declared_type_is_an_error() {
+        // The container is untrusted input like everything else in it. A
+        // shipped implementation whose result does not match the type the
+        // graph verified against would make verification a lie, so the
+        // disagreement is named rather than accepted.
+        let wasm = ref_impl_example_module("run");
+        let digest = crate::HashAlgo::default().digest(&wasm);
+        let objects = |d: &[u8; 32]| (d == &digest).then(|| wasm.clone());
+        let mut host = Dialects::new(&objects);
+        host.load(&ref_impl_ref(digest));
+
+        // The op declares [3, 2]; the module answers [2, 3].
+        let mut m = module_using(ty(&[3, 2]));
+        if let Some((_, f)) = m.functions.first_mut() {
+            f.params = vec![("x".into(), ty(&[2, 3]))];
+        }
+        let x = Tensor::new(vec![2, 3], DType::F32, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let err = crate::interp::run_with(
+            &m,
+            &[x],
+            &(),
+            &crate::interp::Limits::default(),
+            Some(&host),
+        )
+        .expect_err("the shipped answer has a different shape");
+        let msg = err.to_string();
+        assert!(msg.contains("[3, 2]") && msg.contains("[2, 3]"), "{msg}");
     }
 
     #[test]

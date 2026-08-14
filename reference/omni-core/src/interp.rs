@@ -140,6 +140,11 @@ pub struct Outcome {
     pub dims: Vec<(String, u64)>,
     /// `omni.core/debug` labels reached, in order.
     pub debug: Vec<String>,
+    /// Ops run from a `ref_impl` the model shipped (§07.4.2), qualified, in the
+    /// order they ran. Empty when everything came from this build — which is
+    /// the distinction a reader of the result needs: an answer computed by
+    /// semantics that arrived with the model is a different kind of answer.
+    pub shipped: Vec<String>,
 }
 
 impl std::fmt::Debug for Outcome {
@@ -167,12 +172,44 @@ pub fn run(m: &Module, args: &[Tensor], w: &dyn Weights, limits: &Limits) -> Res
     run_function(m, &entry, args, w, limits)
 }
 
+/// [`run`], with the semantics the model shipped for its own dialects.
+///
+/// This is §07.6's tier 2 and the last of §07.2's three claims to be executed
+/// rather than asserted. A runtime meeting an op it has never heard of has
+/// three things it can do before giving up, in decreasing order of speed: apply
+/// a lowering the model ships (`omni graph lower`), run a `ref_impl` the model
+/// ships (here), or say so. The order matters and this build keeps it: an op
+/// this interpreter implements is *never* taken from the container, because a
+/// model that could redefine `omni.tensor/add` by shipping WebAssembly for it
+/// would make the core dialect meaningless.
+pub fn run_with(
+    m: &Module,
+    args: &[Tensor],
+    w: &dyn Weights,
+    limits: &Limits,
+    semantics: Option<&dyn crate::ir::DialectHost>,
+) -> Res<Outcome> {
+    let entry = m.entry.clone();
+    run_function_with(m, &entry, args, w, limits, semantics)
+}
+
 pub fn run_function(
     m: &Module,
     name: &str,
     args: &[Tensor],
     w: &dyn Weights,
     limits: &Limits,
+) -> Res<Outcome> {
+    run_function_with(m, name, args, w, limits, None)
+}
+
+pub fn run_function_with(
+    m: &Module,
+    name: &str,
+    args: &[Tensor],
+    w: &dyn Weights,
+    limits: &Limits,
+    semantics: Option<&dyn crate::ir::DialectHost>,
 ) -> Res<Outcome> {
     let f = m
         .function(name)
@@ -185,6 +222,8 @@ pub fn run_function(
         dims: Vec::new(),
         debug: Vec::new(),
         outputs: Vec::new(),
+        semantics,
+        shipped: Vec::new(),
     };
     let returned = st.call(f, args, 0)?;
     Ok(Outcome {
@@ -193,6 +232,7 @@ pub fn run_function(
         ops: st.ops,
         dims: st.dims,
         debug: st.debug,
+        shipped: std::mem::take(&mut st.shipped),
     })
 }
 
@@ -204,6 +244,12 @@ struct State<'a> {
     dims: Vec<(String, u64)>,
     debug: Vec<String>,
     outputs: Vec<(String, Tensor)>,
+    /// §07.4.2's shipped semantics. An op this build does not implement is
+    /// asked of the model before it is refused.
+    semantics: Option<&'a dyn crate::ir::DialectHost>,
+    /// Which ops the model's own `ref_impl` ran, so the answer says where it
+    /// came from.
+    shipped: Vec<String>,
 }
 
 /// SSA values, indexed by id. Dense numbering (§07.3) makes this a `Vec`.
@@ -711,13 +757,70 @@ impl State<'_> {
             ("omni.tensor", _) => self.tensor_op(op, ins, out_dtype),
             ("omni.quant", _) => self.quant_op(op, ins, out_dtype),
             ("omni.nn", _) => self.nn_op(op, ins, out_dtype),
-            _ => Err(Error::Unsupported(format!(
-                "{}: this build implements omni.core, omni.tensor, omni.quant, \
-                 omni.io and part of omni.nn. A dialect it does not know is a \
-                 refusal and not a wrong answer (§15.1)",
-                op.qualified()
-            ))),
+            // Before refusing: §07.4.2 lets the model ship the op's semantics,
+            // and §07.6 tier 2 makes running them the last thing to try rather
+            // than the first. This arm is reached only for ops nothing above it
+            // claimed, so a shipped implementation can never shadow a built-in
+            // one.
+            _ => match self.shipped_op(op, ins)? {
+                Some(results) => Ok(results),
+                None => Err(Error::Unsupported(format!(
+                    "{}: this build implements omni.core, omni.tensor, omni.quant, \
+                     omni.io and part of omni.nn, and no `ref_impl` was supplied \
+                     for it. A dialect it does not know is a refusal and not a wrong \
+                     answer (§15.1)",
+                    op.qualified()
+                ))),
+            },
         }
+    }
+
+    /// §07.4.2's `ref_impl`, as the last thing tried before a refusal.
+    ///
+    /// The result is checked against what the op *declared* rather than taken
+    /// on trust: a shipped implementation is untrusted input like everything
+    /// else in the container, and one whose answer disagrees with the type the
+    /// graph verified against would make verification a lie. A disagreement is
+    /// therefore an error naming both, not a silently accepted tensor.
+    fn shipped_op(&mut self, op: &Op, ins: &[Tensor]) -> Res<Option<Vec<Tensor>>> {
+        let Some(host) = self.semantics else {
+            return Ok(None);
+        };
+        let Some(answer) = host.compute(op, ins) else {
+            return Ok(None);
+        };
+        let results = answer.map_err(|e| {
+            Error::Unsupported(format!(
+                "{}: the `ref_impl` the model ships did not answer — {e}",
+                op.qualified()
+            ))
+        })?;
+        if results.len() != op.outputs.len() {
+            return Err(Error::Type(format!(
+                "{}: declares {} result(s) and its shipped `ref_impl` returned {}",
+                op.qualified(),
+                op.outputs.len(),
+                results.len()
+            )));
+        }
+        for (k, (declared, got)) in op.outputs.iter().zip(&results).enumerate() {
+            if let Some((shape, dtype)) = declared.1.as_tensor() {
+                if let Some(want) = concrete(shape) {
+                    if want != got.shape {
+                        return Err(Error::Type(format!(
+                            "{}: result {k} is declared {want:?} and its shipped \
+                             `ref_impl` returned {:?}",
+                            op.qualified(),
+                            got.shape
+                        )));
+                    }
+                }
+                let _ = dtype;
+            }
+            self.check_size(&got.shape)?;
+        }
+        self.shipped.push(op.qualified());
+        Ok(Some(results))
     }
 
     fn constant(&mut self, op: &Op) -> Res<Tensor> {
