@@ -13,7 +13,7 @@
 //! highly redundant exponent bytes of a float tensor together.
 //!
 //! Still unimplemented and reported as such: the MAY-level codecs `brotli`,
-//! `xz`, `ans-lut` and the two lossy ones. A registered codec this build cannot
+//! `ans-lut` and the two lossy ones. A registered codec this build cannot
 //! decode makes an object *indeterminate* (§15.1), never invalid — and never
 //! silently half-decoded.
 //!
@@ -97,6 +97,10 @@ pub enum Codec {
     Lz4 {
         level: u8,
     },
+    /// The `.xz` container over LZMA2 — §03.7.1's archival codec.
+    Xz {
+        level: u8,
+    },
     /// Byte-plane transpose with the given element width, then deflate.
     BitshuffleDeflate {
         elem_size: usize,
@@ -118,6 +122,7 @@ impl Codec {
             Codec::BitshuffleZstd { .. } => id::BITSHUFFLE_ZSTD,
             Codec::Deflate { .. } => id::DEFLATE,
             Codec::Lz4 { .. } => id::LZ4,
+            Codec::Xz { .. } => id::XZ,
             Codec::BitshuffleDeflate { .. } => id::BITSHUFFLE_DEFLATE,
             // A pure filter has no registry id of its own; it is only meaningful
             // paired with an entropy coder, and is exposed here for testing.
@@ -140,6 +145,7 @@ impl Codec {
             Codec::BitshuffleZstd { .. } => "bitshuffle+zstd",
             Codec::Deflate { .. } => "deflate",
             Codec::Lz4 { .. } => "lz4",
+            Codec::Xz { .. } => "xz",
             Codec::BitshuffleDeflate { .. } => "bitshuffle+deflate",
             Codec::Bitshuffle { .. } => "bitshuffle",
             Codec::Unsupported(n) => n,
@@ -161,12 +167,12 @@ impl Codec {
             },
             id::DEFLATE => Codec::Deflate { level: 6 },
             id::LZ4 => Codec::Lz4 { level: 6 },
+            id::XZ => Codec::Xz { level: 6 },
             id::BITSHUFFLE_DEFLATE => Codec::BitshuffleDeflate {
                 elem_size: 2,
                 level: 6,
             },
             id::BROTLI => Codec::Unsupported("brotli"),
-            id::XZ => Codec::Unsupported("xz"),
             id::ZFP => Codec::Unsupported("zfp"),
             id::SZ3 => Codec::Unsupported("sz3"),
             id::ANS_LUT => Codec::Unsupported("ans-lut"),
@@ -200,6 +206,10 @@ impl Codec {
                 p.push(("level", Value::U(*level as u64)));
                 p.push(("impl", Value::text("omni-rs")));
             }
+            Codec::Xz { level } => {
+                p.push(("level", Value::U(*level as u64)));
+                p.push(("impl", Value::text("omni-rs")));
+            }
             Codec::BitshuffleDeflate { elem_size, level } => {
                 p.push(("level", Value::U(*level as u64)));
                 p.push(("elem_size", Value::U(*elem_size as u64)));
@@ -227,10 +237,10 @@ impl Codec {
             "bitshuffle+zstd" => Codec::BitshuffleZstd { elem_size, level },
             "deflate" => Codec::Deflate { level },
             "lz4" => Codec::Lz4 { level },
+            "xz" => Codec::Xz { level },
             "bitshuffle+deflate" => Codec::BitshuffleDeflate { elem_size, level },
             "bitshuffle" => Codec::Bitshuffle { elem_size },
             "brotli" => Codec::Unsupported("brotli"),
-            "xz" => Codec::Unsupported("xz"),
             "zfp" => Codec::Unsupported("zfp"),
             "sz3" => Codec::Unsupported("sz3"),
             "ans-lut" => Codec::Unsupported("ans-lut"),
@@ -249,6 +259,7 @@ impl Codec {
             )),
             Codec::Deflate { level } => Ok(deflate(logical, *level)),
             Codec::Lz4 { level } => Ok(crate::lz4::compress(logical, *level)),
+            Codec::Xz { level } => Ok(crate::xz::compress(logical, *level)),
             Codec::Bitshuffle { elem_size } => Ok(bitshuffle(logical, *elem_size)),
             Codec::BitshuffleDeflate { elem_size, level } => {
                 Ok(deflate(&bitshuffle(logical, *elem_size), *level))
@@ -283,6 +294,7 @@ impl Codec {
             }
             Codec::Deflate { .. } => inflate(stored, n)?,
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, n)?,
+            Codec::Xz { .. } => crate::xz::decompress(stored, n)?,
             Codec::Bitshuffle { elem_size } => unbitshuffle(stored, *elem_size),
             Codec::BitshuffleDeflate { elem_size, .. } => {
                 unbitshuffle(&inflate(stored, n)?, *elem_size)
@@ -316,6 +328,7 @@ impl Codec {
             )),
             Codec::Deflate { .. } => inflate(stored, cap),
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, cap),
+            Codec::Xz { .. } => crate::xz::decompress(stored, cap),
             Codec::Bitshuffle { elem_size } => Ok(unbitshuffle(stored, *elem_size)),
             Codec::BitshuffleDeflate { elem_size, .. } => {
                 Ok(unbitshuffle(&inflate(stored, cap)?, *elem_size))
@@ -1005,7 +1018,7 @@ mod tests {
 
     #[test]
     fn unimplemented_codecs_say_so_rather_than_guessing() {
-        for name in ["brotli", "xz", "ans-lut", "zfp", "sz3"] {
+        for name in ["brotli", "ans-lut", "zfp", "sz3"] {
             let c = Codec::from_value(&Value::map(vec![("id", Value::text(name))]));
             assert_eq!(c.name(), name);
             assert!(matches!(c.encode(b"x"), Err(Error::Unsupported(_))));
@@ -1038,6 +1051,7 @@ mod tests {
                 level: 9,
             },
             Codec::Lz4 { level: 6 },
+            Codec::Xz { level: 6 },
             Codec::Unsupported("brotli"),
         ] {
             let v = c.to_value();
@@ -1048,6 +1062,8 @@ mod tests {
         assert_eq!(Codec::Raw.id(), id::RAW);
         assert_eq!(Codec::Deflate { level: 6 }.id(), id::DEFLATE);
         assert_eq!(Codec::Lz4 { level: 6 }.id(), id::LZ4);
+        assert_eq!(Codec::Xz { level: 6 }.id(), id::XZ);
+        assert_eq!(Codec::from_id(id::XZ), Codec::Xz { level: 6 });
         assert_eq!(Codec::from_id(id::LZ4), Codec::Lz4 { level: 6 });
         assert_eq!(Codec::from_id(id::ZSTD), Codec::Zstd { level: 3 });
         assert_eq!(Codec::from_id(id::RAW), Codec::Raw);

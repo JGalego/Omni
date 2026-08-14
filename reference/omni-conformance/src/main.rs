@@ -80,6 +80,7 @@ fn do_codec(args: &[String]) -> u8 {
     let mut level = 3u64;
     let mut elem_size = 2u64;
     let mut logical_len: Option<u64> = None;
+    let mut high_ratio = false;
     let mut i = 5;
     while i < args.len() {
         if args[i] == "--level" {
@@ -91,6 +92,13 @@ fn do_codec(args: &[String]) -> u8 {
         } else if args[i] == "--logical-len" {
             logical_len = args.get(i + 1).and_then(|v| v.parse().ok());
             i += 2;
+        } else if args[i] == "--high-ratio" {
+            // §03.7.4's escape hatch, declared rather than assumed: a container
+            // whose features include `omni.codec/high-ratio.1` may exceed the
+            // 1000:1 bound, and a differential test over 200 KB of zeros needs
+            // it.
+            high_ratio = true;
+            i += 1;
         } else {
             eprintln!("omni-conformance: unknown option `{}`", args[i]);
             return 2;
@@ -116,7 +124,7 @@ fn do_codec(args: &[String]) -> u8 {
         // is nothing to check a ratio against, so the output is bounded and the
         // codec's own framing decides the rest.
         "decode" => match logical_len {
-            Some(n) => codec.decode(&data, n, false),
+            Some(n) => codec.decode(&data, n, high_ratio),
             None => codec.decode_framed(&data, CAP),
         },
         _ => {

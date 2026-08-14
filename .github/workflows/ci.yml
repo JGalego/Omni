@@ -3013,6 +3013,94 @@ jobs:
           PY
           echo "zstd interoperates with libzstd in both directions"
 
+      # `xz` has liblzma on every runner through Python's standard library,
+      # which is the strongest kind of check available: the reference
+      # implementation, written by somebody else, on both sides.
+      - name: xz agrees with liblzma, both ways
+        run: |
+          CONF=reference/target/release/omni-conformance
+          python3 - "$CONF" <<'PY'
+          import lzma, random, subprocess, sys
+
+          CONF = sys.argv[1]
+          random.seed(20260814)
+          cases = {
+              "empty": b"",
+              "one byte": b"z",
+              "text": b"a model exists once, everything else is derived. " * 900,
+              "small alphabet": bytes(random.choice(b"acgt") for _ in range(60000)),
+              "incompressible": bytes(random.randrange(256) for _ in range(70000)),
+              "one value": bytes(200000),
+              "float plane": bytes([0x3f if i % 3 else 0x40 for i in range(60000)]),
+              # Over one 64 KiB chunk, so the dictionary has to survive a chunk
+              # boundary and the state reset that goes with it.
+              "multi-chunk": b"the tensor is an expression. " * 12000,
+          }
+
+          bad = 0
+          for name, data in cases.items():
+              open('/tmp/z-in.bin', 'wb').write(data)
+              # 1. We write it; liblzma must read it.
+              for level in (0, 1, 6, 9):
+                  r = subprocess.run([CONF, 'codec', 'xz', 'encode', '/tmp/z-in.bin',
+                                      '/tmp/z-ours.xz', '--level', str(level)],
+                                     capture_output=True, text=True)
+                  if r.returncode != 0:
+                      print(f"::error::encode failed for {name} at {level}: {r.stderr}")
+                      bad += 1
+                      continue
+                  try:
+                      back = lzma.decompress(open('/tmp/z-ours.xz', 'rb').read())
+                  except Exception as e:
+                      print(f"::error::liblzma rejected our stream for {name} at {level}: {e}")
+                      bad += 1
+                      continue
+                  if back != data:
+                      print(f"::error::liblzma decoded our stream for {name} differently")
+                      bad += 1
+              # 2. liblzma writes it; we must read it — at every preset, and
+              #    under every integrity check the format defines, including the
+              #    SHA-256 one this crate already had for §03.5.1.
+              for preset in (0, 1, 6, 9):
+                  for check in (lzma.CHECK_NONE, lzma.CHECK_CRC32,
+                                lzma.CHECK_CRC64, lzma.CHECK_SHA256):
+                      ref = lzma.compress(data, format=lzma.FORMAT_XZ,
+                                          check=check, preset=preset)
+                      open('/tmp/z-ref.xz', 'wb').write(ref)
+                      r = subprocess.run([CONF, 'codec', 'xz', 'decode', '/tmp/z-ref.xz',
+                                          '/tmp/z-back.bin', '--logical-len', str(len(data)),
+                                          '--high-ratio'],
+                                         capture_output=True, text=True)
+                      if r.returncode != 0:
+                          print(f"::error::we rejected liblzma's stream for {name} "
+                                f"at preset {preset}, check {check}: {r.stderr}")
+                          bad += 1
+                          continue
+                      if open('/tmp/z-back.bin', 'rb').read() != data:
+                          print(f"::error::we decoded liblzma's stream for {name} differently")
+                          bad += 1
+              ours = len(open('/tmp/z-ours.xz', 'rb').read())
+              theirs = len(lzma.compress(data, preset=6))
+              print(f"{name}: {len(data)} B, both directions agree "
+                    f"(ours {ours} B, liblzma {theirs} B)")
+          sys.exit(1 if bad else 0)
+          PY
+          # A filter chain this build does not implement is unsupported (exit 3),
+          # which is §15.1's third answer and not "corrupt".
+          python3 -c "
+          import lzma
+          f = [{'id': lzma.FILTER_X86}, {'id': lzma.FILTER_LZMA2, 'preset': 6}]
+          open('/tmp/z-bcj.xz','wb').write(
+              lzma.compress(b'x'*4096, format=lzma.FORMAT_XZ, filters=f))
+          "
+          set +e
+          "$CONF" codec xz decode /tmp/z-bcj.xz /tmp/z-bcj.bin > /tmp/z-bcj.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 3
+          grep -q 'BCJ' /tmp/z-bcj.txt
+          echo "xz interoperates with liblzma in both directions"
+
       # `lz4` has no library on the runner to check against, so the second
       # opinion is a Python implementation written from the block format
       # (tools/lz4-fixture.py) with a deliberately different match strategy.
@@ -3093,7 +3181,7 @@ jobs:
           # The baseline: the same objects packed raw, from the same directory
           # store, so a raw repack has something byte-exact to be compared with.
           "$OMNI" pack /tmp/comp.omnid -o /tmp/base.omni >/dev/null
-          for codec in zstd:9 bitshuffle+zstd:9:2 deflate:9 lz4:9; do
+          for codec in zstd:9 bitshuffle+zstd:9:2 deflate:9 lz4:9 xz:6; do
             "$OMNI" pack /tmp/comp.omnid -o /tmp/packed.omni --codec "$codec" >/dev/null
             "$OMNI" verify /tmp/packed.omni --level 6 >/dev/null
             "$OMNI" repack /tmp/packed.omni -o /tmp/re.omni --codec raw | tee /tmp/repack.txt

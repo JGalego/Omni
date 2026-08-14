@@ -134,7 +134,11 @@ implemented:
   sequences, repeat offsets, the window, multi-frame streams and the XXH64
   content checksum), `deflate` (RFC 1951, both directions), `lz4` (the block
   format, both directions — the token nibbles, the `255` continuations and the
-  overlapping match that is how LZ4 spells a run), `bitshuffle`, and
+  overlapping match that is how LZ4 spells a run), `xz` (the `.xz` container
+  over LZMA2, both directions — the range coder, the eleven probability arrays,
+  matched literals, the position-slot distance model, the four reset modes and
+  all four integrity checks including the SHA-256 one this crate already had),
+  `bitshuffle`, and
   both `bitshuffle+zstd` and `bitshuffle+deflate`, with the §03.7.4
   decompression bounds; a compressed container holds the same object identities
   as an uncompressed one, the superblock names the codecs a reader will meet and
@@ -531,8 +535,12 @@ implemented:
 
 What is **not** implemented, and is reported as such rather than faked:
 
-- §03.7's MAY-level codecs `brotli`, `xz`, `ans-lut` and the two lossy
-  ones: reported as unsupported rather than half-decoded. `lz4` is implemented
+- §03.7's MAY-level codecs `brotli`, `ans-lut` and the two lossy ones:
+  reported as unsupported rather than half-decoded. `lz4` and `xz` are
+  implemented; `xz`'s BCJ and `delta` filters are not, and a stream that uses
+  one is reported *unsupported* by the filter's own name rather than decoded
+  without it, because a filter changes the bytes and skipping it produces a
+  plausible wrong answer
 - `https://`. §13.4's HTTP range store is here and speaks HTTP/1.1 over a
   socket, but TLS needs a cryptographic transport stack and this crate has no
   dependencies to provide one. An `https://` URL is refused with that reason
@@ -623,7 +631,7 @@ expectation.
 
 ## Tests
 
-568 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+578 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -921,7 +929,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 568 passed; 0 failed
+test result: ok. 578 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```
