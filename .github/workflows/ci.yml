@@ -3871,6 +3871,51 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # §12.4 describes the hostile-input coverage in two numbers, and a security
+      # section is the worst place for a figure nobody re-derives — it said ~200
+      # curated files where 30 ship. Both are countable from the tree, so both
+      # are counted here rather than trusted.
+      - name: §12.4's hostile-input figures match the corpus and the workflow
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+          spec = open('docs/spec/12-security.md', encoding='utf-8').read()
+          bad = []
+
+          # Recursive: the cases are filed under invalid/framing and
+          # invalid/encoding, so a top-level glob counts two directories.
+          shipped = len(glob.glob('conformance/invalid/**/*.omni', recursive=True))
+          m = re.search(r'\*\*(\d+) hand-built invalid containers\*\*', spec)
+          if not m:
+              bad.append('the invalid-container count no longer parses out of §12.4')
+          elif int(m.group(1)) != shipped:
+              bad.append(f'§12.4 says {m.group(1)} invalid containers, '
+                         f'conformance/invalid/ holds {shipped}')
+
+          # The mutation total is whatever the fuzz step actually runs: the seed
+          # list times --iterations. Read it from the workflow so editing one
+          # cannot leave the other behind.
+          ci = open('.github/workflows/ci.yml', encoding='utf-8').read()
+          step = re.search(r'Mutation fuzzing finds no crashes.*?\n\n', ci, re.S)
+          seeds = re.search(r'for seed in ([\d ]+); do', step.group(0) if step else '')
+          iters = re.search(r'--iterations (\d+)', step.group(0) if step else '')
+          if not (step and seeds and iters):
+              bad.append('the fuzz step no longer parses; this check cannot derive the total')
+          else:
+              total = len(seeds.group(1).split()) * int(iters.group(1))
+              stated = re.search(r'\*\*([\d  ]+) structure-aware mutations', spec)
+              if not stated:
+                  bad.append('the mutation count no longer parses out of §12.4')
+              elif int(re.sub(r'\D', '', stated.group(1))) != total:
+                  bad.append(f'§12.4 says {stated.group(1).strip()} mutations, '
+                             f'the fuzz step runs {total}')
+          for b in bad:
+              print(f'::error file=docs/spec/12-security.md::{b}')
+          print(f'§12.4 agrees with the tree: {shipped} invalid containers'
+                if not bad else 'figures disagree')
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Assets are well-formed SVG
         run: |
           python3 - <<'PY'

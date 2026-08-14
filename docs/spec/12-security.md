@@ -86,8 +86,13 @@ The parser is the largest attack surface. Normative requirements:
 | Zero-filled padding verified in strict mode | covert channels, reproducibility |
 
 The reference implementation is continuously fuzzed (§roadmap) with structure-
-aware fuzzers over the header, index, CBOR objects, and expression trees, and
-ships a corpus of ~200 hostile files as part of the conformance suite.
+aware fuzzers over the header, index, CBOR objects, and expression trees. It
+ships **30 hand-built invalid containers**, each naming the rule above that it
+violates, and runs **1 200 000 structure-aware mutations of the corpus on every
+push** — three seeds of four hundred thousand, with any input that crashes or
+hangs kept as an artifact. The hand-built cases and the mutations answer
+different questions: a curated case proves a specific rule is enforced and can be
+cited by ID, while mutation covers the combinations nobody thought to curate.
 
 **Memory safety.** The reference implementation is Rust with `#![forbid(unsafe_code)]`
 in the parsing crate; `unsafe` appears only in the mapping layer, isolated behind
