@@ -4,6 +4,33 @@ A dependency-free Rust implementation of the OMNI/1.0 container, object model
 and canonical encoding — enough to write, read, verify and inspect real `.omni`
 files.
 
+Requires **Rust 1.87** or newer and nothing else. The `[dependencies]` table is
+empty, and that is the point rather than a convenience: `docs/design/sdk.md` §5
+claims a conforming C0 reader needs nothing beyond a hash function, and this crate
+is the evidence.
+
+<!-- Absolute URLs on purpose: this file is the crates.io page for all four
+     crates, and relative links do not resolve there. -->
+
+- The specification this implements —
+  [`docs/spec/`](https://github.com/jgalego/Omni/tree/main/docs/spec)
+- The repository, with the design documents and the conformance corpus —
+  <https://github.com/jgalego/Omni>
+- Licensed **Apache-2.0 OR MIT** at your option; the specification is CC BY 4.0, and
+  [`LICENSE`](https://github.com/jgalego/Omni/blob/main/LICENSE) says which files
+  are which
+- Contributing —
+  [`CONTRIBUTING.md`](https://github.com/jgalego/Omni/blob/main/CONTRIBUTING.md),
+  which is worth reading before the first pull request rather than after
+- Security problems —
+  [`SECURITY.md`](https://github.com/jgalego/Omni/blob/main/SECURITY.md), by
+  private advisory rather than a public issue
+
+**OMNI/1.0 is a draft and not a ratified standard.** Version `0.1.0` of these
+crates is a reference implementation of a draft; read
+[§14](https://github.com/jgalego/Omni/blob/main/docs/spec/14-versioning.md) for
+what that does and does not promise about compatibility.
+
 ```console
 $ cargo build --release
 $ cargo test
