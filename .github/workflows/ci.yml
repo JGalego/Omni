@@ -746,14 +746,17 @@ jobs:
           grep -q 'omni.prov/convert' /tmp/conv3.txt
           grep -q 'max_abs_error' /tmp/conv3.txt
 
-          # And the transformation that needs data this build does not have is
-          # refused by name, with the reason.
+          # And a method whose scales are not a function of the weights is
+          # refused by name rather than approximated: §05.1's `formula` set is
+          # closed, and `gptq` is a search over activations rather than an entry
+          # in it. Nothing is written when the answer is no.
           set +e
           "$OMNI" convert /tmp/conv.omni --requantize gptq:4:128 -o /tmp/no.omni > /tmp/conv4.txt 2>&1
           rc=$?
           set -e
           test "$rc" = 2
-          grep -q 'calibration set' /tmp/conv4.txt
+          grep -q "is not a formula this converter writes" /tmp/conv4.txt
+          grep -q "affine" /tmp/conv4.txt
           test ! -f /tmp/no.omni
 
       # `roundtrip/` is about the writer rather than the reader: unpack one of
@@ -1973,16 +1976,25 @@ jobs:
           diff /tmp/hfr.txt /tmp/hfwant.txt
 
           # A template §06.9 cannot express is left out and named, rather than
-          # shipped as a string somebody executes.
-          python3 - <<'PY_LOOP'
+          # shipped as a string somebody executes. `raise_exception` is the one
+          # construct that stays out of reach on purpose: a total language has
+          # no failure form, so a template asserting something about its input
+          # would have the assertion silently dropped. (The loop variable used
+          # to be the example here, until §06.9 grew one.)
+          python3 - <<'PY_RAISE'
           import json
           p = "/tmp/hfrepo/tokenizer_config.json"
           c = json.load(open(p))
-          c["chat_template"] = "{% for m in messages %}{{ loop.index }}{% endfor %}"
+          c["chat_template"] = (
+              "{% for m in messages %}{% if m['role'] == 'system' %}"
+              "{{ raise_exception('no system messages') }}{% endif %}"
+              "{{ m['content'] }}{% endfor %}"
+          )
           json.dump(c, open(p, "w"))
-          PY_LOOP
+          PY_RAISE
           "$OMNI" import hf /tmp/hfrepo -o /tmp/hf2.omni | tee /tmp/hf2.txt
           grep -q 'chat_template — Jinja2' /tmp/hf2.txt
+          grep -q 'raise_exception' /tmp/hf2.txt
           if grep -q 'chat_template (OMNI-CT)' /tmp/hf2.txt; then
             echo "::error::a template it cannot express was written anyway"; exit 1
           fi
@@ -1997,7 +2009,11 @@ jobs:
           rc=$?
           set -e
           test "$rc" != 0
-          grep -q 'transformer.decoder, transformer.encoder, cnn.classifier, mlp' /tmp/fam.txt
+          grep -q 'no synthesizer for family `llama`' /tmp/fam.txt
+          # The list is named rather than summarised, so a family that *is*
+          # synthesizable is visible in the refusal.
+          grep -q 'transformer.decoder' /tmp/fam.txt
+          grep -q 'ssm.mamba' /tmp/fam.txt
 
           echo "a Hugging Face repo imports as one container, with its tokenizer in it"
 
@@ -2503,14 +2519,26 @@ jobs:
           grep -qi 'claims\|malformed' /tmp/bad.txt
           echo "a safetensors header that disagrees with its buffer is refused"
 
-          # An unknown format is a refusal that says what this build does, not a
-          # silent no-op.
+          # A format with no importer is a refusal that says what this build
+          # does, not a silent no-op. (`gguf` was the example here until it was
+          # implemented, which is the good reason for an assertion to go stale.)
           set +e
-          "$OMNI" import gguf /tmp/src.safetensors -o /tmp/x.omni > /tmp/nofmt.txt 2>&1
+          "$OMNI" import exl2 /tmp/src.safetensors -o /tmp/x.omni > /tmp/nofmt.txt 2>&1
           rc=$?
           set -e
           test "$rc" = 2
-          grep -q 'no importer for `gguf`' /tmp/nofmt.txt
+          grep -q 'no importer for `exl2`' /tmp/nofmt.txt
+          grep -q 'import-export.md' /tmp/nofmt.txt
+
+          # And a file that is not the format it was told to read is invalid
+          # rather than half-imported.
+          set +e
+          "$OMNI" import gguf /tmp/src.safetensors -o /tmp/x2.omni > /tmp/wrongfmt.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          test ! -f /tmp/x2.omni
+          grep -q 'GGUF' /tmp/wrongfmt.txt
 
       # §13: the unit of transfer is the object. A container read over HTTP by
       # range, with the round trips counted — a transport claim nothing counts

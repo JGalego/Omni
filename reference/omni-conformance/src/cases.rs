@@ -621,7 +621,7 @@ fn with_materialized_digest(
                     Value::text("digest_materialized"),
                     Value::Bytes(digest.to_vec()),
                 ));
-                pairs.sort_by(|a, b| a.0.encode().cmp(&b.0.encode()));
+                pairs.sort_by_key(|a| a.0.encode());
             }
             let after = Object::structure(otype::TENSOR_DESC, &v);
             map.push((before, after.digest(hash)));
