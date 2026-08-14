@@ -249,8 +249,9 @@ implemented:
   verifies every blob against the digest that named it before anything becomes a
   file
 - §13.5 **the registry client**, which was the missing half: `omni oci push` and
-  `omni oci pull` over the distribution API, tested in CI against a real
-  `registry:2` rather than a mock — because the argument for the OCI mapping is
+  `omni oci pull` over the distribution API, with credentials, **chunked blob
+  uploads** and the **referrers API**, tested in CI against a real `registry:2`
+  rather than a mock — because the argument for the OCI mapping is
   parasitic adoption, and adoption is not a property this repository can assert
   about itself. A model goes up, comes back down byte-identical, verifies at V6
   and can be pulled by digest instead of by tag; a signed container makes the
@@ -266,8 +267,24 @@ implemented:
   now measures them instead of repeating them. `https://` is still refused — TLS
   needs a dependency this crate does not have — so what this reaches is a
   plaintext registry: a local one, a mirror, or anything behind a terminator. A
-  `401` is told apart from a `404` and the bearer realm it names is reported
-  rather than guessed at
+  `401` is told apart from a `404` and the realm it names is reported rather than
+  guessed at.
+
+  Three things landed after the first version and each closes a named gap.
+  **Chunked uploads** (`--chunk N`): a `POST`, then a `PATCH` per piece with the
+  byte range it carries and the `Location` the registry answers with — which may
+  move, so it is read rather than assumed — then the closing `PUT`. The
+  monolithic `PUT` the specification allows at any size is still the default and
+  is what a healthy link wants; chunking is for a 5 GB layer over a bad one, and
+  for the managed registries that cap a request's size. **Credentials**, above.
+  And **the referrers API** (`--subject`, `omni oci referrers`), which is how an
+  adapter, a signature or an evaluation is found *from the model* instead of by a
+  naming convention two tools have to agree on out of band: the artifact's
+  manifest gains a `subject` and an `artifactType`, the subject is `HEAD`ed first
+  so a link nobody can follow is refused before anything is written, and a
+  registry that does not implement the endpoint gets the fallback tag the
+  distribution specification defines for exactly that case — so the link is
+  findable either way and the client does not have to choose an ecosystem
 - **ONNX, both directions**, which is the row of the capability matrix that tests
   §07 rather than §04: a safetensors file is tensors, a GGUF file is tensors plus
   an architecture enum, and an ONNX file is a computation. The protobuf wire
@@ -569,17 +586,15 @@ What is **not** implemented, and is reported as such rather than faked:
   socket, but TLS needs a cryptographic transport stack and this crate has no
   dependencies to provide one. An `https://` URL is refused with that reason
   rather than silently downgraded
-- Registry *authentication*, and chunked blob uploads. `omni oci push` and
-  `omni oci pull` speak the distribution API and CI pushes to a real
-  `registry:2`, but a registry that answers `401` wants a token from a realm that
-  is https on every registry this could reach — so the challenge is parsed and
-  reported with the URL it would have fetched, and no anonymous retry is
-  attempted, because an endpoint this build cannot reach is not made reachable by
-  trying twice. Uploads are monolithic `PUT`s, which the specification allows at
-  any size; chunking is a resumption story for a 5 GB layer over a bad link, and
-  it is named here rather than half-implemented. The OCI referrers API, which is
-  how an adapter or a signature would be linked to the model it belongs to, is
-  also not here
+- **Fetching** a bearer token. `--user user:password` and `--token T` are here
+  and are sent on every request rather than only after a challenge — a client
+  that waits to be asked spends a round trip per blob, and some registries answer
+  404 for unauthorized, which turns a permissions problem into "your model is
+  missing". What is still absent is the token *dance*: a `401 WWW-Authenticate:
+  Bearer realm=…` points at an endpoint that is https on every registry this
+  could reach, so the challenge is parsed and reported with the realm it named,
+  and whether a credential was sent and refused or never offered — two problems
+  with different fixes that a bare "401" makes the user guess between
 - GPTQ's Hessian update and AWQ's per-channel scaling transform.
   `omni convert --requantize` is here — both the round-to-nearest baseline,
   whose scales come from the weights alone, and a clip search whose objective is
@@ -655,7 +670,7 @@ expectation.
 
 ## Tests
 
-598 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+602 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -953,7 +968,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 598 passed; 0 failed
+test result: ok. 602 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

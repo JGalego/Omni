@@ -41,24 +41,109 @@
 //! anything behind a TLS terminator, which is what a registry looks like from
 //! inside most deployments. CI runs a real `registry:2` and pushes to it.
 //!
-//! **The bearer-token dance.** A registry that answers `401` with a
-//! `WWW-Authenticate: Bearer realm=…` challenge is asking for a token from a
-//! realm that is, in practice, always `https://`. The challenge is parsed and
-//! reported with the URL it would have fetched, because "401" alone tells a user
-//! nothing about which credential is missing. What is *not* done is a guess:
-//! there is no anonymous-token retry, since a token endpoint this build cannot
-//! reach is not made reachable by trying it twice.
-//!
-//! **Chunked blob uploads.** The monolithic `PUT` is what this does, and it is
-//! what the specification allows for any blob size. Chunking exists so a 5 GB
-//! layer can resume after a broken connection, which matters for a real mirror
-//! and is a resumption story rather than a protocol requirement — it is named
-//! here rather than half-implemented.
+//! **Fetching a bearer token.** [`Credentials`] carries one the caller already
+//! has — `Bearer` for a token, `Basic` for a username and password — and it is
+//! sent on every request rather than only after a challenge, which is what a
+//! client with explicit credentials should do. What is still not done is the
+//! *token dance*: a registry that answers `401 WWW-Authenticate: Bearer
+//! realm=…` is pointing at a token endpoint that is https on every registry
+//! this could reach, so the challenge is parsed and reported with the realm it
+//! named instead of being followed. "401" alone tells a user nothing about
+//! which credential is missing; the realm does.
 
 use crate::container::Container;
 use crate::json;
 use crate::oci::{self, Layout};
 use crate::transport::{Http, Url};
+
+/// The credential to send, if any.
+///
+/// Sent on every request rather than only in answer to a challenge. A client
+/// that waits to be asked spends an extra round trip per blob and, worse, gives
+/// the registry a chance to answer 404-for-unauthorized — which some do, and
+/// which turns a permissions problem into "your model is missing".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Credentials {
+    #[default]
+    None,
+    /// A username and password, sent as `Authorization: Basic`.
+    Basic { user: String, password: String },
+    /// A token the caller obtained elsewhere.
+    Bearer(String),
+}
+
+impl Credentials {
+    /// Parses `user:password`, which is how every registry client spells it.
+    pub fn basic(spec: &str) -> Res<Credentials> {
+        let (user, password) = spec.split_once(':').ok_or_else(|| {
+            Error::Auth("credentials are `user:password`; there is no colon in this one".into())
+        })?;
+        Ok(Credentials::Basic {
+            user: user.to_string(),
+            password: password.to_string(),
+        })
+    }
+
+    /// The `Authorization` header this credential produces, if any.
+    fn header(&self) -> Option<(String, String)> {
+        match self {
+            Credentials::None => None,
+            Credentials::Basic { user, password } => Some((
+                "Authorization".into(),
+                format!("Basic {}", base64(format!("{user}:{password}").as_bytes())),
+            )),
+            Credentials::Bearer(t) => Some(("Authorization".into(), format!("Bearer {t}"))),
+        }
+    }
+}
+
+/// Standard base64, for the one place HTTP needs it.
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// How a push should behave beyond the bytes it sends.
+#[derive(Clone, Debug, Default)]
+pub struct PushOpts {
+    pub creds: Credentials,
+    /// Upload blobs larger than this in `PATCH` chunks of this size, instead of
+    /// one `PUT`.
+    ///
+    /// The monolithic `PUT` the specification allows at any size is the default
+    /// and is what a healthy link wants. Chunking exists so a 5 GB layer over a
+    /// bad link does not start again from zero, and so a registry with a request
+    /// size limit — most managed ones have one — can be pushed to at all.
+    pub chunk_size: Option<usize>,
+    /// Make this artifact a *referrer* of an existing manifest (§13.5's
+    /// referrers API): the descriptor a registry answers `GET
+    /// /v2/<name>/referrers/<digest>` with.
+    pub subject: Option<String>,
+    /// The `artifactType` a referring manifest declares, so a client can filter
+    /// signatures from adapters without pulling either.
+    pub artifact_type: Option<String>,
+}
 
 pub const MANIFEST_TYPE: &str = oci::MANIFEST_TYPE;
 
@@ -170,6 +255,13 @@ pub struct Push {
     /// The manifest digest the artifact is now addressable by.
     pub manifest_digest: String,
     pub requests: u64,
+    /// `PATCH` requests made, when the upload was chunked.
+    pub chunks: u64,
+    /// The manifest this artifact was linked to, if any (§13.5's referrers).
+    pub subject: Option<String>,
+    /// Whether the registry acknowledged the link with `OCI-Subject`. When it
+    /// did not, the fallback tag was written instead.
+    pub subject_accepted: bool,
 }
 
 impl Push {
@@ -198,26 +290,64 @@ fn client(r: &Reference) -> Res<Http> {
     Http::new(&r.base_url()).map_err(|e| Error::Transport(e.to_string()))
 }
 
-/// Turns a `401` into an error that says which credential is missing.
-fn challenge(resp: &crate::transport::Response, what: &str) -> Error {
-    match resp.header("www-authenticate") {
-        Some(c) => {
-            let realm = c
-                .split(',')
-                .find_map(|p| p.trim().strip_prefix("realm=").map(|r| r.trim_matches('"')))
-                .unwrap_or("(unstated)");
-            Error::Auth(format!(
-                "{what}: the registry wants a bearer token from `{realm}`. That \
-                 endpoint is https on every registry this could reach, and this \
-                 build has no TLS — so the token cannot be fetched here. Push to a \
-                 registry that does not require one, or through something that \
-                 terminates TLS"
-            ))
-        }
-        None => Error::Auth(format!(
-            "{what}: the registry refused with 401 and stated no challenge"
-        )),
+/// A request with the credential attached, if there is one.
+fn send(
+    http: &Http,
+    creds: &Credentials,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> Res<crate::transport::Response> {
+    let mut all: Vec<(String, String)> = headers.to_vec();
+    if let Some(h) = creds.header() {
+        all.push(h);
     }
+    http.send(method, path, &all, body)
+        .map_err(|e| Error::Transport(e.to_string()))
+}
+
+/// Turns a `401` into an error that says which credential is missing, and
+/// whether one was even offered.
+///
+/// The distinction matters: "you sent nothing" and "what you sent was refused"
+/// are different problems with different fixes, and a client that reports both
+/// as `401` makes the user guess.
+fn challenge(resp: &crate::transport::Response, what: &str, creds: &Credentials) -> Error {
+    let Some(c) = resp.header("www-authenticate") else {
+        return Error::Auth(format!(
+            "{what}: the registry refused with 401 and stated no challenge"
+        ));
+    };
+    // `Bearer realm="…",service="…"` — the scheme is the first token and the
+    // parameters follow it, so `realm=` is not necessarily at the start of a
+    // comma-separated part.
+    let scheme = c.split_whitespace().next().unwrap_or("").to_string();
+    let realm = c
+        .split(',')
+        .find_map(|p| {
+            let p = p.trim();
+            let p = p.strip_prefix(&scheme).map(str::trim_start).unwrap_or(p);
+            p.strip_prefix("realm=").map(|r| r.trim_matches('"'))
+        })
+        .unwrap_or("(unstated)");
+    let offered = match creds {
+        Credentials::None => "no credential was sent",
+        Credentials::Basic { .. } => "the username and password sent were refused",
+        Credentials::Bearer(_) => "the token sent was refused",
+    };
+    if scheme.eq_ignore_ascii_case("basic") {
+        return Error::Auth(format!(
+            "{what}: the registry wants a username and password for realm \
+             `{realm}`, and {offered}. Pass `--user <user>:<password>`"
+        ));
+    }
+    Error::Auth(format!(
+        "{what}: the registry wants a bearer token from `{realm}`, and {offered}. \
+         That endpoint is https on every registry this could reach and this build \
+         has no TLS, so the token cannot be fetched here — pass one with `--token`, \
+         or push through something that terminates TLS"
+    ))
 }
 
 fn status_error(what: &str, resp: &crate::transport::Response) -> Error {
@@ -242,7 +372,13 @@ fn status_error(what: &str, resp: &crate::transport::Response) -> Error {
 /// the registry is exactly what `oras cp --from-oci-layout` would have pushed
 /// from disk — the same blobs, the same manifest, the same digests.
 pub fn push(layout: &Layout, r: &Reference) -> Res<Push> {
+    push_with(layout, r, &PushOpts::default())
+}
+
+/// [`push`], with credentials, chunking and a referrers `subject`.
+pub fn push_with(layout: &Layout, r: &Reference, opts: &PushOpts) -> Res<Push> {
     let http = client(r)?;
+    let creds = &opts.creds;
     let mut out = Push {
         manifest_digest: layout.manifest_digest.clone(),
         ..Default::default()
@@ -251,12 +387,10 @@ pub fn push(layout: &Layout, r: &Reference) -> Res<Push> {
     // §13.5 says the registry API is reachable before anything is uploaded, and
     // a client that discovers otherwise halfway through a 4 GB push has wasted
     // the push. `GET /v2/` is the specification's own ping.
-    let ping = http
-        .send("GET", "/v2/", &[], None)
-        .map_err(|e| Error::Transport(e.to_string()))?;
+    let ping = send(&http, creds, "GET", "/v2/", &[], None)?;
     match ping.status {
         200 => {}
-        401 => return Err(challenge(&ping, "/v2/")),
+        401 => return Err(challenge(&ping, "/v2/", creds)),
         _ => return Err(status_error("/v2/", &ping)),
     }
 
@@ -275,9 +409,14 @@ pub fn push(layout: &Layout, r: &Reference) -> Res<Push> {
             continue;
         }
         let digest = format!("sha256:{hex}");
-        let head = http
-            .send("HEAD", &format!("/v2/{}/blobs/{digest}", r.name), &[], None)
-            .map_err(|e| Error::Transport(e.to_string()))?;
+        let head = send(
+            &http,
+            creds,
+            "HEAD",
+            &format!("/v2/{}/blobs/{digest}", r.name),
+            &[],
+            None,
+        )?;
         match head.status {
             200 => {
                 // The registry already has these bytes. This is the dedup claim,
@@ -287,31 +426,79 @@ pub fn push(layout: &Layout, r: &Reference) -> Res<Push> {
                 continue;
             }
             404 => {}
-            401 => return Err(challenge(&head, "blob HEAD")),
+            401 => return Err(challenge(&head, "blob HEAD", creds)),
             _ => return Err(status_error("blob HEAD", &head)),
         }
 
-        let start = http
-            .send("POST", &format!("/v2/{}/blobs/uploads/", r.name), &[], None)
-            .map_err(|e| Error::Transport(e.to_string()))?;
+        let start = send(
+            &http,
+            creds,
+            "POST",
+            &format!("/v2/{}/blobs/uploads/", r.name),
+            &[],
+            None,
+        )?;
         if start.status != 202 {
             return Err(status_error("starting a blob upload", &start));
         }
-        let location = start.header("location").ok_or_else(|| {
-            Error::Registry("a 202 with no Location: there is nowhere to upload to".into())
-        })?;
-        let location = upload_path(location, &digest)?;
-        let put = http
-            .send(
-                "PUT",
-                &location,
-                &[(
-                    "Content-Type".into(),
-                    "application/octet-stream".to_string(),
-                )],
-                Some(bytes),
-            )
-            .map_err(|e| Error::Transport(e.to_string()))?;
+        let mut location = start
+            .header("location")
+            .ok_or_else(|| {
+                Error::Registry("a 202 with no Location: there is nowhere to upload to".into())
+            })?
+            .to_string();
+
+        // Chunked, when the caller asked for it and the blob is worth it. Each
+        // `PATCH` states the byte range it carries and the registry answers with
+        // the `Location` to continue at — which may move, so it is read from the
+        // response rather than assumed.
+        let mut tail: &[u8] = bytes;
+        if let Some(chunk) = opts.chunk_size.filter(|c| *c > 0 && bytes.len() > *c) {
+            let mut at = 0usize;
+            while at + chunk < bytes.len() {
+                let end = at + chunk;
+                let patch = send(
+                    &http,
+                    creds,
+                    "PATCH",
+                    &plain_path(&location)?,
+                    &[
+                        (
+                            "Content-Type".into(),
+                            "application/octet-stream".to_string(),
+                        ),
+                        ("Content-Range".into(), format!("{at}-{}", end - 1)),
+                    ],
+                    Some(&bytes[at..end]),
+                )?;
+                if patch.status != 202 {
+                    return Err(status_error(
+                        &format!("uploading bytes {at}..{end} of {digest}"),
+                        &patch,
+                    ));
+                }
+                if let Some(next) = patch.header("location") {
+                    location = next.to_string();
+                }
+                out.chunks += 1;
+                at = end;
+            }
+            tail = &bytes[at..];
+        }
+
+        // The closing `PUT` carries whatever is left — the whole blob when the
+        // upload was monolithic, the last chunk when it was not.
+        let put = send(
+            &http,
+            creds,
+            "PUT",
+            &upload_path(&location, &digest)?,
+            &[(
+                "Content-Type".into(),
+                "application/octet-stream".to_string(),
+            )],
+            Some(tail),
+        )?;
         if put.status != 201 {
             return Err(status_error(&format!("uploading {digest}"), &put));
         }
@@ -319,24 +506,239 @@ pub fn push(layout: &Layout, r: &Reference) -> Res<Push> {
         out.uploaded_bytes += bytes.len() as u64;
     }
 
-    let manifest = layout
+    let mut manifest = layout
         .files
         .iter()
         .find(|(p, _)| p.ends_with(layout.manifest_digest.trim_start_matches("sha256:")))
         .map(|(_, b)| b.clone())
         .ok_or_else(|| Error::Oci("the layout holds no manifest blob".into()))?;
-    let put = http
-        .send(
-            "PUT",
-            &format!("/v2/{}/manifests/{}", r.name, r.reference),
-            &[("Content-Type".into(), MANIFEST_TYPE.to_string())],
-            Some(&manifest),
-        )
-        .map_err(|e| Error::Transport(e.to_string()))?;
+
+    // §13.5's referrers API: an artifact that names a `subject` is *linked* to
+    // it by the registry, which is how a signature, an adapter or an evaluation
+    // is found from the model rather than by a naming convention two tools have
+    // to agree on out of band.
+    if let Some(subject) = &opts.subject {
+        manifest = with_subject(
+            &manifest,
+            subject,
+            opts.artifact_type.as_deref(),
+            &http,
+            r,
+            creds,
+        )?;
+        // The layout's digest names the manifest *before* the subject was added,
+        // and the artifact is addressable by what was actually written. Bare
+        // hex, like the layout's, because the caller prefixes it.
+        out.manifest_digest = crate::sha256::hex(&crate::sha256::sha256(&manifest));
+        out.subject = Some(subject.clone());
+    }
+
+    let put = send(
+        &http,
+        creds,
+        "PUT",
+        &format!("/v2/{}/manifests/{}", r.name, r.reference),
+        &[("Content-Type".into(), MANIFEST_TYPE.to_string())],
+        Some(&manifest),
+    )?;
     if put.status != 201 {
         return Err(status_error("putting the manifest", &put));
     }
+    // A registry that understands referrers echoes the subject it recorded. One
+    // that does not says nothing, and the fallback tag below is what makes the
+    // link findable there — the specification's own compatibility path, not a
+    // convention invented here.
+    if opts.subject.is_some() {
+        out.subject_accepted = put.header("oci-subject").is_some();
+        if !out.subject_accepted {
+            let tag = fallback_tag(opts.subject.as_deref().unwrap_or_default())?;
+            let index = referrers_index(&[(
+                format!("sha256:{}", out.manifest_digest),
+                manifest.len() as u64,
+                opts.artifact_type.clone().unwrap_or_default(),
+            )]);
+            let bytes = index.encode().into_bytes();
+            let put = send(
+                &http,
+                creds,
+                "PUT",
+                &format!("/v2/{}/manifests/{tag}", r.name),
+                &[("Content-Type".into(), oci::INDEX_JSON_TYPE.to_string())],
+                Some(&bytes),
+            )?;
+            if put.status != 201 {
+                return Err(status_error("putting the referrers fallback tag", &put));
+            }
+        }
+    }
     out.requests = http.requests.get();
+    Ok(out)
+}
+
+/// Adds `subject` (and an `artifactType`) to a manifest, checking first that the
+/// subject is actually there.
+///
+/// Pointing at a manifest the registry does not have produces a dangling link
+/// that only shows up when somebody follows it, so it is checked before the
+/// artifact is written rather than after.
+fn with_subject(
+    manifest: &[u8],
+    subject: &str,
+    artifact_type: Option<&str>,
+    http: &Http,
+    r: &Reference,
+    creds: &Credentials,
+) -> Res<Vec<u8>> {
+    let head = send(
+        http,
+        creds,
+        "HEAD",
+        &format!("/v2/{}/manifests/{subject}", r.name),
+        &[(
+            "Accept".into(),
+            format!("{MANIFEST_TYPE}, {}", oci::INDEX_JSON_TYPE),
+        )],
+        None,
+    )?;
+    if head.status == 404 {
+        return Err(Error::Registry(format!(
+            "the subject {subject} is not in `{}`; a referrer pointing at a \
+             manifest the registry does not have is a link nobody can follow",
+            r.name
+        )));
+    }
+    if head.status != 200 {
+        return Err(status_error("checking the subject", &head));
+    }
+    let size: u64 = head
+        .header("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let media = head
+        .header("content-type")
+        .unwrap_or(MANIFEST_TYPE)
+        .to_string();
+
+    let mut doc = json::parse(manifest).map_err(|e| Error::Oci(e.to_string()))?;
+    let json::Value::Object(map) = &mut doc else {
+        return Err(Error::Oci("the manifest is not a JSON object".into()));
+    };
+    map.insert(
+        "subject".to_string(),
+        json::object(vec![
+            ("mediaType", json::string(media)),
+            ("digest", json::string(subject.to_string())),
+            ("size", json::Value::U(size)),
+        ]),
+    );
+    if let Some(t) = artifact_type {
+        map.insert("artifactType".to_string(), json::string(t.to_string()));
+    }
+    Ok(doc.encode().into_bytes())
+}
+
+/// The referrers fallback tag of the distribution specification: the subject's
+/// digest with its separator replaced, because a tag cannot contain a colon.
+fn fallback_tag(subject: &str) -> Res<String> {
+    let (algo, hex) = subject.split_once(':').ok_or_else(|| {
+        Error::Registry(format!("`{subject}` is not an algorithm-prefixed digest"))
+    })?;
+    Ok(format!("{algo}-{hex}"))
+}
+
+/// An OCI image index of referring descriptors.
+fn referrers_index(entries: &[(String, u64, String)]) -> json::Value {
+    json::object(vec![
+        ("schemaVersion", json::Value::U(2)),
+        ("mediaType", json::string(oci::INDEX_JSON_TYPE)),
+        (
+            "manifests",
+            json::Value::Array(
+                entries
+                    .iter()
+                    .map(|(digest, size, artifact)| {
+                        let mut d = vec![
+                            ("mediaType", json::string(MANIFEST_TYPE)),
+                            ("digest", json::string(digest.clone())),
+                            ("size", json::Value::U(*size)),
+                        ];
+                        if !artifact.is_empty() {
+                            d.push(("artifactType", json::string(artifact.clone())));
+                        }
+                        json::object(d)
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// One artifact that refers to another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Referrer {
+    pub digest: String,
+    pub size: u64,
+    pub artifact_type: String,
+}
+
+/// Lists what refers to a manifest (§13.5).
+///
+/// The referrers endpoint first, then the fallback tag for a registry that does
+/// not implement it — which the distribution specification defines precisely so
+/// that a client does not have to choose between the two ecosystems.
+pub fn referrers(r: &Reference, subject: &str, creds: &Credentials) -> Res<Vec<Referrer>> {
+    let http = client(r)?;
+    let resp = send(
+        &http,
+        creds,
+        "GET",
+        &format!("/v2/{}/referrers/{subject}", r.name),
+        &[],
+        None,
+    )?;
+    let body = match resp.status {
+        200 => resp.body,
+        401 => return Err(challenge(&resp, "referrers", creds)),
+        404 | 405 | 501 => {
+            // The fallback. An absent tag means no referrers, which is a
+            // different answer from "this registry cannot tell you".
+            let tag = fallback_tag(subject)?;
+            let f = send(
+                &http,
+                creds,
+                "GET",
+                &format!("/v2/{}/manifests/{tag}", r.name),
+                &[("Accept".into(), oci::INDEX_JSON_TYPE.to_string())],
+                None,
+            )?;
+            match f.status {
+                200 => f.body,
+                404 => return Ok(Vec::new()),
+                _ => return Err(status_error("the referrers fallback tag", &f)),
+            }
+        }
+        _ => return Err(status_error("referrers", &resp)),
+    };
+    let doc = json::parse(&body).map_err(|e| Error::Oci(e.to_string()))?;
+    let mut out = Vec::new();
+    for m in doc
+        .get("manifests")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&[])
+    {
+        let Some(digest) = m.get("digest").and_then(|d| d.as_str()) else {
+            continue;
+        };
+        out.push(Referrer {
+            digest: digest.to_string(),
+            size: m.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+            artifact_type: m
+                .get("artifactType")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
     Ok(out)
 }
 
@@ -345,22 +747,27 @@ pub fn push(layout: &Layout, r: &Reference) -> Res<Push> {
 /// A `Location` may be absolute or relative and may already carry a query, and
 /// getting either wrong produces a 400 that says nothing useful.
 fn upload_path(location: &str, digest: &str) -> Res<String> {
-    let path = if let Some(rest) = location.strip_prefix("http://") {
-        match rest.find('/') {
+    let path = plain_path(location)?;
+    let sep = if path.contains('?') { '&' } else { '?' };
+    Ok(format!("{path}{sep}digest={digest}"))
+}
+
+/// The path part of a `Location`, absolute or relative.
+fn plain_path(location: &str) -> Res<String> {
+    if let Some(rest) = location.strip_prefix("http://") {
+        return Ok(match rest.find('/') {
             Some(i) => rest[i..].to_string(),
             None => "/".to_string(),
-        }
-    } else if location.starts_with("https://") {
+        });
+    }
+    if location.starts_with("https://") {
         return Err(Error::Transport(
             "the registry redirected the upload to https, which needs a TLS stack \
              this crate does not have"
                 .into(),
         ));
-    } else {
-        location.to_string()
-    };
-    let sep = if path.contains('?') { '&' } else { '?' };
-    Ok(format!("{path}{sep}digest={digest}"))
+    }
+    Ok(location.to_string())
 }
 
 /// Pulls an artifact from a registry and reassembles the container.
@@ -371,22 +778,27 @@ fn upload_path(location: &str, digest: &str) -> Res<String> {
 /// registry that returns the wrong bytes fails here rather than becoming a
 /// model.
 pub fn pull(r: &Reference) -> Res<Pull> {
+    pull_with(r, &Credentials::None)
+}
+
+/// [`pull`], with a credential.
+pub fn pull_with(r: &Reference, creds: &Credentials) -> Res<Pull> {
     let http = client(r)?;
     let accept = (
         "Accept".to_string(),
         format!("{MANIFEST_TYPE}, {}", oci::INDEX_JSON_TYPE),
     );
-    let m = http
-        .send(
-            "GET",
-            &format!("/v2/{}/manifests/{}", r.name, r.reference),
-            std::slice::from_ref(&accept),
-            None,
-        )
-        .map_err(|e| Error::Transport(e.to_string()))?;
+    let m = send(
+        &http,
+        creds,
+        "GET",
+        &format!("/v2/{}/manifests/{}", r.name, r.reference),
+        std::slice::from_ref(&accept),
+        None,
+    )?;
     match m.status {
         200 => {}
-        401 => return Err(challenge(&m, "manifest GET")),
+        401 => return Err(challenge(&m, "manifest GET", creds)),
         404 => {
             return Err(Error::Registry(format!(
                 "no `{}` in `{}` on {}",
@@ -442,9 +854,14 @@ pub fn pull(r: &Reference) -> Res<Pull> {
         let hex = d.strip_prefix("sha256:").ok_or_else(|| {
             Error::Oci(format!("`{d}` is not a sha256 digest; §13.5 uses sha256"))
         })?;
-        let b = http
-            .send("GET", &format!("/v2/{}/blobs/{d}", r.name), &[], None)
-            .map_err(|e| Error::Transport(e.to_string()))?;
+        let b = send(
+            &http,
+            creds,
+            "GET",
+            &format!("/v2/{}/blobs/{d}", r.name),
+            &[],
+            None,
+        )?;
         if b.status != 200 {
             return Err(status_error(&format!("fetching {d}"), &b));
         }
@@ -514,17 +931,127 @@ fn index_json(digest: &str, size: u64, reference: &str) -> json::Value {
 
 /// Pushes a container: the mapping and the transfer in one call.
 pub fn push_container(c: &Container, r: &Reference, opts: &oci::ExportOpts) -> Res<Push> {
+    push_container_with(c, r, opts, &PushOpts::default())
+}
+
+/// [`push_container`], with credentials, chunking and a referrers `subject`.
+pub fn push_container_with(
+    c: &Container,
+    r: &Reference,
+    opts: &oci::ExportOpts,
+    push_opts: &PushOpts,
+) -> Res<Push> {
     let mut opts = opts.clone();
     if opts.reference.is_none() && !r.reference.starts_with("sha256:") {
         opts.reference = Some(r.reference.clone());
     }
     let layout = oci::export_layout(c, &opts).map_err(|e| Error::Oci(e.to_string()))?;
-    push(&layout, r)
+    push_with(&layout, r, push_opts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basic_credentials_are_the_header_http_defines() {
+        // RFC 7617's example, so the encoder is checked against something
+        // outside this crate rather than against itself.
+        let c = Credentials::basic("Aladdin:open sesame").unwrap();
+        let (k, v) = c.header().unwrap();
+        assert_eq!(k, "Authorization");
+        assert_eq!(v, "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        // Every padding case, since that is where a hand-written base64 goes
+        // wrong.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+
+        assert_eq!(
+            Credentials::Bearer("t0k".into()).header().unwrap().1,
+            "Bearer t0k"
+        );
+        assert!(Credentials::None.header().is_none());
+        // A credential with no colon is a usage error rather than a username
+        // with an empty password.
+        assert!(Credentials::basic("nocolon").is_err());
+        // A password may contain colons; only the first one separates.
+        let c = Credentials::basic("u:a:b").unwrap();
+        assert!(matches!(c, Credentials::Basic { ref password, .. } if password == "a:b"));
+    }
+
+    #[test]
+    fn the_referrers_fallback_tag_is_the_one_the_specification_names() {
+        // A tag cannot contain a colon, so the digest's separator becomes a
+        // dash. Getting this wrong means writing a link no other client finds.
+        assert_eq!(fallback_tag("sha256:abc123").unwrap(), "sha256-abc123");
+        assert!(fallback_tag("abc123").is_err());
+    }
+
+    #[test]
+    fn an_upload_location_is_followed_wherever_it_points() {
+        // Relative, absolute, and one that already carries a query — all three
+        // are what registries actually send, and getting any of them wrong
+        // produces a 400 that says nothing useful.
+        assert_eq!(
+            upload_path("/v2/m/blobs/uploads/abc", "sha256:d").unwrap(),
+            "/v2/m/blobs/uploads/abc?digest=sha256:d"
+        );
+        assert_eq!(
+            upload_path("http://reg:5000/v2/m/blobs/uploads/abc", "sha256:d").unwrap(),
+            "/v2/m/blobs/uploads/abc?digest=sha256:d"
+        );
+        assert_eq!(
+            upload_path("/v2/m/blobs/uploads/abc?_state=xyz", "sha256:d").unwrap(),
+            "/v2/m/blobs/uploads/abc?_state=xyz&digest=sha256:d"
+        );
+        assert_eq!(plain_path("/a/b?c=d").unwrap(), "/a/b?c=d");
+        // https is refused rather than downgraded, here as everywhere.
+        assert!(upload_path("https://reg/v2/m/blobs/uploads/abc", "sha256:d").is_err());
+    }
+
+    #[test]
+    fn a_401_says_which_credential_is_missing_and_whether_one_was_offered() {
+        let resp = |c: &str| crate::transport::Response {
+            status: 401,
+            headers: vec![("www-authenticate".into(), c.into())],
+            body: Vec::new(),
+        };
+        let basic = resp(r#"Basic realm="https://auth.example/token",service="reg""#);
+        let e = challenge(&basic, "/v2/", &Credentials::None).to_string();
+        assert!(e.contains("username and password"), "{e}");
+        assert!(e.contains("https://auth.example/token"), "{e}");
+        assert!(e.contains("no credential was sent"), "{e}");
+
+        let e = challenge(
+            &basic,
+            "/v2/",
+            &Credentials::Basic {
+                user: "a".into(),
+                password: "b".into(),
+            },
+        )
+        .to_string();
+        assert!(e.contains("were refused"), "{e}");
+
+        let bearer = resp(r#"Bearer realm="https://auth.example/token",scope="repo:m:pull""#);
+        let e = challenge(&bearer, "manifest GET", &Credentials::None).to_string();
+        assert!(e.contains("bearer token"), "{e}");
+        assert!(e.contains("https://auth.example/token"), "{e}");
+
+        // A 401 with no challenge at all is still an answer, and a different one.
+        let bare = crate::transport::Response {
+            status: 401,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let e = challenge(&bare, "/v2/", &Credentials::None).to_string();
+        assert!(e.contains("stated no challenge"), "{e}");
+    }
 
     #[test]
     fn references_parse_the_way_they_are_written() {

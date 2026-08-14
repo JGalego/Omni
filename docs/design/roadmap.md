@@ -327,7 +327,8 @@ Deliverables:
 - HTTP and object-store stores with range coalescing and resumption.
 - OCI push/pull with `by-novelty` pack partitioning; referrers for adapters and
   signatures. ◐ (the mapping, the layout and the client exist and CI pushes to a
-  real registry; the referrers API and `by-novelty` partitioning do not)
+  real registry, with credentials, chunked uploads and the referrers API;
+  `by-novelty` partitioning does not)
 - Verified streaming (Bao) end to end; progressive load.
 - `omni mount` (FUSE) with synthesized safetensors and tokenizer views.
 - `omni serve`: an object server. ✅
@@ -402,7 +403,7 @@ real model, over a real link.
 
 What the gate actually asks for is still untouched: there is no mirror of 10 000
 models, and no dedup, delta-size, load-time or TTFT figures over real ones. There
-is no `mount`, no referrers API and no `by-novelty` partitioning. The signature stack of §12.5 is implemented (Ed25519,
+is no `mount` and no `by-novelty` partitioning. The signature stack of §12.5 is implemented (Ed25519,
 COSE_Sign1, trust policies) and has had no third-party review. The distribution
 *mechanisms* are now demonstrated rather than claimed; the distribution
 *measurements* are what remains, and they need a corpus rather than more code.

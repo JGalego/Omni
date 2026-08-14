@@ -290,6 +290,8 @@ VERBS:
                               that `oras`/`skopeo` can push; layers are cut at
                               object boundaries
     oci     push <file.omni> <host[:port]/name[:tag]> [--pack 1Gi]
+                              [--chunk N] [--user U:P | --token T]
+                              [--subject <sha256:…>] [--artifact-type T]
                               Push over the OCI distribution API. Every blob is
                               HEADed first, so what is uploaded is what the
                               registry does not already have — which is §13.5's
@@ -297,8 +299,17 @@ VERBS:
                               https needs a TLS stack this build has no
                               dependency for, so what works is a plaintext
                               registry: a local one, a mirror, or anything behind
-                              a terminator
-    oci     pull <host[:port]/name[:tag]> -o <file.omni>
+                              a terminator. --chunk uploads in PATCH pieces so a
+                              bad link resumes at a boundary; --subject links
+                              this artifact to a manifest (§13.5's referrers), and
+                              a subject the registry does not have is refused
+                              rather than left dangling
+    oci     referrers <host[:port]/name@sha256:…> [--user U:P | --token T]
+                              What points at a model — an adapter, a signature, an
+                              evaluation — without pulling any of it. The
+                              referrers endpoint, and the tag scheme the
+                              specification defines for a registry without one
+    oci     pull <host[:port]/name[:tag]> -o <file.omni> [--user U:P | --token T]
                               Pull it back. Every blob is checked against the
                               digest that named it before it becomes a file, and
                               the layers are reassembled and parsed as a
@@ -6155,6 +6166,21 @@ fn cmd_serve(args: &[String]) -> R {
 /// Not a push: that needs a registry client with the token dance and chunked
 /// blob uploads, which is a client rather than a format concern. What this
 /// writes is what `oras cp --from-oci-layout` pushes today.
+/// `--user user:pass` or `--token T`, for a registry that wants one.
+///
+/// Sent on every request rather than only after a challenge: a client that waits
+/// to be asked spends a round trip per blob, and some registries answer 404 for
+/// unauthorized, which turns a permissions problem into "your model is missing".
+fn registry_credentials(args: &[String]) -> Result<omni_core::registry::Credentials, String> {
+    if let Some(spec) = flag(args, "--user") {
+        return omni_core::registry::Credentials::basic(spec).map_err(|e| e.to_string());
+    }
+    if let Some(t) = flag(args, "--token") {
+        return Ok(omni_core::registry::Credentials::Bearer(t.to_string()));
+    }
+    Ok(omni_core::registry::Credentials::None)
+}
+
 fn cmd_oci(args: &[String]) -> R {
     use omni_core::oci::{dir_reader, export_layout, import_layout, ExportOpts};
     let Some(verb) = args.get(1) else {
@@ -6259,7 +6285,16 @@ fn cmd_oci(args: &[String]) -> R {
                 },
                 reference: None,
             };
-            let p = match omni_core::registry::push_container(&c, &r, &opts) {
+            let push_opts = omni_core::registry::PushOpts {
+                creds: registry_credentials(args)?,
+                chunk_size: match flag(args, "--chunk") {
+                    Some(s) => Some(parse_size(s)? as usize),
+                    None => None,
+                },
+                subject: flag(args, "--subject").map(str::to_string),
+                artifact_type: flag(args, "--artifact-type").map(str::to_string),
+            };
+            let p = match omni_core::registry::push_container_with(&c, &r, &opts, &push_opts) {
                 Ok(p) => p,
                 Err(e) => {
                     prr!("omni: {e}\n");
@@ -6296,7 +6331,78 @@ fn cmd_oci(args: &[String]) -> R {
                     100.0 * p.skipped_bytes as f64 / p.total_bytes().max(1) as f64
                 );
             }
+            if p.chunks > 0 {
+                pr!(
+                    "  chunks       {} PATCH request(s); a broken link resumes at a \
+                     chunk boundary rather than at zero",
+                    commas(p.chunks)
+                );
+            }
+            if let Some(subject) = &p.subject {
+                pr!(
+                    "  subject      {subject} ({})",
+                    if p.subject_accepted {
+                        "the registry recorded the link"
+                    } else {
+                        "the registry does not implement referrers; the fallback \
+                         tag was written instead"
+                    }
+                );
+            }
             pr!("  requests     {}", commas(p.requests));
+            Ok(0)
+        }
+        // §13.5's referrers: what points at a model, without pulling any of it.
+        "referrers" => {
+            let Some(reference) = args.get(2) else {
+                prr!("omni: oci referrers needs <host[:port]/name@sha256:…>\n");
+                return Ok(2);
+            };
+            let r = match omni_core::registry::Reference::parse(reference) {
+                Ok(r) => r,
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    return Ok(2);
+                }
+            };
+            let subject = match flag(args, "--subject") {
+                Some(d) => d.to_string(),
+                None if r.reference.starts_with("sha256:") => r.reference.clone(),
+                None => {
+                    prr!(
+                        "omni: referrers are listed for a digest; give one as \
+                         `name@sha256:…` or with --subject\n"
+                    );
+                    return Ok(2);
+                }
+            };
+            let creds = registry_credentials(args)?;
+            let list = match omni_core::registry::referrers(&r, &subject, &creds) {
+                Ok(l) => l,
+                Err(e) => {
+                    prr!("omni: {e}\n");
+                    return Ok(match e {
+                        omni_core::registry::Error::Auth(_) => 4,
+                        _ => 1,
+                    });
+                }
+            };
+            pr!("referrers of {subject} in {}/{}", r.host, r.name);
+            if list.is_empty() {
+                pr!("  none");
+            }
+            for e in &list {
+                pr!(
+                    "  {:<12} {}  {}",
+                    if e.artifact_type.is_empty() {
+                        "(untyped)"
+                    } else {
+                        &e.artifact_type
+                    },
+                    e.digest,
+                    human(e.size)
+                );
+            }
             Ok(0)
         }
         "pull" => {
@@ -6313,7 +6419,8 @@ fn cmd_oci(args: &[String]) -> R {
                     return Ok(2);
                 }
             };
-            let got = match omni_core::registry::pull(&r) {
+            let creds = registry_credentials(args)?;
+            let got = match omni_core::registry::pull_with(&r, &creds) {
                 Ok(p) => p,
                 Err(e) => {
                     prr!("omni: {e}\n");

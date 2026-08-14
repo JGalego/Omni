@@ -1374,7 +1374,44 @@ jobs:
           test ! -f /tmp/never.omni
           expect 2 "$OMNI" oci push /tmp/reg-base.omni "https://$REG/models/base:v1"
           "$OMNI" oci push /tmp/reg-base.omni "https://$REG/m:1" 2>&1 | grep -q 'TLS'
-          echo "a model pushes, pulls, deduplicates and keeps its signature"
+
+          # Chunked upload: the same blobs, in pieces, so a 5 GB layer over a bad
+          # link resumes at a chunk boundary rather than at zero — and a
+          # registry with a request-size limit can be pushed to at all.
+          # A repository of its own: blobs are namespaced per repository, so
+          # pushing into one that has them already would measure the dedup path
+          # instead of the chunking one.
+          "$OMNI" oci push /tmp/reg-base.omni "$REG/models/chunked:v1" --chunk 16k \
+            | tee /tmp/regchunk.txt
+          grep -qE 'chunks       [0-9]+ PATCH request' /tmp/regchunk.txt
+          "$OMNI" oci pull "$REG/models/chunked:v1" -o /tmp/reg-chunked.omni >/dev/null
+          cmp /tmp/reg-base.omni /tmp/reg-chunked.omni
+
+          # §13.5's referrers: an adapter linked to the model it adapts, found
+          # from the model without pulling either. Whether the registry
+          # implements the endpoint or the client falls back to the tag scheme
+          # the specification defines, the answer has to be the same — so this
+          # asserts the link is findable rather than which path found it.
+          SUBJECT=$("$OMNI" oci push /tmp/reg-base.omni "$REG/models/base:subject" \
+            | grep '^  manifest ' | awk '{print $2}')
+          "$OMNI" oci push /tmp/reg-tuned.omni "$REG/models/base:adapter" \
+            --subject "$SUBJECT" \
+            --artifact-type application/vnd.omni.adapter.v1 | tee /tmp/regref.txt
+          grep -q "subject      $SUBJECT" /tmp/regref.txt
+          "$OMNI" oci referrers "$REG/models/base@$SUBJECT" | tee /tmp/regrefs.txt
+          grep -q 'application/vnd.omni.adapter.v1' /tmp/regrefs.txt
+          # And a subject that is not there is refused before anything is
+          # written, because a referrer nobody can follow is worse than none.
+          MISSING=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          set +e
+          "$OMNI" oci push /tmp/reg-tuned.omni "$REG/models/base:dangling" \
+            --subject "$MISSING" > /tmp/regdangle.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          grep -q 'nobody can follow' /tmp/regdangle.txt
+
+          echo "a model pushes, pulls, deduplicates, keeps its signature and links its adapter"
 
       # Gate 3's second ask, in the only honest form this repository can put it:
       # the compute half of time-to-first-token is the same whatever the file
