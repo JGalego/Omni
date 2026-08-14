@@ -22,7 +22,9 @@
 //!   the evidence.
 //! * **Both mandatory hashes, from scratch.** §03.5.1 requires BLAKE3-256 and
 //!   SHA-256; both are implemented here, the former including the tree
-//!   internals that Bao verified streaming (§13.3) is built on.
+//!   internals that Bao verified streaming (§13.3) is built on. §12.5's two
+//!   implemented signature algorithms are here from scratch too: Ed25519 in
+//!   [`ed25519`] and ES256 in [`p256`].
 //!
 //! ## Not implemented here
 //!
@@ -79,6 +81,7 @@ pub mod model;
 pub mod npy;
 pub mod oci;
 pub mod onnx;
+pub mod p256;
 pub mod pattern;
 pub mod peft;
 pub mod plan;

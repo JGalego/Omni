@@ -3425,6 +3425,121 @@ jobs:
           "
           echo "numpy arrays import, export and round-trip through OMNI"
 
+      # §12.5's ES256 is somebody else's specification, exactly like §03.7's
+      # codecs, so the check that means something exchanges signatures with an
+      # independent implementation — here `cryptography`, which is OpenSSL
+      # underneath.
+      - name: ES256 agrees with a real ECDSA implementation, both ways
+        run: |
+          # Already present on some images; installing over a distro package
+          # fails, so only install when the import does not work.
+          python3 -c 'import cryptography.hazmat.primitives.asymmetric.ec' 2>/dev/null \
+            || pip install --quiet cryptography
+          CONF=reference/target/release/omni-conformance
+          python3 - "$CONF" <<'PY'
+          import hashlib, subprocess, sys
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import ec, utils as asym
+
+          CONF = sys.argv[1]
+          N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+          bad = 0
+          cases = [b"", b"a", b"a model exists once. everything else is derived.",
+                   bytes(range(256)) * 4]
+          for i, msg in enumerate(cases):
+              seed = bytes([(i * 37 + 3) % 256]) * 32
+              open('/tmp/sig-msg.bin', 'wb').write(msg)
+              pub_hex = subprocess.run([CONF, 'sig', 'es256', 'public', seed.hex()],
+                                       capture_output=True, text=True).stdout.strip()
+              r = subprocess.run([CONF, 'sig', 'es256', 'sign', seed.hex(),
+                                  '/tmp/sig-msg.bin', '/tmp/sig-ours.raw'],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"::error::signing failed for case {i}: {r.stderr}")
+                  bad += 1
+                  continue
+              raw = open('/tmp/sig-ours.raw', 'rb').read()
+
+              # 1. A real ECDSA verifier must accept what we wrote. COSE carries
+              #    R‖S and X.509 tooling wants DER, so the test converts.
+              pub = ec.EllipticCurvePublicKey.from_encoded_point(
+                  ec.SECP256R1(), bytes.fromhex(pub_hex))
+              der = asym.encode_dss_signature(int.from_bytes(raw[:32], 'big'),
+                                              int.from_bytes(raw[32:], 'big'))
+              try:
+                  pub.verify(der, msg, ec.ECDSA(hashes.SHA256()))
+              except Exception as e:
+                  print(f"::error::cryptography rejected our signature for case {i}: {e}")
+                  bad += 1
+
+              # 2. And we must accept what it writes — including the high-S form
+              #    it may produce, since only the signer normalizes.
+              cand = seed
+              while not 0 < int.from_bytes(cand, 'big') < N:
+                  cand = hashlib.sha256(cand).digest()
+              priv = ec.derive_private_key(int.from_bytes(cand, 'big'), ec.SECP256R1())
+              theirs_pub = priv.public_key().public_bytes(
+                  serialization.Encoding.X962,
+                  serialization.PublicFormat.UncompressedPoint).hex()
+              if theirs_pub != pub_hex:
+                  print(f"::error::the two implementations derive different public keys "
+                        f"for case {i}")
+                  bad += 1
+              rr, ss = asym.decode_dss_signature(
+                  priv.sign(msg, ec.ECDSA(hashes.SHA256())))
+              open('/tmp/sig-theirs.raw', 'wb').write(
+                  rr.to_bytes(32, 'big') + ss.to_bytes(32, 'big'))
+              v = subprocess.run([CONF, 'sig', 'es256', 'verify', pub_hex,
+                                  '/tmp/sig-msg.bin', '/tmp/sig-theirs.raw'],
+                                 capture_output=True, text=True)
+              if v.returncode != 0:
+                  print(f"::error::we rejected cryptography's signature for case {i}: "
+                        f"{v.stderr}")
+                  bad += 1
+              print(f"case {i}: {len(msg)} B, both directions agree")
+
+          # A tampered signature must fail on our side too, or "verified" means
+          # nothing.
+          bad_sig = bytearray(open('/tmp/sig-ours.raw', 'rb').read())
+          bad_sig[0] ^= 1
+          open('/tmp/sig-bad.raw', 'wb').write(bytes(bad_sig))
+          v = subprocess.run([CONF, 'sig', 'es256', 'verify', pub_hex,
+                              '/tmp/sig-msg.bin', '/tmp/sig-bad.raw'],
+                             capture_output=True, text=True)
+          if v.returncode == 0:
+              print("::error::a tampered signature verified")
+              bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+
+          # And the whole path through the CLI: an ES256 key signs a container
+          # and V7 accepts it.
+          OMNI=reference/target/release/omni
+          SEED=$(python3 -c "print('11' * 32)")
+          "$OMNI" example /tmp/es-src.omni >/dev/null
+          "$OMNI" keygen --seed $SEED --alg es256 --out /tmp/es.key | tee /tmp/eskey.txt
+          grep -q 'alg     ES256' /tmp/eskey.txt
+          PUB=$(grep '^public' /tmp/es.key | awk '{print $2}')
+          test ${#PUB} = 130          # 65 bytes: the uncompressed point
+          "$OMNI" sign /tmp/es-src.omni --key $SEED --alg es256 -o /tmp/es-signed.omni >/dev/null
+          "$OMNI" sign --verify /tmp/es-signed.omni --key $PUB | tee /tmp/esver.txt
+          grep -q 'policy satisfied' /tmp/esver.txt
+          "$OMNI" verify /tmp/es-signed.omni --level 6 | grep -q '^valid'
+          # Signing is deterministic (RFC 6979), so the same key and container
+          # give the same bytes — which is what makes a signed container
+          # reproducible (§01.10).
+          "$OMNI" sign /tmp/es-src.omni --key $SEED --alg es256 -o /tmp/es-again.omni >/dev/null
+          cmp /tmp/es-signed.omni /tmp/es-again.omni
+          # An Ed25519 key must not verify an ES256 signature, and the length is
+          # what tells them apart.
+          set +e
+          "$OMNI" sign --verify /tmp/es-signed.omni --key $(python3 -c "print('22' * 32)") \
+            > /tmp/eswrong.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          echo "ES256 interoperates with a real ECDSA implementation in both directions"
+
       # §03.7: compression is a property of a stored copy, so changing it must
       # change no identity at all.
       - name: Compressed containers keep every digest

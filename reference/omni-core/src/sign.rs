@@ -26,6 +26,17 @@ use crate::cbor::{self, Value};
 use crate::container::{otype, Digest, HashAlgo};
 use crate::ed25519;
 
+/// COSE algorithm identifier for ECDSA with SHA-256 (RFC 9053 §2.1).
+pub const COSE_ALG_ES256: i64 = -7;
+
+/// ML-DSA-44's COSE identifier, the third algorithm §12.5.1 names.
+///
+/// Not implemented: a lattice signature is a different amount of code from an
+/// elliptic-curve one and its COSE registration is still moving, so a container
+/// signed with one is *indeterminate* here — the file is fine and this reader
+/// cannot check it, which is §15.1's third answer and the one that matters.
+pub const COSE_ALG_ML_DSA_44: i64 = -48;
+
 /// COSE algorithm identifier for EdDSA (RFC 9053 §2.2).
 pub const COSE_ALG_EDDSA: i64 = -8;
 
@@ -307,38 +318,127 @@ impl CoseSign1 {
     }
 }
 
-/// Signs a TBS payload with Ed25519, producing a COSE_Sign1.
-pub fn sign_cose(key: &ed25519::SecretKey, tbs: &Tbs) -> CoseSign1 {
-    let protected = Value::Map(vec![(Value::U(1), Value::I(COSE_ALG_EDDSA))]).encode();
-    let payload = tbs.encode();
-    let to_sign = CoseSign1::sig_structure(&protected, &[], &payload);
-    let sig = key.sign(&to_sign);
-    CoseSign1 {
-        protected,
-        unprotected: vec![(Value::U(4), Value::Bytes(key.public_key().to_vec()))],
-        payload,
-        signature: sig.to_vec(),
+/// A key that can sign — §12.5's two implemented algorithms.
+///
+/// The third the section names, ML-DSA, is not here: a lattice signature is a
+/// different amount of code from an elliptic curve one and it has no
+/// interoperability story yet, so it stays named rather than half-written.
+pub enum SigningKey {
+    Ed25519(ed25519::SecretKey),
+    /// ECDSA on P-256 with SHA-256 — what an HSM, a KMS and a WebPKI
+    /// certificate all already speak.
+    Es256(crate::p256::SecretKey),
+}
+
+impl SigningKey {
+    pub fn alg(&self) -> i64 {
+        match self {
+            SigningKey::Ed25519(_) => COSE_ALG_EDDSA,
+            SigningKey::Es256(_) => COSE_ALG_ES256,
+        }
+    }
+
+    pub fn alg_name(&self) -> &'static str {
+        match self {
+            SigningKey::Ed25519(_) => "EdDSA",
+            SigningKey::Es256(_) => "ES256",
+        }
+    }
+
+    /// The public key, in the encoding that algorithm's `kid` uses here: the
+    /// 32-byte Ed25519 point, or the 65-byte uncompressed P-256 point.
+    pub fn public_key(&self) -> Vec<u8> {
+        match self {
+            SigningKey::Ed25519(k) => k.public_key().to_vec(),
+            SigningKey::Es256(k) => k.public_key().to_vec(),
+        }
+    }
+
+    fn sign_bytes(&self, message: &[u8]) -> Vec<u8> {
+        match self {
+            SigningKey::Ed25519(k) => k.sign(message).to_vec(),
+            SigningKey::Es256(k) => k.sign(message).to_vec(),
+        }
     }
 }
 
-/// Verifies a COSE_Sign1 against a public key, returning the decoded TBS.
+/// Verifies `signature` over `message` under whichever algorithm the key's
+/// length names.
+///
+/// The length *is* the discriminator, and that is not a shortcut: 32 bytes is an
+/// Ed25519 point and 65 is an uncompressed P-256 one, and no value is both.
+fn verify_with_key(public: &[u8], alg: i64, message: &[u8], signature: &[u8]) -> Res<()> {
+    match alg {
+        COSE_ALG_EDDSA => {
+            let key: [u8; ed25519::KEY_LEN] = public
+                .try_into()
+                .map_err(|_| Error::Malformed("EdDSA keys are 32 bytes".into()))?;
+            let sig: [u8; ed25519::SIG_LEN] = signature
+                .try_into()
+                .map_err(|_| Error::Malformed("EdDSA signatures are 64 bytes".into()))?;
+            if !ed25519::verify(&key, message, &sig) {
+                return Err(Error::Malformed("signature does not verify".into()));
+            }
+            Ok(())
+        }
+        COSE_ALG_ES256 => {
+            if public.len() != crate::p256::PUBLIC_LEN {
+                return Err(Error::Malformed(format!(
+                    "ES256 keys are {} bytes in the uncompressed form",
+                    crate::p256::PUBLIC_LEN
+                )));
+            }
+            if signature.len() != crate::p256::SIG_LEN {
+                return Err(Error::Malformed("ES256 signatures are 64 bytes".into()));
+            }
+            if !crate::p256::verify(public, message, signature) {
+                return Err(Error::Malformed("signature does not verify".into()));
+            }
+            Ok(())
+        }
+        COSE_ALG_ML_DSA_44 => Err(Error::Unsupported(format!(
+            "COSE algorithm {COSE_ALG_ML_DSA_44} is ML-DSA-44, which §12.5.1 names and \
+             this build does not implement — so this signature is indeterminate rather \
+             than invalid (§15.1): the file is fine and this reader cannot check it"
+        ))),
+        other => Err(Error::Unsupported(format!(
+            "COSE algorithm {other}; this build implements EdDSA ({COSE_ALG_EDDSA}) and \
+             ES256 ({COSE_ALG_ES256}), and an unsupported algorithm is indeterminate \
+             rather than invalid (§15.1)"
+        ))),
+    }
+}
+
+/// Signs a TBS payload with Ed25519, producing a COSE_Sign1.
+pub fn sign_cose(key: &ed25519::SecretKey, tbs: &Tbs) -> CoseSign1 {
+    sign_cose_with(&SigningKey::Ed25519(key.clone()), tbs)
+}
+
+/// Signs a TBS payload with whichever algorithm the key is.
+pub fn sign_cose_with(key: &SigningKey, tbs: &Tbs) -> CoseSign1 {
+    let protected = Value::Map(vec![(Value::U(1), Value::I(key.alg()))]).encode();
+    let payload = tbs.encode();
+    let to_sign = CoseSign1::sig_structure(&protected, &[], &payload);
+    let sig = key.sign_bytes(&to_sign);
+    CoseSign1 {
+        protected,
+        unprotected: vec![(Value::U(4), Value::Bytes(key.public_key()))],
+        payload,
+        signature: sig,
+    }
+}
+
+/// Verifies a COSE_Sign1 against an Ed25519 public key, returning the TBS.
 pub fn verify_cose(cose: &CoseSign1, public: &[u8; ed25519::KEY_LEN]) -> Res<Tbs> {
+    verify_cose_with(cose, public)
+}
+
+/// Verifies a COSE_Sign1 against a public key of whichever algorithm the
+/// protected header names.
+pub fn verify_cose_with(cose: &CoseSign1, public: &[u8]) -> Res<Tbs> {
     let alg = cose.alg()?;
-    if alg != COSE_ALG_EDDSA {
-        return Err(Error::Unsupported(format!(
-            "COSE algorithm {alg}; only EdDSA ({COSE_ALG_EDDSA}) is implemented, and an \
-             unsupported algorithm is indeterminate rather than invalid (§15.1)"
-        )));
-    }
-    let sig: [u8; ed25519::SIG_LEN] = cose
-        .signature
-        .clone()
-        .try_into()
-        .map_err(|_| Error::Malformed("EdDSA signatures are 64 bytes".into()))?;
     let to_sign = CoseSign1::sig_structure(&cose.protected, &[], &cose.payload);
-    if !ed25519::verify(public, &to_sign, &sig) {
-        return Err(Error::Malformed("signature does not verify".into()));
-    }
+    verify_with_key(public, alg, &to_sign, &cose.signature)?;
     let payload = cbor::decode(&cose.payload).map_err(|e| Error::Malformed(e.to_string()))?;
     Tbs::from_value(&payload)
 }
@@ -363,9 +463,17 @@ pub struct Signature {
 
 impl Signature {
     pub fn new(cose: &CoseSign1) -> Signature {
+        // The convenience field is read from the COSE message rather than passed
+        // in, because two places stating the algorithm is one place too many:
+        // the protected header is what the signature actually covers.
+        let alg = match cose.alg() {
+            Ok(COSE_ALG_ES256) => "ES256",
+            Ok(COSE_ALG_ML_DSA_44) => "ML-DSA-44",
+            _ => "EdDSA",
+        };
         Signature {
             cose: cose.encode(),
-            alg: "EdDSA".into(),
+            alg: alg.into(),
             kid: cose.kid(),
             identity: None,
         }
@@ -497,14 +605,21 @@ fn ref_digest(v: &Value) -> Option<Digest> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrustedKey {
     pub kid: Vec<u8>,
-    pub public: [u8; ed25519::KEY_LEN],
+    /// The public key, whose *length* names the algorithm: 32 bytes is an
+    /// Ed25519 point, 65 an uncompressed P-256 one, and no value is both.
+    pub public: Vec<u8>,
     pub roles: Vec<String>,
 }
 
 impl TrustedKey {
     pub fn new(public: [u8; ed25519::KEY_LEN]) -> TrustedKey {
+        TrustedKey::from_bytes(public.to_vec())
+    }
+
+    /// A trusted key of either algorithm.
+    pub fn from_bytes(public: Vec<u8>) -> TrustedKey {
         TrustedKey {
-            kid: public.to_vec(),
+            kid: public.clone(),
             public,
             roles: Vec::new(),
         }
@@ -655,7 +770,7 @@ pub fn verify_signatures(
             continue;
         };
         out.roles = key.roles.clone();
-        let tbs = match verify_cose(&cose, &key.public) {
+        let tbs = match verify_cose_with(&cose, &key.public) {
             Ok(t) => t,
             Err(Error::Unsupported(m)) => {
                 out.indeterminate = true;
@@ -1161,8 +1276,10 @@ mod tests {
         let m = manifest();
         let sk = key(7);
         let mut cose = sign_cose(&sk, &tbs_for(&m, algo, 1));
-        // ES256: legal per §12.5.1, not implemented here.
-        cose.protected = Value::Map(vec![(Value::U(1), Value::I(-7))]).encode();
+        // ML-DSA-44: legal per §12.5.1, not implemented here. (ES256 was the
+        // example until ES256 was implemented, which is the good reason for a
+        // test to need rewriting.)
+        cose.protected = Value::Map(vec![(Value::U(1), Value::I(COSE_ALG_ML_DSA_44))]).encode();
         let sig = Signature::new(&cose);
         let v = verify_signatures(
             &[sig],
@@ -1173,7 +1290,42 @@ mod tests {
         assert!(!v.satisfied);
         assert_eq!(v.invalid_count(), 0);
         assert!(v.outcomes[0].indeterminate);
-        assert!(v.outcomes[0].message.contains("EdDSA"));
+        assert!(v.outcomes[0].message.contains("ML-DSA-44"));
+    }
+
+    #[test]
+    fn an_es256_signature_verifies_through_the_same_path() {
+        // §12.5's second algorithm, end to end through the COSE layer and the
+        // trust policy — the same code path Ed25519 takes, with the key's length
+        // deciding which curve is meant.
+        let algo = HashAlgo::default();
+        let m = manifest();
+        let sk = crate::p256::from_seed(&[0x5a; 32]);
+        let public = sk.public_key().to_vec();
+        let signer = SigningKey::Es256(sk);
+        let cose = sign_cose_with(&signer, &tbs_for(&m, algo, 1));
+        assert_eq!(cose.alg().unwrap(), COSE_ALG_ES256);
+        let sig = Signature::new(&cose);
+        assert_eq!(sig.alg, "ES256");
+        let v = verify_signatures(
+            std::slice::from_ref(&sig),
+            &signing_root(&m, algo),
+            &canonical_digest(&m, algo, &|d| d == &[2u8; 32]),
+            &Policy::keys(vec![TrustedKey::from_bytes(public.clone())]),
+        );
+        assert!(v.satisfied, "{:?}", v.outcomes);
+
+        // And an Ed25519 key of the same nominal trust does not verify it: the
+        // algorithm is in the protected header and the key is 32 bytes, so the
+        // mismatch is caught rather than papered over.
+        let other = key(7).public_key();
+        let v = verify_signatures(
+            &[sig],
+            &signing_root(&m, algo),
+            &canonical_digest(&m, algo, &|d| d == &[2u8; 32]),
+            &Policy::keys(vec![TrustedKey::new(other)]),
+        );
+        assert!(!v.satisfied);
     }
 
     #[test]

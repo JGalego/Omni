@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         Some("list") => list(),
         Some("fuzz") => do_fuzz(&args),
         Some("codec") => do_codec(&args),
+        Some("sig") => do_sig(&args),
         _ => {
             eprintln!(
                 "omni-conformance — OMNI conformance corpus (suite {SUITE_VERSION})\n\
@@ -40,7 +41,8 @@ fn main() -> ExitCode {
                  \x20   omni-conformance list\n\
                  \x20   omni-conformance fuzz <dir> [--iterations N] [--seed S] [--out <dir>]\n\
                  \x20   omni-conformance codec <id> encode|decode <in> <out>\n\
-                 \x20       [--level N] [--elem-size N] [--logical-len N]\n"
+                 \x20       [--level N] [--elem-size N] [--logical-len N] [--high-ratio]\n\
+                 \x20   omni-conformance sig es256 public|sign|verify …\n"
             );
             2
         }
@@ -402,4 +404,97 @@ fn expected_code(e: Expect) -> &'static str {
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == name)?;
     args.get(i + 1).map(|s| s.as_str())
+}
+
+/// `sig <alg> public|sign|verify …` — the differential-testing hook for
+/// signatures.
+///
+/// §12.5's algorithms are somebody else's specification, exactly like §03.7's
+/// codecs, so the only test that means anything is one that exchanges
+/// signatures with an independent implementation. This is that exchange point:
+/// CI signs here and verifies with `cryptography`, then signs with
+/// `cryptography` and verifies here.
+///
+///     sig es256 public <seed-hex>
+///     sig es256 sign   <seed-hex> <message-file> <out-sig>
+///     sig es256 verify <public-hex> <message-file> <sig-file>
+fn do_sig(args: &[String]) -> u8 {
+    let (Some(alg), Some(op)) = (args.get(1), args.get(2)) else {
+        eprintln!("omni-conformance: sig needs <alg> public|sign|verify");
+        return 2;
+    };
+    if alg != "es256" {
+        eprintln!("omni-conformance: only es256 is exchanged here");
+        return 3;
+    }
+    let unhex = |s: &str| -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+            .collect()
+    };
+    match op.as_str() {
+        "public" => {
+            let Some(seed) = args.get(3).and_then(|s| unhex(s)) else {
+                eprintln!("omni-conformance: sig es256 public <seed-hex>");
+                return 2;
+            };
+            let Ok(seed): Result<[u8; 32], _> = seed.try_into() else {
+                eprintln!("omni-conformance: the seed is 32 bytes");
+                return 2;
+            };
+            println!(
+                "{}",
+                omni_core::sha256::hex(&omni_core::p256::from_seed(&seed).public_key())
+            );
+            0
+        }
+        "sign" => {
+            let (Some(seed), Some(msg), Some(out)) =
+                (args.get(3).and_then(|s| unhex(s)), args.get(4), args.get(5))
+            else {
+                eprintln!("omni-conformance: sig es256 sign <seed-hex> <msg> <out>");
+                return 2;
+            };
+            let Ok(seed): Result<[u8; 32], _> = seed.try_into() else {
+                eprintln!("omni-conformance: the seed is 32 bytes");
+                return 2;
+            };
+            let Ok(message) = std::fs::read(msg) else {
+                eprintln!("omni-conformance: cannot read {msg}");
+                return 2;
+            };
+            let sig = omni_core::p256::from_seed(&seed).sign(&message);
+            if std::fs::write(out, sig).is_err() {
+                eprintln!("omni-conformance: cannot write {out}");
+                return 2;
+            }
+            0
+        }
+        "verify" => {
+            let (Some(public), Some(msg), Some(sig)) =
+                (args.get(3).and_then(|s| unhex(s)), args.get(4), args.get(5))
+            else {
+                eprintln!("omni-conformance: sig es256 verify <public-hex> <msg> <sig>");
+                return 2;
+            };
+            let (Ok(message), Ok(signature)) = (std::fs::read(msg), std::fs::read(sig)) else {
+                eprintln!("omni-conformance: cannot read the message or the signature");
+                return 2;
+            };
+            if omni_core::p256::verify(&public, &message, &signature) {
+                println!("verified");
+                0
+            } else {
+                eprintln!("omni-conformance: the signature does not verify");
+                1
+            }
+        }
+        other => {
+            eprintln!("omni-conformance: sig has no `{other}`");
+            2
+        }
+    }
 }

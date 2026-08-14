@@ -190,9 +190,30 @@ implemented:
 - §10 capability negotiation: capability sets with the three-valued support of
   §10.2, candidate enumeration, the deterministic resolver of §10.5 under all
   five objectives, budget retry, and the informative failures of §10.5.2
-- §12.5 signatures: COSE_Sign1 over the §12.5.2 payload, Ed25519, the
-  `canonical_digest` of §12.5.3, trust policies (any-of, all-of, k-of-n,
-  role-based), validity windows, rollback counters and revocation statements
+- §12.5 signatures: COSE_Sign1 over the §12.5.2 payload, Ed25519 **and ES256**,
+  the `canonical_digest` of §12.5.3, trust policies (any-of, all-of, k-of-n,
+  role-based), validity windows, rollback counters and revocation statements.
+  ES256 is the algorithm the rest of the world already has — what a WebPKI
+  certificate signs with, what an HSM and a KMS offer without argument, what
+  Sigstore's Fulcio issues — and a format that can only be signed by keys
+  nobody's compliance process recognises is a format with a queue in front of it.
+  P-256 is implemented here like everything else: the field and group arithmetic,
+  Jacobian point maths, and **RFC 6979's deterministic nonce**, which is not an
+  optimization — ECDSA with a repeated nonce leaks the key outright and with a
+  biased one leaks it over enough signatures, both of which have happened to
+  shipped software, and deriving `k` from the key and the message removes the
+  entropy source from the threat model. It also makes a signed container
+  reproducible in §01.10's sense: the same key and manifest give the same bytes.
+  Signatures are normalized to low-S, because `(r, s)` and `(r, n − s)` both
+  verify and leaving the choice open is a malleability nobody wants in a
+  signature that names a model. A public key off the curve, an `r` or `s` outside
+  `[1, n)`, and the point at infinity are each refused — every one of those has
+  been a real vulnerability in somebody's ECDSA. RFC 6979's own P-256 vector is a
+  unit test, and CI exchanges signatures with `cryptography` in both directions,
+  because §12.5's algorithms are somebody else's specification exactly like
+  §03.7's codecs. ML-DSA, the third §12.5.1 names, is **not** here: a lattice
+  signature is a different amount of code and its COSE registration is still
+  moving, so a container signed with one is reported *indeterminate* by name
 - §06.7 the tokenizer IR: read structurally — the vocabulary as a string tensor,
   the merges as `u32` id pairs — with `encode`/`decode` for the bpe, wordpiece,
   unigram, wordlevel, char and byte kinds, the normalizer, pre-tokenizer and
@@ -677,7 +698,7 @@ expectation.
 
 ## Tests
 
-602 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+613 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -975,7 +996,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 602 passed; 0 failed
+test result: ok. 613 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

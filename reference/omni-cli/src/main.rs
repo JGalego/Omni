@@ -247,12 +247,18 @@ VERBS:
     plan    <file> [--caps caps.cbor] [--objective O] [--memory N]
                               [--optimistic] [--allow-lossy]
                               Resolve a model against a runtime (§10.5)
-    keygen  [--out key.hex] [--seed <hex>]
-                              Make an Ed25519 signing key (§12.5.1)
-    sign    <file> --key <hex> [-o <out.omni>] [--purpose P] [--counter N]
-                              Sign a manifest and embed the attestation
+    keygen  [--out key.hex] [--seed <hex>] [--alg ed25519|es256]
+                              Make a signing key (§12.5.1). ES256 is the one an
+                              HSM, a KMS and a WebPKI certificate already speak
+    sign    <file> --key <hex> [--alg ed25519|es256] [-o <out.omni>]
+                      [--purpose P] [--counter N]
+                              Sign a manifest and embed the attestation. Signing
+                              is deterministic under both algorithms, so the same
+                              key and container give the same bytes
     sign    --verify <file> --key <pubkey-hex>[,<hex>…] [--require any|all|k:N]
-                              V7: authenticity against a trust policy
+                              V7: authenticity against a trust policy. A key's
+                              length names its algorithm — 32 bytes Ed25519,
+                              65 an uncompressed ES256 point
     convert <in.omni> --cast DTYPE | --requantize SPEC
                       [--calib <acts.safetensors>] [--except GLOB,GLOB]
                       [--verify] -o <out.omni>
@@ -5457,7 +5463,6 @@ tensor reconstruction (§12.10)",
     Ok(0)
 }
 
-
 // ------------------------------------------------------------------ sandbox --
 
 /// §12.10 clause 2: run the pickle import in a separate process with caps on
@@ -7933,18 +7938,36 @@ fn cmd_keygen(args: &[String]) -> R {
                 .map_err(|_| "short read from /dev/urandom")?
         }
     };
-    let sk = omni_core::ed25519::SecretKey::from_seed(&seed);
+    // §12.5 names three algorithms and two are implemented. The default stays
+    // Ed25519, because that is what §12.5 makes the default; ES256 is for the
+    // keys an HSM, a KMS or a WebPKI certificate already holds.
+    let (alg, public, seed_hex) = match flag(args, "--alg").unwrap_or("ed25519") {
+        "ed25519" | "eddsa" | "EdDSA" => {
+            let sk = omni_core::ed25519::SecretKey::from_seed(&seed);
+            ("Ed25519", hex(&sk.public_key()), hex(&sk.seed()))
+        }
+        "es256" | "ES256" | "p256" => {
+            let sk = omni_core::p256::from_seed(&seed);
+            ("ES256", hex(&sk.public_key()), hex(&sk.to_bytes()))
+        }
+        other => {
+            prr!(
+                "omni: unknown --alg `{other}`. §12.5 names ed25519, es256 and \
+                 ml-dsa; the first two are implemented\n"
+            );
+            return Ok(2);
+        }
+    };
     let out = flag(args, "--out");
     let line = format!(
-        "# OMNI Ed25519 key. The seed is the private key: treat this file as one.\nseed {}\npublic {}\n",
-        hex(&sk.seed()),
-        hex(&sk.public_key())
+        "# OMNI {alg} key. The seed is the private key: treat this file as one.\nseed {seed_hex}\npublic {public}\n"
     );
     match out {
         Some(path) => {
             std::fs::write(path, &line)?;
             pr!("wrote {path}");
-            pr!("  public  {}", hex(&sk.public_key()));
+            pr!("  alg     {alg}");
+            pr!("  public  {public}");
         }
         None => prr!("{line}"),
     }
@@ -7968,8 +7991,8 @@ fn container_objects(c: &Container) -> Result<Vec<omni_core::Object>, Box<dyn st
 /// `omni sign` — sign a manifest, or verify signatures against a policy.
 fn cmd_sign(args: &[String]) -> R {
     use omni_core::sign::{
-        canonical_digest, sign_cose, signing_root, verify_signatures, Policy, Purpose, Requirement,
-        Signature, Summary, Tbs, TrustedKey,
+        canonical_digest, signing_root, verify_signatures, Policy, Purpose, Requirement, Signature,
+        Summary, Tbs, TrustedKey,
     };
 
     if args.iter().any(|a| a == "--verify") {
@@ -7990,10 +8013,16 @@ fn cmd_sign(args: &[String]) -> R {
             if k.is_empty() {
                 continue;
             }
-            let b: [u8; 32] = unhex(k)?
-                .try_into()
-                .map_err(|_| "--key takes 32 bytes of hex per key")?;
-            keys.push(TrustedKey::new(b));
+            // 32 bytes is an Ed25519 point and 65 an uncompressed P-256 one, so
+            // the length names the algorithm and the caller does not have to.
+            let b = unhex(k)?;
+            if b.len() != 32 && b.len() != omni_core::p256::PUBLIC_LEN {
+                return Err(
+                    "--key takes 32 bytes of hex (Ed25519) or 65 (uncompressed ES256) per key"
+                        .into(),
+                );
+            }
+            keys.push(TrustedKey::from_bytes(b));
         }
         let requirement = match flag(args, "--require") {
             None | Some("any") => Requirement::AnyOf,
@@ -8077,7 +8106,21 @@ fn cmd_sign(args: &[String]) -> R {
     let seed: [u8; 32] = unhex(key_hex)?
         .try_into()
         .map_err(|_| "--key takes 32 bytes of hex (the seed)")?;
-    let sk = omni_core::ed25519::SecretKey::from_seed(&seed);
+    let sk = match flag(args, "--alg").unwrap_or("ed25519") {
+        "ed25519" | "eddsa" | "EdDSA" => {
+            omni_core::sign::SigningKey::Ed25519(omni_core::ed25519::SecretKey::from_seed(&seed))
+        }
+        "es256" | "ES256" | "p256" => {
+            omni_core::sign::SigningKey::Es256(omni_core::p256::from_seed(&seed))
+        }
+        other => {
+            prr!(
+                "omni: unknown --alg `{other}`. §12.5 names ed25519, es256 and \
+                 ml-dsa; the first two are implemented\n"
+            );
+            return Ok(2);
+        }
+    };
     let out = flag(args, "-o")
         .or_else(|| flag(args, "--out"))
         .unwrap_or(path);
@@ -8133,7 +8176,7 @@ fn cmd_sign(args: &[String]) -> R {
 
     let tbs = Tbs {
         root: signing_root(&manifest, algo),
-        alg: "EdDSA".into(),
+        alg: sk.alg_name().into(),
         purpose,
         subject_name: name.clone(),
         subject_version: flag(args, "--version").map(|s| s.to_string()),
@@ -8149,7 +8192,7 @@ fn cmd_sign(args: &[String]) -> R {
         },
         counter,
     };
-    let sig = Signature::new(&sign_cose(&sk, &tbs));
+    let sig = Signature::new(&omni_core::sign::sign_cose_with(&sk, &tbs));
     let sig_obj = omni_core::Object::structure(otype::SIGNATURE, &sig.to_value());
     let sig_digest = sig_obj.digest(algo);
     let signed_manifest = omni_core::sign::attach(&manifest, &sig_digest);
