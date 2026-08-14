@@ -40,10 +40,10 @@
 //! since the registry named it and nothing defined its bitstream. `brotli` and
 //! the two lossy ones are reported as unsupported rather than half-decoded. The WebAssembly
 //! host of §11.6 runs the core instruction set but not SIMD. Of the 25 formats
-//! in `docs/design/import-export.md` §3, eight are implemented —
-//! [`safetensors`], [`pytorch`], [`gguf`], [`onnx`], [`peft`], GPTQ and AWQ in
-//! [`hfquant`], and a whole Hugging Face repo in [`hf`] — and a request to
-//! import another is refused by name. All but PyTorch and the repo importer
+//! in `docs/design/import-export.md` §3, nine are implemented —
+//! [`safetensors`], [`pytorch`], [`gguf`], [`onnx`], [`peft`], [`npy`], GPTQ and
+//! AWQ in [`hfquant`], and a whole Hugging Face repo in [`hf`] — and a request
+//! to import another is refused by name. All but PyTorch and the repo importer
 //! export as well as import; §12.10 clause 4 says never to re-emit pickle, and
 //! this build does not. GGUF's `IQ*` types are refused with their codebooks as
 //! the reason (§05.6 rule 1), and an ONNX op no single OMNI op means is carried
@@ -76,6 +76,7 @@ pub mod json;
 pub mod layout;
 pub mod lz4;
 pub mod model;
+pub mod npy;
 pub mod oci;
 pub mod onnx;
 pub mod pattern;

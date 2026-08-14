@@ -110,7 +110,7 @@ everything": it records what the importer *chose not to invent*.
 | **Hugging Face repo** | ● | ● | ● | ○ | ● | ● | ● | ◐ | ● | ◐ | ● (as a bundle) |
 | **NeMo `.nemo`** | ● | ● | ◐ | ○ | ● | ◐ | ● | ● | ◐ | ○ | ◐ |
 | **Megatron dist ckpt** | ● | ● | ◐ | ○ | ◐ | ○ | ◐ | ● | ○ | ○ | ● |
-| **HDF5 / Zarr / NPZ** | ● | ● | ○ | ○ | — | — | ◐ | ◐ | ○ | ○ | ● |
+| **HDF5 / Zarr / NPZ** | ● | ●¹⁶ | ○ | ○ | — | — | ◐ | ◐ | ○ | ○ | ● lossless (NPZ) |
 
 Notes:
 ¹ only if quantization params are present as tensors + a config;
@@ -129,6 +129,15 @@ Notes:
 ¹⁴ downgraded from ● on evidence, when the importer was written: GGUF carries the vocabulary, the merges and the scores, but `tokenizer.ggml.pre` names a pre-tokenizer whose regexes live in llama.cpp's source rather than in the file, so the keys present do not determine where a token begins. What is importable is a decoder, not an encoder.
 ¹⁵ corrected from ◐ when the importer was written: ONNX has no signature field
 at all. The ◐ was a guess about the format, and the format says nothing.
+¹⁶ NPZ is implemented and HDF5 and Zarr are not, which the single row hides:
+they are three formats with one thing in common. NumPy's dtypes map onto §04.3
+exactly in both directions *except* that OMNI has narrower floats and sub-byte
+integers than NumPy can spell — `bf16`, `f8e4m3`, `i4` — so exporting one is a
+widening to the narrowest NumPy type that holds every value, named in the loss
+report and refused without `--allow-lossy`, rather than a drop. Column-major
+arrays keep their bytes and are described with §04.4's `strided` layout; a
+big-endian array is *converted*, because §03.9 makes OMNI little-endian, and the
+report says so. `descr: '|O'` is pickle and is refused under §12.10 clause 1.
 
 ## 4 Notable import paths in detail
 

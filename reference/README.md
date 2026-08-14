@@ -460,6 +460,24 @@ implemented:
   is read from `checkpoint_format`, written as an explicit `+1` node, and named in
   the report — and an unrecognised `checkpoint_format` is refused rather than
   guessed, because guessing shifts every weight by one quantization step
+- **NumPy `.npy` and `.npz`, both directions**, which is the row of the matrix
+  most likely to be somebody's first attempt: half of the tooling around a model
+  — a probe's activations, a calibration set, a learned codebook, an evaluation's
+  logits — can write an `.npz` and nothing else. It is also the row with a
+  reference implementation on every machine, so CI has NumPy itself write the
+  files and read them back, and every array comes out with the dtype, the shape
+  and the bytes it went in with. Three details decide whether that is faithful
+  or merely plausible, and each is handled where it is decided rather than
+  averaged away: a `fortran_order` array keeps its bytes and is described with
+  §04.4's `strided` layout instead of being rearranged; a big-endian array is
+  *converted*, because §03.9 makes OMNI little-endian, and the report says so
+  rather than leaving it to be discovered later as wrong numbers; and `descr:
+  '|O'` is pickle, so §12.10 clause 1 refuses it by name rather than routing it
+  to the unpickler, since nobody expects an `.npz` to execute anything. Going out,
+  a dtype NumPy cannot spell — `bf16`, `f8e4m3`, `i4` — is **widened** to the
+  narrowest NumPy type that holds every value exactly, named in the plan and
+  refused without `--allow-lossy`: losing the dtype is a smaller loss than losing
+  the weight, and it is a different one, so it is reported as a different one
 - **safetensors, both directions**, with the importer and exporter contracts of
   `docs/design/import-export.md` §1 implemented rather than paraphrased: every
   tensor verified byte-for-byte against the source before the import claims to
@@ -573,9 +591,9 @@ What is **not** implemented, and is reported as such rather than faked:
   refusing the whole verb was refusing more than the argument supported
 - `omni mount` (§13.9), which needs FUSE
 - Every importer and exporter except safetensors, PyTorch, GGUF, ONNX, PEFT,
-  GPTQ, AWQ and a whole Hugging Face repo.
+  GPTQ, AWQ, NumPy and a whole Hugging Face repo.
   The capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
-  build implements eight of them; EXL2 does not exist, and a
+  build implements nine of them; EXL2 does not exist, and a
   request for one is refused by name rather than half-attempted. Export covers
   safetensors, GGUF, ONNX, PEFT, GPTQ and AWQ — not PyTorch, because §12.10
   clause 4 says never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
@@ -637,7 +655,7 @@ expectation.
 
 ## Tests
 
-590 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+598 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -935,7 +953,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 590 passed; 0 failed
+test result: ok. 598 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

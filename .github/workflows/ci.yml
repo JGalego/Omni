@@ -3242,6 +3242,118 @@ jobs:
           PY
           echo "lz4 interoperates with a second implementation in both directions"
 
+      # The row of the capability matrix that is most likely to be somebody's
+      # first attempt, and the one with a reference implementation on every
+      # runner: NumPy itself writes the files and reads them back.
+      - name: NumPy arrays round-trip through OMNI
+        run: |
+          pip install --quiet numpy
+          OMNI=reference/target/release/omni
+          python3 - <<'PY_NPZ'
+          import numpy as np
+          rng = np.random.default_rng(20260814)
+          np.savez('/tmp/np-src.npz',
+                   weights=rng.standard_normal((4, 8)).astype(np.float32),
+                   bias=np.arange(8, dtype=np.float64),
+                   mask=np.array([True, False, True, True], dtype=bool),
+                   counts=np.arange(6, dtype=np.int32).reshape(2, 3),
+                   half=rng.standard_normal(5).astype(np.float16),
+                   # Column-major: the same values in a different order, which
+                   # §04.4 describes rather than rearranges.
+                   fortran=np.asfortranarray(rng.standard_normal((3, 2)).astype(np.float32)))
+          np.savez_compressed('/tmp/np-deflated.npz',
+                              a=rng.standard_normal((16, 16)).astype(np.float32),
+                              b=np.arange(100, dtype=np.int64))
+          np.save('/tmp/np-one.npy', rng.standard_normal((3, 3)).astype(np.float32))
+          # A big-endian array: §03.9 makes OMNI little-endian, so this is a
+          # conversion and the report has to say so.
+          np.save('/tmp/np-be.npy', rng.standard_normal(6).astype('>f8'))
+          print("wrote the numpy corpus")
+          PY_NPZ
+
+          "$OMNI" import npz /tmp/np-src.npz -o /tmp/np.omni | tee /tmp/np.txt
+          grep -q 'verified byte-for-byte against the source' /tmp/np.txt
+          # I1: neither a licence nor an architecture is invented for a file
+          # that states neither.
+          grep -q 'license — field omitted' /tmp/np.txt
+          grep -q 'arch.family — field omitted' /tmp/np.txt
+          grep -q "column-major storage for 1 array" /tmp/np.txt
+          "$OMNI" verify /tmp/np.omni --level 6 | grep -q '^valid'
+
+          # Out again, and NumPy — a different program — must read every array
+          # back as the one that went in.
+          "$OMNI" export npz /tmp/np.omni -o /tmp/np-back.npz | tee /tmp/npx.txt
+          grep -q 'lossless     yes' /tmp/npx.txt
+          python3 - <<'PY_CMP'
+          import numpy as np
+          a, b = np.load('/tmp/np-src.npz'), np.load('/tmp/np-back.npz')
+          assert sorted(a.files) == sorted(b.files), (a.files, b.files)
+          for k in a.files:
+              x, y = a[k], b[k]
+              assert x.dtype == y.dtype, (k, x.dtype, y.dtype)
+              assert x.shape == y.shape, (k, x.shape, y.shape)
+              assert np.array_equal(x, y), k
+              print(f"  {k}: {x.dtype} {x.shape} identical")
+          print("every array survived the round trip exactly")
+          PY_CMP
+
+          # A deflated `.npz` and a bare `.npy` are the same importer.
+          "$OMNI" import npz /tmp/np-deflated.npz -o /tmp/np2.omni >/dev/null
+          "$OMNI" export npz /tmp/np2.omni -o /tmp/np2-back.npz >/dev/null
+          "$OMNI" import npz /tmp/np-one.npy -o /tmp/np3.omni >/dev/null
+          python3 - <<'PY_CMP2'
+          import numpy as np
+          a, b = np.load('/tmp/np-deflated.npz'), np.load('/tmp/np2-back.npz')
+          for k in a.files:
+              assert np.array_equal(a[k], b[k]), k
+          print("a deflated npz round-trips too")
+          PY_CMP2
+
+          # A big-endian source is converted, and the report says so rather
+          # than leaving it to be discovered as wrong numbers later.
+          "$OMNI" import npz /tmp/np-be.npy -o /tmp/np-be.omni | tee /tmp/npbe.txt
+          grep -q 'byte order' /tmp/npbe.txt
+
+          # An object array is pickle, and §12.10 clause 1 applies to it just as
+          # it does to a `.bin`.
+          python3 -c "
+          import numpy as np
+          np.save('/tmp/np-obj.npy', np.array([{'a': 1}, None], dtype=object), allow_pickle=True)
+          "
+          rm -f /tmp/np-obj.omni
+          set +e
+          "$OMNI" import npz /tmp/np-obj.npy -o /tmp/np-obj.omni > /tmp/npobj.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 3
+          grep -q '§12.10' /tmp/npobj.txt
+          test ! -f /tmp/np-obj.omni
+
+          # E1/E2: a dtype NumPy cannot spell is named before anything is
+          # written, and widening it is a loss the caller has to consent to.
+          "$OMNI" example --quantized /tmp/np-q.omni >/dev/null
+          set +e
+          "$OMNI" export npz /tmp/np-q.omni --plan > /tmp/npplan.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 3
+          grep -q 'widening to `f32` keeps every value and not the type' /tmp/npplan.txt
+          rm -f /tmp/np-q.npz
+          set +e
+          "$OMNI" export npz /tmp/np-q.omni -o /tmp/np-q.npz > /tmp/nprefuse.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 1
+          test ! -f /tmp/np-q.npz
+          "$OMNI" export npz /tmp/np-q.omni -o /tmp/np-q.npz --allow-lossy >/dev/null
+          python3 -c "
+          import numpy as np
+          z = np.load('/tmp/np-q.npz')
+          assert len(z.files) > 0
+          print(f'{len(z.files)} arrays came out under --allow-lossy')
+          "
+          echo "numpy arrays import, export and round-trip through OMNI"
+
       # §03.7: compression is a property of a stored copy, so changing it must
       # change no identity at all.
       - name: Compressed containers keep every digest

@@ -179,6 +179,12 @@ VERBS:
                               run outcome rather than a failure. External data
                               is read from beside the file, and a path that
                               leaves that directory is refused
+    import  npz <in.npz|in.npy> -o <out.omni> [--name N] [--arch FAMILY]
+                              NumPy arrays, one tensor each. A column-major
+                              array keeps its bytes and gets §04.4's layout; a
+                              big-endian one is converted to §03.9's order and
+                              the report says so; an object array is pickle and
+                              is refused under §12.10 clause 1
     import  peft <adapter-dir> --base <base.omni> -o <out.omni>
                               A PEFT LoRA as an §08 Adapter, pinned to that base
                               by digest rather than by the name PEFT gives it
@@ -213,6 +219,12 @@ VERBS:
                               be lost without writing; a lossy export needs
                               --allow-lossy, and the loss report is written
                               beside the artifact (§1.2)
+    export  npz <in.omni> [-o <out.npz>] [--plan] [--allow-lossy]
+                              Arrays back out. A dtype NumPy cannot spell —
+                              bf16, f8e4m3, i4 — is widened to the narrowest one
+                              that holds every value, which is a loss of the
+                              type and not of the weight, named in the plan and
+                              refused without consent
     jinja   <template.jinja> [--coverage [<dir>]]
                               Translate a Jinja2 chat template into OMNI-CT
                               (§06.9), or measure the built-in corpus. A
@@ -4675,13 +4687,16 @@ fn cmd_import(args: &[String]) -> R {
     if format == "onnx" {
         return cmd_import_onnx(args, input);
     }
+    if matches!(format.as_str(), "npz" | "npy" | "numpy") {
+        return cmd_import_npz(args, input);
+    }
     if let Some(method) = omni_core::hfquant::Method::parse(format) {
         return cmd_import_hfquant(args, input, method);
     }
     if format != "safetensors" {
         prr!(
             "omni: no importer for `{format}`. This build imports safetensors, \
-             pytorch, hf, gguf, peft, gptq and awq; \
+             pytorch, hf, gguf, onnx, npz, peft, gptq and awq; \
              `docs/design/import-export.md` §3 lists what the others would \
              need\n"
         );
@@ -5800,11 +5815,14 @@ fn cmd_export(args: &[String]) -> R {
     if format == "onnx" {
         return cmd_export_onnx(args, input);
     }
+    if matches!(format.as_str(), "npz" | "npy" | "numpy") {
+        return cmd_export_npz(args, input);
+    }
     if format != "safetensors" {
         prr!(
             "omni: no exporter for `{format}`. This build exports safetensors, \
-             gguf, gptq, awq and peft; `docs/design/import-export.md` §5.2 \
-             lists the others\n"
+             gguf, onnx, npz, gptq, awq and peft; \
+             `docs/design/import-export.md` §5.2 lists the others\n"
         );
         return Ok(2);
     }
@@ -5878,6 +5896,177 @@ fn cmd_export(args: &[String]) -> R {
         p.loss_report(&c.header.root_digest, c.header.hash),
     )?;
     pr!("wrote {report_path}");
+    Ok(0)
+}
+
+/// `omni import npz` — the *HDF5 / Zarr / NPZ* row of the capability matrix.
+///
+/// An `.npz` is arrays and nothing else, which is why this importer is short:
+/// there is no architecture to read, no tokenizer, no licence. I1's rule is
+/// that absence is information, so each of those is *reported as absent*
+/// rather than filled in with something plausible.
+fn cmd_import_npz(args: &[String], input: &str) -> R {
+    use omni_core::npy::{import, ImportOpts};
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let bytes = std::fs::read(input)?;
+    let opts = ImportOpts {
+        name: flag(args, "--name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("imported/{}", stem(input))),
+        source_path: input.to_string(),
+        hash: if flag(args, "--hash") == Some("sha256") {
+            HashAlgo::Sha256
+        } else {
+            HashAlgo::Blake3_256
+        },
+        chunk_size: flag(args, "--chunk")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 20),
+        license: flag(args, "--license").map(str::to_string),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+    };
+    let imported = match import(&bytes, &opts) {
+        Ok(i) => i,
+        Err(e @ omni_core::npy::Error::Unsupported(_)) => {
+            prr!("omni: {e}\n");
+            return Ok(3);
+        }
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(1);
+        }
+    };
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: opts.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+    let r = &imported.report;
+    pr!("imported {input} -> {out}");
+    pr!(
+        "  source       numpy, {}, {}",
+        human(r.source_size),
+        short(opts.hash, &r.source_digest)
+    );
+    pr!(
+        "  arrays       {} verified byte-for-byte against the source ({}) — I4",
+        commas(r.verified_tensors as u64),
+        human(r.verified_bytes)
+    );
+    pr!("  represented  {}", r.represented.join(", "));
+    pr!("  assumptions");
+    for n in &r.assumptions {
+        pr!("     {} — {}", n.item, n.action);
+    }
+    pr!(
+        "  size         {} -> {} ({:.1} %)",
+        human(r.source_size),
+        human(packed.len() as u64),
+        100.0 * packed.len() as f64 / r.source_size.max(1) as f64
+    );
+    pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
+    Ok(0)
+}
+
+/// `omni export npz` — arrays back out, one `.npy` member each.
+///
+/// E1 first: the plan says what it would write and what it cannot, with nothing
+/// on disk. The refusal that matters is a dtype NumPy has no `descr` for —
+/// `i4`, a codebook index, anything sub-byte — because widening it to the next
+/// whole byte is a loss that looks exactly like success.
+fn cmd_export_npz(args: &[String], input: &str) -> R {
+    let c = Container::open(std::fs::read(input)?)?;
+    let store = Borrowed(&c);
+    let ctx = Ctx::new(&store);
+    let table = tensor_table(&c)?;
+
+    let mut arrays: Vec<omni_core::npy::Array> = Vec::new();
+    let mut widened: Vec<(String, String, String)> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut bytes_total = 0u64;
+    for (name, r) in &table.tensors {
+        let desc = TensorDesc::load(&ctx, r)?;
+        let Some(shape) = omni_core::expr::concrete(&desc.shape) else {
+            refused.push((
+                name.clone(),
+                "its shape is symbolic, and NumPy has no way to write one".into(),
+            ));
+            continue;
+        };
+        // A dtype NumPy cannot spell is widened to the narrowest one that holds
+        // every value exactly, rather than dropped: losing the dtype is a
+        // smaller loss than losing the weight, and it is a different one.
+        let target = match omni_core::npy::descr_of(&desc.dtype) {
+            Ok(_) => desc.dtype.clone(),
+            Err(why) => match omni_core::npy::widen(&desc.dtype) {
+                Some(w) => {
+                    widened.push((name.clone(), desc.dtype.label(), w.label()));
+                    w
+                }
+                None => {
+                    refused.push((name.clone(), why));
+                    continue;
+                }
+            },
+        };
+        // The value is evaluated through §04.7, so a `dequantize` exports as
+        // the numbers it computes rather than as its packed operand.
+        let t = desc.value.eval(&ctx)?;
+        let data = omni_core::npy::encode_array(&target, &t.data)?;
+        bytes_total += data.len() as u64;
+        arrays.push((name.clone(), target, shape, false, data));
+    }
+
+    pr!("{input} -> npz");
+    pr!(
+        "  arrays       {}, {} of payload",
+        commas(arrays.len() as u64),
+        human(bytes_total)
+    );
+    let lossless = refused.is_empty() && widened.is_empty();
+    if lossless {
+        pr!("  lossless     yes");
+    } else {
+        pr!(
+            "  lossless     no — {} thing(s) would be lost:",
+            refused.len() + widened.len()
+        );
+        for (name, from, to) in &widened {
+            pr!("     {name} — `{from}` has no NumPy dtype; widening to `{to}` keeps every value and not the type");
+        }
+        for (name, why) in &refused {
+            pr!("     {name} — {why}");
+        }
+    }
+    if args.iter().any(|a| a == "--plan") {
+        return Ok(if lossless { 0 } else { 3 });
+    }
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    // E2: a lossy export without consent writes nothing.
+    if !lossless && !args.iter().any(|a| a == "--allow-lossy") {
+        prr!(
+            "omni: {} tensor(s) would be widened and {} dropped; pass \
+             --allow-lossy to write it anyway\n",
+            widened.len(),
+            refused.len()
+        );
+        return Ok(1);
+    }
+    let members = omni_core::npy::export_members(&arrays)?;
+    let npz = omni_core::npy::write_npz(&members);
+    std::fs::write(out, &npz)?;
+    pr!("wrote {out}  {}", human(npz.len() as u64));
     Ok(0)
 }
 
