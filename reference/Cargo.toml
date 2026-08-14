@@ -9,6 +9,13 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/jgalego/Omni"
+# The minimum supported Rust version, and it is measured rather than chosen:
+# 1.87 is the release that stabilized `unsigned_is_multiple_of`, and 1.86 fails
+# to build this workspace for that reason alone. CI builds and tests on exactly
+# this toolchain so the number stays true. Declaring it is what turns "use of
+# unstable library feature" — an error that reads like a bug in this crate — into
+# cargo saying which compiler is required.
+rust-version = "1.87"
 
 [profile.release]
 opt-level = 3

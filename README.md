@@ -68,7 +68,10 @@ what produced them, and may always be deleted.
 ## Getting started
 
 The reference implementation has zero dependencies, so installing the CLI is a
-clone and one `cargo install`:
+clone and one `cargo install`. Rust 1.87 or newer is the only requirement, and
+that number is measured rather than picked — CI builds and tests on exactly 1.87
+and checks that 1.86 does *not* compile, so a stated minimum cannot quietly drift
+above the real one:
 
 ```console
 $ git clone https://github.com/JGalego/Omni && cd Omni

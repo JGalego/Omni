@@ -3,6 +3,7 @@ name = "omni-conformance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 description = "OMNI conformance corpus generator and test runner"
 

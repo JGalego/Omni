@@ -3,6 +3,7 @@ name = "omni-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 description = "The OMNI C ABI: the substrate every non-Rust binding is built on."
 

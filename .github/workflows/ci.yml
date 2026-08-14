@@ -64,6 +64,65 @@ jobs:
       - name: Build (release)
         run: cargo build --release --all
 
+  # `rust-version` in the workspace manifest is a promise to anyone running
+  # `cargo install --path reference/omni-cli`, and an unchecked promise about a
+  # compiler is one that a single clippy suggestion can break: `is_multiple_of`
+  # is in this tree because a newer clippy's `manual_is_multiple_of` lint asked
+  # for it, and it silently moved the floor from 1.82 to 1.87. So the floor is
+  # tested from both sides.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reference
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read it out of the manifest rather than repeating it here. A number
+      # written in two places is a number that will disagree with itself.
+      - name: Read the declared minimum from the manifest
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          case "$v" in
+            1.*) ;;
+            *) echo "::error::could not read rust-version from reference/Cargo.toml"; exit 1 ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "previous=1.$(( ${v#1.} - 1 ))" >> "$GITHUB_OUTPUT"
+          echo "declared minimum $v, previous ${v%.*}.$(( ${v#1.} - 1 ))"
+
+      - name: The declared minimum builds and passes the suite
+        run: |
+          rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+          rustup default ${{ steps.msrv.outputs.version }}
+          rustc --version
+          cargo build --all --all-features
+          cargo test --all --all-features
+
+      # The half that keeps the number honest in the other direction. A minimum
+      # stated too high excludes users for nothing, and nobody finds out, because
+      # everything passes. If this step stops failing, the floor has dropped and
+      # `rust-version` should follow it down.
+      #
+      # `--ignore-rust-version` is what makes this a test of the code rather than
+      # of the manifest. Without it cargo refuses the older toolchain by reading
+      # `rust-version` — which would make the check circular, passing for any
+      # number however inflated, since cargo would decline to try. With it, the
+      # compiler is asked the question and answers it.
+      - name: One release earlier does not, so the minimum is the minimum
+        run: |
+          prev=${{ steps.msrv.outputs.previous }}
+          rustup toolchain install "$prev" --profile minimal
+          if cargo +"$prev" build --all --all-features --ignore-rust-version 2>/tmp/prev.log; then
+            echo "::error::rust $prev compiles this workspace, so the declared minimum of \
+          ${{ steps.msrv.outputs.version }} is higher than it needs to be"
+            exit 1
+          fi
+          echo "rust $prev fails to compile it, as the declared minimum requires:"
+          grep -m3 -E '^error' /tmp/prev.log || true
+
   container-conformance:
     name: container conformance
     runs-on: ubuntu-latest

@@ -3,6 +3,7 @@ name = "omni-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "OMNI (Open Model Neutral Interchange) reference core: container, objects, canonical CBOR, digests"
 
 # Deliberately zero dependencies. The C0 reader budget (docs/design/sdk.md §5)
