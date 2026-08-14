@@ -3830,6 +3830,47 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # The size of the pure-Python C0 reader is the *measured* half of
+      # `sdk.md` §5's budget claim — the one thing in that section that is
+      # evidence rather than an estimate — and it is quoted in four documents.
+      # It was wrong in all four: 878 against a file that has been 880 lines
+      # since it was written. A measurement nobody re-measures is an estimate
+      # with a decimal point.
+      - name: The C0 reader is the size the documents say it is
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          path = 'bindings/python/omni.py'
+          n = sum(1 for _ in open(path, encoding='utf-8'))
+          sites = {
+              'README.md': r'in (\d+) lines of pure',
+              'docs/design/sdk.md': r'\*\*(\d+) lines of pure Python',
+              'docs/design/roadmap.md': r'C0 reader is (\d+) lines',
+          }
+          bad = []
+          for f, pattern in sites.items():
+              found = re.findall(pattern, open(f, encoding='utf-8').read())
+              if not found:
+                  bad.append(f'{f}: no count matching /{pattern}/ — reworded, and this '
+                             f'check has stopped reading it')
+              for got in found:
+                  if int(got) != n:
+                      bad.append(f'{f}: says {got} lines, {path} is {n}')
+          # sdk.md states it twice; the second is the comparison with the budget.
+          budget = re.findall(r'(\d+) lines against ~3 000',
+                              open('docs/design/sdk.md', encoding='utf-8').read())
+          if not budget:
+              bad.append('docs/design/sdk.md: the budget comparison no longer parses')
+          for got in budget:
+              if int(got) != n:
+                  bad.append(f'docs/design/sdk.md: budget comparison says {got}, is {n}')
+          for b in bad:
+              print(f'::error::{b}')
+          print(f'{path} is {n} lines; every documented figure agrees'
+                if not bad else f'{path} is {n} lines')
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Assets are well-formed SVG
         run: |
           python3 - <<'PY'

@@ -234,7 +234,7 @@ open, starting with the one no format can do anything about.
 One claim gets a second opinion rather than a louder assertion. The design says a
 conforming reader at the lowest profile fits in about three thousand lines with no
 dependencies beyond a hash function — so
-[`bindings/python/omni.py`](bindings/python/omni.py) is one, in 878 lines of pure
+[`bindings/python/omni.py`](bindings/python/omni.py) is one, in 880 lines of pure
 Python with BLAKE3 written out because Python does not ship it, and CI checks that
 it and the Rust implementation agree on every digest and every tensor byte of the
 same file. A format is only as portable as its second implementation.

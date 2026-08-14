@@ -464,7 +464,7 @@ At least one production deployment outside the authoring organizations.
 | **Registry capture / politicization** | medium | `x.*` namespace, first-come-first-served for third parties, frozen core, mirrorable signed registry (§11.7) |
 | **Hash algorithm break** | low, high impact | Agility designed in (§12.11); migration costs one hashing pass, zero re-uploads |
 | **Container format needs a breaking change** | low, very high impact | `header_size` growth, skippable segments, index `fmt_version`, feature flags — the specific mechanisms that prevent it |
-| **Scope creep** | high | The C0 budget (§SDK.5) is a hard gate on every proposal, and it is now *measured* rather than modelled: the pure-Python C0 reader is 878 lines against a ~3 000 line budget |
+| **Scope creep** | high | The C0 budget (§SDK.5) is a hard gate on every proposal, and it is now *measured* rather than modelled: the pure-Python C0 reader is 880 lines against a ~3 000 line budget |
 
 ## Success criteria at 5 years
 

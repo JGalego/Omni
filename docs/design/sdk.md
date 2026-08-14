@@ -372,7 +372,7 @@ program that *wrote* the containers it reads. On its own that cannot distinguish
 "the format is simple" from "these two programs share an author's assumptions".
 
 So there is a second reader: [`bindings/python/omni.py`](../../bindings/python/omni.py),
-**878 lines of pure Python with no dependencies**, written from the specification
+**880 lines of pure Python with no dependencies**, written from the specification
 rather than from the Rust. It implements BLAKE3 from scratch — the one primitive
 C0 needs that Python does not ship — plus CRC-32C, the two-read open, the index
 with its bucket table, canonical OMNI-CBOR with D1–D8 enforced, the object graph,
@@ -387,7 +387,7 @@ only honest if what sits above it is named.
 
 Two things the exercise found, which is the argument for doing it at all:
 
-- The budget is comfortable. 878 lines against ~3 000, in a language with none of
+- The budget is comfortable. 880 lines against ~3 000, in a language with none of
   Rust's advantages for this kind of work, with room left over for the strictness
   checks a reader could technically skip.
 - The strictness is load-bearing and easy to get subtly wrong. D5 is not "doubles
