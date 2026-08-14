@@ -3839,35 +3839,52 @@ jobs:
       - name: The C0 reader is the size the documents say it is
         run: |
           python3 - <<'PY'
-          import re, sys
+          import glob, os, re, sys
           path = 'bindings/python/omni.py'
           n = sum(1 for _ in open(path, encoding='utf-8'))
-          sites = {
-              'README.md': r'in (\d+) lines of pure',
-              'docs/design/sdk.md': r'\*\*(\d+) lines of pure Python',
-              'docs/design/roadmap.md': r'C0 reader is (\d+) lines',
-          }
-          bad = []
-          for f, pattern in sites.items():
-              found = re.findall(pattern, open(f, encoding='utf-8').read())
-              if not found:
-                  bad.append(f'{f}: no count matching /{pattern}/ — reworded, and this '
-                             f'check has stopped reading it')
-              for got in found:
-                  if int(got) != n:
-                      bad.append(f'{f}: says {got} lines, {path} is {n}')
-          # sdk.md states it twice; the second is the comparison with the budget.
-          budget = re.findall(r'(\d+) lines against ~3 000',
-                              open('docs/design/sdk.md', encoding='utf-8').read())
-          if not budget:
-              bad.append('docs/design/sdk.md: the budget comparison no longer parses')
-          for got in budget:
-              if int(got) != n:
-                  bad.append(f'docs/design/sdk.md: budget comparison says {got}, is {n}')
+
+          # Find the sites instead of listing them. The first version of this
+          # check carried a hand-written list of three files and missed a fourth
+          # in `reference/README.md` — which is the same failure as the stale
+          # number it was added to prevent, one level up. Any "<number> lines"
+          # within a few lines of a mention of the reader is a claim about its
+          # size, so search for that rather than for the places somebody
+          # remembered.
+          bad, sites = [], 0
+          for f in glob.glob('**/*.md', recursive=True):
+              if {'node_modules', 'target', '.git'} & set(f.split(os.sep)):
+                  continue
+              text = open(f, encoding='utf-8').read()
+              for m in re.finditer(r'(\d[\d ]*) lines', text):
+                  # The budget itself is "~3 000 lines" and is an estimate, not a
+                  # measurement of this file; skip anything marked approximate.
+                  window = text[max(0, m.start() - 400):m.end() + 400]
+                  if not any(k in window for k in
+                             ('omni.py', 'C0 reader', 'budget is comfortable')):
+                      continue
+                  # The same paragraphs state the *budget* as well as the
+                  # measurement — "~3 000 lines", "in under 3 000 lines" — and a
+                  # bound is not a claim about this file's size. Distinguish by
+                  # the hedge in front of the number rather than by proximity,
+                  # which cannot tell them apart.
+                  if re.search(r'(~|under|about|roughly|up to|budget of)\s*$',
+                               text[max(0, m.start() - 24):m.start()]):
+                      continue
+                  got = int(re.sub(r'\D', '', m.group(1)))
+                  sites += 1
+                  if got != n:
+                      bad.append(f'{f}: says {got} lines near a mention of the reader, '
+                                 f'{path} is {n}')
+          # Four is what there are; a change to that number means a site was
+          # added or removed and this check should be looked at rather than
+          # trusted.
+          if sites != 5:
+              bad.append(f'{sites} claims about the reader size found, expected 5 — a '
+                         f'mention has been added or reworded')
           for b in bad:
               print(f'::error::{b}')
-          print(f'{path} is {n} lines; every documented figure agrees'
-                if not bad else f'{path} is {n} lines')
+          print(f'{path} is {n} lines; all {sites} documented figures agree'
+                if not bad else f'{path} is {n} lines, {sites} sites')
           sys.exit(1 if bad else 0)
           PY
 

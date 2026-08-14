@@ -395,7 +395,7 @@ implemented:
   none, because safetensors says nothing about them, and asserting a requirement
   the base cannot meet made every attach *invalid* instead of merely unchecked
 - **A second reader, in pure Python** —
-  [`bindings/python/omni.py`](../bindings/python/omni.py), 878 lines, standard
+  [`bindings/python/omni.py`](../bindings/python/omni.py), 880 lines, standard
   library only, BLAKE3 included because Python does not ship it. It exists to test
   a claim this crate cannot test on its own: `docs/design/sdk.md` §5 says a
   conforming C0 reader fits in ~3 000 lines with no dependencies beyond a hash
