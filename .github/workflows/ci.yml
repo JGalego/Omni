@@ -3824,7 +3824,13 @@ jobs:
           # SPDX expressions from the crate manifests, resolved through the
           # workspace's `license.workspace = true` indirection.
           spdx = set()
-          for f in sorted(glob.glob('reference/**/Cargo.toml', recursive=True)) + ['reference/Cargo.toml']:
+          manifests = [f for f in glob.glob('reference/**/Cargo.toml', recursive=True)
+                       # `cargo package` writes a manifest with the inherited
+                       # fields resolved into literals. Reading it would count a
+                       # build artifact as a claim, and report a different number
+                       # depending on whether anyone had packaged recently.
+                       if 'target' not in f.split(os.sep)]
+          for f in sorted(set(manifests) | {'reference/Cargo.toml'}):
               for m in re.finditer(r'^license\s*=\s*"([^"]+)"', open(f, encoding='utf-8').read(), re.M):
                   spdx.add((f, m.group(1)))
           if not spdx:

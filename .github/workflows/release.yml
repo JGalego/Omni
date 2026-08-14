@@ -1,0 +1,249 @@
+name: Release
+
+# Tag-driven. `git tag v0.2.0 && git push --tags` is the whole trigger; nothing
+# here runs on a push to a branch, and nothing here can be started by accident.
+on:
+  push:
+    tags: ["v*"]
+  # Available by hand so the build and the self-checks can be exercised without
+  # tagging anything. A manual run produces artifacts and creates no release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One leg per platform people actually run. Cross-compilation is deliberately
+  # avoided: §03.9 makes the container little-endian and the parser does explicit
+  # byte-order conversion, so "it built" is a weaker claim than "it built and
+  # then wrote a byte-identical container on that machine" — and the second one
+  # needs the target to be the host.
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the declared minimum toolchain
+        shell: bash
+        run: |
+          # Build releases on the MSRV rather than on stable. A binary compiled
+          # by a newer compiler can depend on a newer libstd; building on the
+          # floor means the published artifact works everywhere the manifest
+          # says the source does.
+          v=$(grep -m1 '^rust-version' reference/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          rustup toolchain install "$v" --profile minimal
+          rustup default "$v"
+          rustc --version
+
+      - name: Build
+        working-directory: reference
+        run: cargo build --release --all
+
+      # A release of a format implementation that has not shown it writes the
+      # format is a release nobody should install. The committed example is the
+      # fixture CI already checks on every push (writer rule W1, §01.10); doing
+      # it again here checks the *artifact being shipped* rather than a build
+      # that happened to pass earlier on a different machine.
+      - name: The artifact writes the committed container, byte for byte
+        shell: bash
+        run: |
+          bin=reference/target/release/omni
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" example fresh.omni >/dev/null
+          if ! cmp -s fresh.omni examples/toy.omni; then
+            echo "::error::this build does not reproduce examples/toy.omni; not shippable"
+            exit 1
+          fi
+          "$bin" verify fresh.omni --level 6
+          rm -f fresh.omni
+          echo "reproduces the committed example and verifies at V6"
+
+      - name: Stage the artifacts
+        shell: bash
+        run: |
+          name="omni-${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}-${{ matrix.target }}"
+          mkdir -p "stage/$name"
+          cd reference/target/release
+          # The CLI, the C ABI in both linkages, and the header that describes
+          # it — the header is what makes the library usable and is the one file
+          # people forget to ship.
+          for f in omni omni.exe libomni.so libomni.dylib omni.dll \
+                   libomni.a omni.lib omni.dll.lib; do
+            [ -f "$f" ] && cp "$f" "../../../stage/$name/"
+          done
+          cd "$GITHUB_WORKSPACE"
+          cp reference/omni-ffi/include/omni.h "stage/$name/"
+          cp LICENSE LICENSE-APACHE LICENSE-MIT LICENSE-SPEC "stage/$name/"
+          # Apache-2.0 §4(a) requires recipients be given the licence, and a
+          # tarball is a distribution: shipping a binary without it would undo
+          # what committing the licence files was for.
+
+          # The copy loop above skips what does not exist, which is how one list
+          # covers four platforms — and is also how an archive could come to hold
+          # a header, four licences and no program at all. Name what must be
+          # there rather than trusting the glob.
+          for want in omni; do
+            [ -f "stage/$name/$want" ] || [ -f "stage/$name/$want.exe" ] || {
+              echo "::error::no $want in the staged archive; the build produced nothing to ship"
+              exit 1
+            }
+          done
+          case "${{ runner.os }}" in
+            Linux)   lib=libomni.so ;;
+            macOS)   lib=libomni.dylib ;;
+            Windows) lib=omni.dll ;;
+          esac
+          [ -f "stage/$name/$lib" ] || {
+            echo "::error::no $lib in the staged archive; the C ABI did not build as a cdylib"
+            exit 1
+          }
+          ls -l "stage/$name"
+          echo "name=$name" >> "$GITHUB_ENV"
+
+      # CI already checks the C ABI against the build tree on every push. This
+      # checks something else: the header and library **as staged**, with the
+      # source tree out of the include path entirely. It is the step that catches
+      # a stale `omni.h`, or a `staging` list that quietly stopped copying one —
+      # neither of which the build-tree check can see, because there the right
+      # file is always sitting next to the wrong one.
+      - name: A C program consumes the staged archive, and nothing else
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd "stage/$name"
+          "$GITHUB_WORKSPACE/reference/target/release/omni" example --quantized probe.omni >/dev/null
+          # -Werror for the same reason CI uses it: a header that needs a cast to
+          # use is a header that will be used wrongly.
+          cc -Wall -Wextra -Werror -std=c11 -pedantic \
+            "$GITHUB_WORKSPACE/reference/omni-ffi/examples/read.c" \
+            -I. libomni.a -lpthread -ldl -lm -o probe
+          ./probe probe.omni | tee probe.txt
+          grep -q 'the C ABI read a container end to end' probe.txt
+          rm -f probe probe.omni probe.txt
+          echo "the staged header and library build and run on their own"
+
+      # Named rather than skipped. The Windows archive ships the same header and
+      # an import library, and neither is consumption-tested here: doing it would
+      # mean driving MSVC from bash for one leg. The symbol-parity check in the
+      # `rust` job covers the header against the library on every push, on every
+      # platform, which is the larger half of what this step proves.
+      - name: Note what is not checked on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "::notice::the Windows archive is not consumption-tested by a C \
+          compiler in this workflow; header/library symbol parity is checked in CI"
+
+      - name: Archive
+        shell: bash
+        working-directory: stage
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "../$name.zip" "$name" >/dev/null
+          else
+            tar czf "../$name.tar.gz" "$name"
+          fi
+          cd .. && ls -l $name.*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.name }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  # Separate job so `contents: write` is scoped to the one step that needs it,
+  # rather than granted to four build legs that run a compiler over the tree.
+  publish:
+    name: publish
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Digest every artifact
+        working-directory: dist
+        run: |
+          ls -l
+          # A project whose premise is that identity is a hash should not ask
+          # anyone to download an artifact it has not named the digest of.
+          sha256sum *.tar.gz *.zip | tee SHA256SUMS
+          echo "::notice::$(wc -l < SHA256SUMS) artifacts digested"
+
+      # Written to a file rather than passed inline. Release notes are markdown
+      # full of backticks and dollar signs, and every one of them is a shell
+      # metacharacter on the way through `--notes`; a quoting mistake there is
+      # discovered in the published release.
+      - name: Compose the notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The heading is written separately so the body can stay a *quoted*
+          # heredoc. An unquoted one would interpolate $TAG and also every `$`
+          # and backtick in the markdown below, which is most of it.
+          printf '## OMNI %s\n\n' "$TAG" > notes.md
+          cat >> notes.md <<'EOF'
+          The reference implementation of OMNI.
+
+          The format is **OMNI/1.0 Draft** and is not a ratified standard. See
+          [`docs/spec/14-versioning.md`](docs/spec/14-versioning.md) for what that
+          does and does not promise about compatibility.
+
+          Each archive holds the `omni` CLI, the C ABI as a shared and a static
+          library, `omni.h`, and the licences. Every binary here was required to
+          reproduce the committed `examples/toy.omni` byte for byte and to verify
+          it at V6 on its own platform before being uploaded — a build that does
+          not write the format does not ship.
+
+          `SHA256SUMS` covers every archive:
+
+          ```console
+          $ sha256sum -c SHA256SUMS --ignore-missing
+          ```
+
+          Building from source needs Rust 1.87 or newer and nothing else:
+
+          ```console
+          $ cargo install --path reference/omni-cli
+          ```
+          EOF
+          cat notes.md
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Marked as a prerelease while the format is a draft (§14): the version
+          # people should trust is the format version, and OMNI/1.0 is not
+          # ratified. Dropping this flag is a deliberate act, not an oversight.
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --prerelease \
+            --notes-file notes.md \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS
