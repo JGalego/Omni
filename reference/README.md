@@ -84,7 +84,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server and OCI mapping with the `.omni.idx` sidecar, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), PEFT, GPTQ and AWQ import and export, whole-Hugging-Face-repo import, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, lz4, xz/LZMA2, ans-lut, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server, the OCI mapping with the `.omni.idx` sidecar and a registry client, COSE signatures under Ed25519 and ES256, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), GGUF, ONNX, NumPy, PEFT, GPTQ and AWQ import and export, whole-Hugging-Face-repo import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-ffi` | the C ABI (`omni.h`): opaque handles, panic-proof entry points, CLI-matching status codes, DLPack in *and* out, and a container writer. Built as `cdylib` + `staticlib`. The only crate here that uses `unsafe` | design/sdk.md §3 |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
@@ -95,8 +95,12 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 - **Zero dependencies.** `docs/design/sdk.md` §5 claims a conforming C0 reader
   needs nothing beyond a hash function and fits in ~3 000 lines. This crate is
   the evidence rather than the assertion — BLAKE3, SHA-256, SHA-512, CRC-32C,
-  Ed25519, ChaCha20, deflate, Zstandard, XXH64 and a strict canonical CBOR codec
-  are all implemented here.
+  CRC-64, Ed25519, NIST P-256 with ECDSA and RFC 6979 deterministic nonces,
+  ChaCha20, deflate, Zstandard, LZ4, LZMA2 with its range coder, rANS, XXH64 and
+  a strict canonical CBOR codec are all implemented here. That list is longer
+  than the C0 budget needs, which is the point: the budget covers a *reader*, and
+  everything past it is what the constraint costs to keep once the crate does
+  more than read.
 - **`#![forbid(unsafe_code)]`** in every crate that parses. This code reads
   untrusted binary input; §12.4 requires memory safety, bounds checks on every
   length and offset, bounded nesting depth, and no allocation driven by an
