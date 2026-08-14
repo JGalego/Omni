@@ -294,7 +294,11 @@ data. Rules:
    depth for clause 1, not a replacement for it: an implementation whose
    unpickler is a general evaluator with a filter in front of it needs the
    sandbox, and an implementation whose unpickler cannot express a call at all
-   has nothing for the sandbox to contain. State which one you are.
+   has nothing for the sandbox to contain. State which one you are — and state
+   which of the four confinements you enforce, because "sandboxed" covers both an
+   implementation that drops every capability and one that sets a memory limit,
+   and a reader deciding whether to open an untrusted checkpoint needs to know
+   which.
 3. Record in `Provenance` that the source was an unsafe format, what was
    rejected, and the digest of the source file.
 4. Never re-emit pickle on export unless explicitly requested with a warning.

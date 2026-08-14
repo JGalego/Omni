@@ -147,11 +147,15 @@ VERBS:
                               every tensor verified against the source, nothing
                               invented, the unrepresentable preserved (§1.1)
     import  pytorch <in.bin> -o <out.omni> [--name N] [--arch FAMILY]
+                              [--no-sandbox] [--memory N] [--timeout S]
                               A `torch.save` checkpoint, read by a restricted
                               unpickler (§12.10): an opcode allowlist, 19
                               resolvable symbols, and no way to call anything
                               but tensor reconstruction. Exit 4 names the symbol
-                              a file asked for and did not get
+                              a file asked for and did not get. Clause 2's
+                              confinement is on by default where a POSIX shell
+                              exists: a separate process with an address-space
+                              cap and a wall clock
     import  hf <model-dir> -o <out.omni> [--name N] [--license SPDX]
                               A whole Hugging Face repo as one container: the
                               weights (sharded or not, safetensors or torch),
@@ -5330,6 +5334,47 @@ fn cmd_import_pytorch(args: &[String], input: &str) -> R {
         eprint!("{USAGE}");
         return Ok(2);
     };
+
+    // §12.10 clause 2. The child is this same binary with the same arguments
+    // and `OMNI_CONFINED` set, so there is one import path rather than two —
+    // the sandbox decides *where* it runs, never *what* it does.
+    let confined_already = std::env::var_os("OMNI_CONFINED").is_some();
+    let wanted = !args.iter().any(|a| a == "--no-sandbox");
+    let caps = Sandbox {
+        memory_kb: match flag(args, "--memory") {
+            Some(s) => parse_size(s)? / 1024,
+            None => Sandbox::default().memory_kb,
+        },
+        seconds: flag(args, "--timeout")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| Sandbox::default().seconds),
+    };
+    if wanted && !confined_already && sandbox_available() {
+        // `args` already begins with the verb, so the child is given exactly
+        // the command line this process was given.
+        match run_confined(args, &caps) {
+            Ok(0) => {
+                pr!(
+                    "  sandbox      a separate process, address space capped at {} \
+                     and {} s of wall clock (§12.10 clause 2)",
+                    human(caps.memory_kb * 1024),
+                    caps.seconds
+                );
+                pr!(
+                    "     not capped  network and filesystem, which need namespaces \
+                     and therefore libc — clause 1's restricted unpickler is what \
+                     protects those"
+                );
+                return Ok(0);
+            }
+            Ok(code) => return Ok(code.clamp(0, 255) as u8),
+            Err(e) => {
+                prr!("omni: {e}\n");
+                return Ok(4);
+            }
+        }
+    }
+
     let bytes = std::fs::read(input)?;
     let opts = ImportOpts {
         name: flag(args, "--name")
@@ -5410,6 +5455,101 @@ tensor reconstruction (§12.10)",
     );
     pr!("  report       attached as a Provenance object (`omni dump --provenance`)");
     Ok(0)
+}
+
+
+// ------------------------------------------------------------------ sandbox --
+
+/// §12.10 clause 2: run the pickle import in a separate process with caps on
+/// what it can spend.
+///
+/// The clause asks for a separate process, no network, a read-only filesystem
+/// view, a memory cap and a wall-clock cap, and it also says to **state which
+/// implementation you are**. This one enforces three of those five, and the two
+/// it does not are named rather than implied: network and filesystem isolation
+/// need namespaces or a seccomp filter, and both need `libc` — a dependency this
+/// build does not have and the reason the sandbox was absent for a draft.
+///
+/// The argument for having the other three anyway is not that the unpickler is
+/// suspect. It is a parser for a data language with no call mechanism, and
+/// `docs/spec/12-security.md` §12.10 says an implementation like that has
+/// nothing for a sandbox to contain. It is that a *parser* for untrusted input
+/// can still be made to allocate or loop, and a memory cap and a wall-clock cap
+/// turn either into a process that dies instead of a machine that does. Defence
+/// in depth is for the bug nobody has found yet.
+///
+/// Windows gets neither `ulimit` nor a POSIX shell, so there the import runs in
+/// this process and says so. A refusal would be worse: §12.10's own reading is
+/// that clause 1 is the protection and clause 2 is depth behind it.
+struct Sandbox {
+    /// Address space cap, in kilobytes, as `ulimit -v` spells it.
+    memory_kb: u64,
+    /// Wall-clock cap in seconds.
+    seconds: u64,
+}
+
+impl Default for Sandbox {
+    fn default() -> Self {
+        // Generous enough for a real checkpoint's largest tensor and small
+        // enough that a pickle asking for a terabyte dies rather than swaps.
+        Sandbox {
+            memory_kb: 8 << 20,
+            seconds: 900,
+        }
+    }
+}
+
+/// Whether a confined child is available here at all.
+fn sandbox_available() -> bool {
+    cfg!(unix) && std::path::Path::new("/bin/sh").exists()
+}
+
+/// Runs `omni` again, confined, on the arguments given.
+///
+/// Returns the child's exit code. The parent enforces the wall clock itself
+/// because `ulimit -t` measures CPU time and a process asleep on a read is not
+/// spending any.
+fn run_confined(args: &[String], caps: &Sandbox) -> Result<i32, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?;
+    let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+    let script = format!(
+        "ulimit -v {} 2>/dev/null; exec {} {}",
+        caps.memory_kb,
+        shell_quote(&exe.to_string_lossy()),
+        quoted.join(" ")
+    );
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        // The child must not inherit a decision it is supposed to be making.
+        .env("OMNI_CONFINED", "1")
+        .spawn()
+        .map_err(|e| format!("cannot start the confined child: {e}"))?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.code().unwrap_or(1)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("waiting for the confined child: {e}")),
+        }
+        if start.elapsed().as_secs() >= caps.seconds {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "the import did not finish within {} s and was killed (§12.10 \
+                 clause 2's wall-clock cap)",
+                caps.seconds
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Single-quotes a string for `/bin/sh`, which is the only quoting that is
+/// total: every byte but `'` passes through untouched.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// `omni import peft` — a PEFT LoRA over a base, as an §08 `Adapter`.

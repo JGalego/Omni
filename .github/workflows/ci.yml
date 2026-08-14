@@ -2180,7 +2180,41 @@ jobs:
           test "$rc" = 3                    # indeterminate: real file, unsupported here
           grep -q 'pre-1.6' /tmp/legacy.txt
 
-          echo "a torch checkpoint imports under §12.10, and a hostile one does not"
+          # §12.10 clause 2: the import runs in a separate process with an
+          # address-space cap and a wall clock, and says so. The container it
+          # produces must be the same either way — the sandbox decides where
+          # the import runs, never what it does.
+          grep -q 'sandbox      a separate process' /tmp/pt.txt
+          grep -q 'not capped  network and filesystem' /tmp/pt.txt
+          "$OMNI" import pytorch /tmp/torch.bin -o /tmp/torch-direct.omni --no-sandbox \
+            > /tmp/ptdirect.txt 2>&1
+          if grep -q 'sandbox      a separate process' /tmp/ptdirect.txt; then
+            echo "::error::--no-sandbox still confined the import"; exit 1
+          fi
+          cmp /tmp/torch.omni /tmp/torch-direct.omni
+
+          # Both caps are real: an address space a Rust binary cannot start in,
+          # and a wall clock of zero, each kill the child rather than being
+          # advisory. Nothing is written either way.
+          rm -f /tmp/torch-capped.omni
+          set +e
+          "$OMNI" import pytorch /tmp/torch.bin -o /tmp/torch-capped.omni --memory 4M \
+            > /tmp/ptcap.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          test ! -e /tmp/torch-capped.omni
+          rm -f /tmp/torch-clock.omni
+          set +e
+          "$OMNI" import pytorch /tmp/torch.bin -o /tmp/torch-clock.omni --timeout 0 \
+            > /tmp/ptclock.txt 2>&1
+          rc=$?
+          set -e
+          test "$rc" = 4
+          grep -q "§12.10 clause 2's wall-clock cap" /tmp/ptclock.txt
+          test ! -e /tmp/torch-clock.omni
+
+          echo "a torch checkpoint imports under §12.10, confined, and a hostile one does not"
 
       # §05's central claim is that quantization is a transformation and not a
       # file type: a GPTQ or AWQ weight is `dequantize(packed_words, scheme)` and

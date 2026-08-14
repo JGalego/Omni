@@ -614,12 +614,19 @@ What is **not** implemented, and is reported as such rather than faked:
   clause 4 says never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
   versions are refused for the reasons named above, and so are GGUF's `IQ*`
   types, whose codebooks are in llama.cpp's source rather than in the file
-- §12.10's confined child process for the pickle import. The restricted
-  unpickler is implemented in full — an opcode allowlist, 19 resolvable symbols,
-  no call mechanism beyond tensor reconstruction — and the sandbox is not, on
-  the argument that there is nothing to confine: it is a parser for a data
-  language, not an evaluator with a filter in front of it. A build that ever
-  grows a general evaluator needs the sandbox back
+- Two of §12.10 clause 2's four confinements: **network and filesystem
+  isolation**, which need namespaces or a seccomp filter and therefore `libc`.
+  The other two — a separate process with an address-space cap, and a wall clock
+  — are here and on by default wherever a POSIX shell is (`--no-sandbox`,
+  `--memory`, `--timeout`). The clause asks an implementation to *state which one
+  it is*, so: the restricted unpickler is clause 1 and is the protection — it is
+  a parser for a data language with no call mechanism, and there is nothing in it
+  for a sandbox to contain. The caps are depth behind that, for the bug nobody
+  has found yet: a parser for untrusted input can still be made to allocate or to
+  loop, and a cap turns either into a process that dies instead of a machine that
+  does. CI checks that both caps kill rather than warn, and that the container
+  produced is the same either way — the sandbox decides where the import runs,
+  never what it does
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
