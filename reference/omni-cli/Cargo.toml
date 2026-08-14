@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "../README.md"
 description = "The `omni` command-line tool (reference subset)"
+keywords = ["machine-learning", "model", "cli", "container", "safetensors"]
+categories = ["command-line-utilities", "encoding", "science"]
 
 [[bin]]
 name = "omni"
 path = "src/main.rs"
 
 [dependencies]
-omni-core = { path = "../omni-core" }
+omni-core.workspace = true

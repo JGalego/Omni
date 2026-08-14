@@ -64,6 +64,67 @@ jobs:
       - name: Build (release)
         run: cargo build --release --all
 
+      # Publishability is not a property you can check by building — `cargo build`
+      # is happy with a manifest `cargo publish` rejects, and the rejection
+      # arrives at the one moment it is most expensive: after a release is tagged.
+      # Checked on one leg only; a manifest does not vary by platform.
+      - name: Every crate is publishable
+        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+          meta = json.loads(subprocess.run(
+              ['cargo', 'metadata', '--no-deps', '--format-version', '1'],
+              capture_output=True, text=True, check=True).stdout)
+          bad = []
+          # crates.io's own limits, which it enforces at upload and cargo does not.
+          for p in sorted(meta['packages'], key=lambda p: p['name']):
+              n, root = p['name'], os.path.dirname(p['manifest_path'])
+              for field in ('description', 'license', 'repository', 'readme', 'rust_version'):
+                  if not p.get(field):
+                      bad.append(f'{n}: no {field}')
+              if p.get('readme') and not os.path.exists(os.path.join(root, p['readme'])):
+                  bad.append(f'{n}: readme points at {p["readme"]}, which does not exist')
+              kw = p.get('keywords') or []
+              if not 1 <= len(kw) <= 5:
+                  bad.append(f'{n}: {len(kw)} keywords, crates.io allows 1 to 5')
+              for k in kw:
+                  if len(k) > 20 or not re.fullmatch(r'[A-Za-z0-9_+-]+', k):
+                      bad.append(f'{n}: keyword {k!r} is not one crates.io accepts')
+              if not p.get('categories'):
+                  bad.append(f'{n}: no categories')
+              # The defect this check exists for. A `path` dependency with no
+              # version requirement builds forever and can never be published:
+              # cargo strips the path on publish and is left with nothing to
+              # resolve. `req` reads as "*" in that case.
+              for d in p['dependencies']:
+                  if d.get('path') and d['req'] == '*':
+                      bad.append(f'{n}: path dependency {d["name"]} has no version requirement, '
+                                 f'so this crate cannot be packaged')
+
+          # The internal version requirement is a second literal that has to
+          # track `workspace.package.version`, because cargo will not interpolate
+          # one into the other.
+          version = next(p['version'] for p in meta['packages'] if p['name'] == 'omni-core')
+          for p in meta['packages']:
+              for d in p['dependencies']:
+                  if d['name'] == 'omni-core' and d['req'] != f'^{version}':
+                      bad.append(f'{p["name"]}: depends on omni-core {d["req"]} but the '
+                                 f'workspace version is {version}')
+
+          for b in bad:
+              print(f'::error::{b}')
+          print(f'checked {len(meta["packages"])} manifests, {len(bad)} problems')
+          sys.exit(1 if bad else 0)
+          PY
+
+          # And then actually do it, for the one crate that can be done before
+          # anything is published: omni-core has no dependencies, so nothing has
+          # to exist on crates.io for this to resolve. The other three depend on
+          # it and can only be dry-run once it is released, which is a fact about
+          # publication order rather than a gap in this check.
+          cargo package -p omni-core --no-verify
+
   # `rust-version` in the workspace manifest is a promise to anyone running
   # `cargo install --path reference/omni-cli`, and an unchecked promise about a
   # compiler is one that a single clippy suggestion can break: `is_multiple_of`

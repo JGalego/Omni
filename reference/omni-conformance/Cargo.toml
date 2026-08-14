@@ -4,12 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+readme = "../README.md"
 repository.workspace = true
 description = "OMNI conformance corpus generator and test runner"
+keywords = ["machine-learning", "model", "conformance", "testing", "fuzzing"]
+categories = ["development-tools::testing", "command-line-utilities"]
 
 [[bin]]
 name = "omni-conformance"
 path = "src/main.rs"
 
 [dependencies]
-omni-core = { path = "../omni-core" }
+omni-core.workspace = true

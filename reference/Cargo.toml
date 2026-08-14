@@ -17,6 +17,15 @@ repository = "https://github.com/jgalego/Omni"
 # cargo saying which compiler is required.
 rust-version = "1.87"
 
+# The internal dependency lives here so its version requirement is written once.
+# A `path` dependency with no `version` cannot be packaged at all — cargo strips
+# the path on publish and would have nothing left to resolve — and the version
+# has to be a literal because cargo does not interpolate `workspace.package`
+# into it. CI asserts this number and `workspace.package.version` agree, since
+# two literals that must match are two literals that will not.
+[workspace.dependencies]
+omni-core = { path = "omni-core", version = "0.1.0" }
+
 [profile.release]
 opt-level = 3
 lto = true
