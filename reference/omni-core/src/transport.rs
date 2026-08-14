@@ -559,6 +559,19 @@ impl Http {
             }
         }
         let mut body = Vec::new();
+        // A HEAD response carries the headers a GET would — `Content-Length`
+        // included — and **no body** (RFC 9110 §9.3.2). Reading the length it
+        // states blocks forever on a connection that will never send those
+        // bytes, and a registry answering `HEAD /v2/…/blobs/<digest>` with a 404
+        // and a `Content-Length` is exactly where that happens. The same is true
+        // of 204 and 304.
+        if method.eq_ignore_ascii_case("HEAD") || code == 204 || code == 304 {
+            return Ok(Response {
+                status: code,
+                headers: received,
+                body,
+            });
+        }
         if chunked {
             loop {
                 let mut size_line = String::new();
@@ -1114,6 +1127,58 @@ mod tests {
                 range = Some((a.parse().ok()?, b.parse().ok()?));
             }
         }
+    }
+
+    /// RFC 9110 §9.3.2: a HEAD response carries the headers a GET would, and no
+    /// body.
+    ///
+    /// This is the shape of a real registry's `HEAD /v2/…/blobs/<digest>`: 404
+    /// with the `Content-Length` of the error document it would have sent to a
+    /// GET, and nothing after the headers. A client that reads that length waits
+    /// forever for bytes that are never coming, which is exactly what happened —
+    /// the OCI push hung on the first blob it asked about, in CI, for as long as
+    /// the job was allowed to run.
+    #[test]
+    fn a_head_response_with_a_content_length_and_no_body_does_not_hang() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().take(1) {
+                let Ok(mut conn) = conn else { break };
+                let mut r = std::io::BufReader::new(conn.try_clone().unwrap());
+                // Two requests on one connection, so the second also proves the
+                // stream was left in a usable state.
+                for code in ["404 Not Found", "200 OK"] {
+                    if read_request(&mut r).is_none() {
+                        break;
+                    }
+                    let _ = conn.write_all(
+                        format!(
+                            "HTTP/1.1 {code}\r\nContent-Length: 157\r\n\
+                             Content-Type: application/json\r\n\
+                             Connection: keep-alive\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+        });
+
+        let http = Http::new(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let first = http
+            .send("HEAD", "/v2/m/blobs/sha256:00", &[], None)
+            .unwrap();
+        assert_eq!(first.status, 404);
+        assert!(first.body.is_empty());
+        // The connection is still usable, which is the other half: a client that
+        // half-read a body would desynchronise here rather than hang.
+        let second = http
+            .send("HEAD", "/v2/m/blobs/sha256:01", &[], None)
+            .unwrap();
+        assert_eq!(second.status, 200);
+        assert_eq!(second.header("content-length"), Some("157"));
+        assert!(second.body.is_empty());
     }
 
     // ---------------------------------------------------------------- sidecar --

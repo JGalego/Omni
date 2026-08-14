@@ -67,6 +67,10 @@ jobs:
   container-conformance:
     name: container conformance
     runs-on: ubuntu-latest
+    # A step that hangs on a socket used to burn the job's whole six-hour budget
+    # and produce no log, which is the worst of both. Nothing here takes ten
+    # minutes when it is working.
+    timeout-minutes: 45
     # §13.5's other half. A mapping nobody has pushed anywhere is a claim about
     # distribution rather than a demonstration of one, so the push is tested
     # against the reference registry implementation rather than against a mock
@@ -1290,6 +1294,7 @@ jobs:
       # OCI mapping is parasitic adoption, and adoption is not a property this
       # repository can assert about itself.
       - name: A model pushes to a real registry, and comes back byte for byte
+        timeout-minutes: 5
         run: |
           OMNI=$PWD/reference/target/release/omni
           REG=localhost:5000
@@ -1420,6 +1425,7 @@ jobs:
       # socket that difference is invisible, which is why the server can be
       # throttled: the rate limit restores the only variable the claim is about.
       - name: What a layout costs before the first number comes out
+        timeout-minutes: 5
         run: |
           OMNI=$PWD/reference/target/release/omni
           "$OMNI" example --tune 4 /tmp/ttft.omni >/dev/null
@@ -1463,6 +1469,7 @@ jobs:
       # pack and per-object URLs, and having both here means each is tested
       # against a real implementation of the other rather than against a mock.
       - name: The object server and the range client speak to each other
+        timeout-minutes: 5
         run: |
           OMNI=$PWD/reference/target/release/omni
           # SHA-256 rather than the default BLAKE3, for one reason: Python's
@@ -2615,6 +2622,7 @@ jobs:
       # range, with the round trips counted — a transport claim nothing counts
       # is not a claim.
       - name: A container is read over HTTP by range, and every byte is checked
+        timeout-minutes: 5
         run: |
           OMNI=$PWD/reference/target/release/omni
           "$OMNI" example --tune 1 /tmp/net.omni >/dev/null
