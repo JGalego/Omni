@@ -187,25 +187,32 @@ and feature-flag mechanisms in [§14](docs/spec/14-versioning.md).
 
 The reference implementation covers the container and object model, canonical
 encoding and both mandatory hashes, the tensor expression algebra with its
-typing and range pushdown, quantization and sparsity, compression (including
-`zstd`, the one codec §03 marks MUST), tokenizers and chat templates, adapters
+typing and range pushdown, quantization and sparsity, compression (`zstd`, the
+one codec §03 marks MUST, and with it `deflate`, `lz4`, `xz` over LZMA2, and
+`ans-lut` — OMNI's own, which had to be *specified* before it could be
+implemented twice), tokenizers and chat templates, adapters
 and deltas, OMNI-IR with its dialects and rewrites and an interpreter that runs
-it, capability negotiation,
-signatures, training state, a WebAssembly host for plugins, HTTP range transport
-with the detached index sidecar, an object server and the OCI mapping, and
+it — including a dialect nobody has heard of shipping the WebAssembly that
+shapes, verifies *and computes* its own ops — capability negotiation,
+COSE signatures under Ed25519 and ES256, training state, a WebAssembly host for
+plugins, HTTP range transport
+with the detached index sidecar, an object server, and the OCI mapping over a
+real registry — credentials, chunked upload, and the referrers API with the
+fallback tag for registries that lack it — and
 lossless safetensors, GGUF, PEFT LoRA, GPTQ and AWQ import *and* export — the
 quantized ones as expressions over the packed words rather than as a conversion
 of them, checked by dequantizing every layer and comparing against arithmetic
 done in Python, and GGUF byte-for-byte in both directions across its eleven
-block types — PyTorch `.bin` import through a restricted unpickler, a whole Hugging
+block types — NumPy `.npy` and `.npz` both ways, PyTorch `.bin` import through a
+restricted unpickler in a confined child process, a whole Hugging
 Face repo (weights, config, tokenizer and chat template) as one container, and a
 [C ABI](reference/omni-ffi/include/omni.h) that a C program drives end to end
 in both directions — reading a container, and *writing* one, with DLPack going
 in as well as out. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
-it — every importer but those seven, `https://` (TLS
-needs a dependency), `mount`, SIMD in the
-plugin host, and the remaining MAY-level codecs — and every one of them is reported as
+it — every importer but those nine, `https://` (TLS
+needs a dependency), `mount` (FUSE), `mmap` (`unsafe`), SIMD in the
+plugin host, ML-DSA, and `brotli` and the two lossy codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See
 [the roadmap](docs/design/roadmap.md) for what the gates have and have not
 proven.
