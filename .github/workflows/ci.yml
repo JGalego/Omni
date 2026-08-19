@@ -1453,7 +1453,11 @@ jobs:
           # values near 1e24, and the graph over them evaluates to all zeros. So
           # the check compared 768 zeros with 768 zeros. Every arithmetic error
           # in §04.7's evaluator was invisible to it.
-          pip install --quiet safetensors
+          # numpy explicitly: `safetensors.torch` imports it inside `save_file`
+          # and `load_file`, and a runner that happens to have torch need not
+          # have numpy. It did here, which is why this was found on a runner
+          # rather than locally.
+          pip install --quiet safetensors numpy
           if ! pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu \
              || ! python3 -c "import torch" 2>/dev/null; then
             echo "::notice::torch unavailable; the family comparison is running against \
