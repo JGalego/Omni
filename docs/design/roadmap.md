@@ -407,8 +407,9 @@ is no `mount` and no `by-novelty` partitioning. The signature stack of §12.5 is
 ML-DSA in all three parameter sets, COSE_Sign1, trust policies) and has had no
 third-party review — though ML-DSA and SLH-DSA are both checked against NIST's
 own ACVP known-answer vectors, which is a different and better assurance than
-review of the classical two have. What remains unimplemented in §12.5.1 is
-SLH-DSA's SHA2 parameter sets and RSA-PSS, each reported indeterminate by name. The distribution
+review of the classical two have — SLH-DSA in all twelve of its parameter sets,
+the six SHAKE and the six SHA2. What remains unimplemented in §12.5.1 is
+RSA-PSS, reported indeterminate by name. The distribution
 *mechanisms* are now demonstrated rather than claimed; the distribution
 *measurements* are what remains, and they need a corpus rather than more code.
 

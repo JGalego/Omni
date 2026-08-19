@@ -103,7 +103,10 @@ fn key_generation_matches_nists_vectors() {
         );
         *seen.entry(p.name).or_insert(0) += 1;
     }
-    let want = if cfg!(debug_assertions) { 3 } else { 6 };
+    // Twelve sets in the fixtures (six SHAKE, six SHA2). A debug build skips the
+    // slow `s` sets of both families, leaving the six `f` sets; a release build
+    // runs all twelve.
+    let want = if cfg!(debug_assertions) { 6 } else { 12 };
     assert_eq!(
         seen.len(),
         want,

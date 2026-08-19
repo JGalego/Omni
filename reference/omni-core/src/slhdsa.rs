@@ -11,10 +11,13 @@
 //! dual-sign with (§12.5.1 recommends exactly that against adversary A7), and it
 //! costs a 7 856-byte signature to have one.
 //!
-//! The six SHAKE parameter sets are implemented. The six SHA2 sets are not, and
-//! are refused by name: they are not a smaller amount of work than these were,
-//! they use a different address encoding and an MGF1 construction, and a
-//! half-done second family would be the thing this crate keeps declining to do.
+//! All twelve parameter sets are implemented: the six SHAKE sets (§11.2.1,
+//! SHAKE256 over the 32-byte address) and the six SHA2 sets (§11.2.2, which use
+//! the 22-byte compressed address, SHA-256 with SHA-512 for the higher
+//! categories, and MGF1 and HMAC for the message hash and message PRF). The two
+//! families share all of §4–§10 — the trees, the addresses, the WOTS+ and FORS
+//! arithmetic — and differ only in the six functions of §11.2, which is why the
+//! second family is a branch in each of those and nothing more.
 //!
 //! Checked against NIST's own ACVP known-answer vectors, for the same reason
 //! ML-DSA is: a hash-based signature has a great many self-consistent
@@ -22,11 +25,23 @@
 //! children of a node are concatenated in are all invisible to a round trip and
 //! all fatal to interoperability.
 
+use crate::sha256::sha256;
+use crate::sha512::sha512;
 use crate::shake::shake256;
 
 // ---------------------------------------------------------------------------
 // Parameters (FIPS 205 §11, Table 2)
 // ---------------------------------------------------------------------------
+
+/// Which hash family instantiates the six functions of §11.2. The SHAKE family
+/// calls SHAKE256 over the 32-byte address; the SHA2 family (§11.2.2) uses a
+/// 22-byte *compressed* address, SHA-256/512, and MGF1/HMAC — a different
+/// construction wearing the same six names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashFamily {
+    Shake,
+    Sha2,
+}
 
 /// One SLH-DSA parameter set. `s` sets sign slowly and produce short signatures;
 /// `f` sets sign fast and produce long ones, which is the whole axis the suffix
@@ -46,6 +61,8 @@ pub struct Params {
     pub k: usize,
     /// Message digest length, in bytes.
     pub m: usize,
+    /// The hash family that instantiates §11.2's six functions.
+    pub hash: HashFamily,
 }
 
 /// The Winternitz parameter. FIPS 205 fixes `lg_w = 4` for every set, so `w` is
@@ -61,6 +78,7 @@ pub const SHAKE_128S: Params = Params {
     a: 12,
     k: 14,
     m: 30,
+    hash: HashFamily::Shake,
 };
 pub const SHAKE_128F: Params = Params {
     name: "SLH-DSA-SHAKE-128f",
@@ -70,6 +88,7 @@ pub const SHAKE_128F: Params = Params {
     a: 6,
     k: 33,
     m: 34,
+    hash: HashFamily::Shake,
 };
 pub const SHAKE_192S: Params = Params {
     name: "SLH-DSA-SHAKE-192s",
@@ -79,6 +98,7 @@ pub const SHAKE_192S: Params = Params {
     a: 14,
     k: 17,
     m: 39,
+    hash: HashFamily::Shake,
 };
 pub const SHAKE_192F: Params = Params {
     name: "SLH-DSA-SHAKE-192f",
@@ -88,6 +108,7 @@ pub const SHAKE_192F: Params = Params {
     a: 8,
     k: 33,
     m: 42,
+    hash: HashFamily::Shake,
 };
 pub const SHAKE_256S: Params = Params {
     name: "SLH-DSA-SHAKE-256s",
@@ -97,6 +118,7 @@ pub const SHAKE_256S: Params = Params {
     a: 14,
     k: 22,
     m: 47,
+    hash: HashFamily::Shake,
 };
 pub const SHAKE_256F: Params = Params {
     name: "SLH-DSA-SHAKE-256f",
@@ -106,10 +128,46 @@ pub const SHAKE_256F: Params = Params {
     a: 9,
     k: 35,
     m: 49,
+    hash: HashFamily::Shake,
 };
 
-pub const ALL: [Params; 6] = [
-    SHAKE_128S, SHAKE_128F, SHAKE_192S, SHAKE_192F, SHAKE_256S, SHAKE_256F,
+// The SHA2 sets (§11, Table 2) share every structural parameter with the SHAKE
+// set of the same category; only the hash family — and with it the address
+// encoding and the underlying primitives of §11.2.2 — differs.
+pub const SHA2_128S: Params = Params {
+    name: "SLH-DSA-SHA2-128s",
+    hash: HashFamily::Sha2,
+    ..SHAKE_128S
+};
+pub const SHA2_128F: Params = Params {
+    name: "SLH-DSA-SHA2-128f",
+    hash: HashFamily::Sha2,
+    ..SHAKE_128F
+};
+pub const SHA2_192S: Params = Params {
+    name: "SLH-DSA-SHA2-192s",
+    hash: HashFamily::Sha2,
+    ..SHAKE_192S
+};
+pub const SHA2_192F: Params = Params {
+    name: "SLH-DSA-SHA2-192f",
+    hash: HashFamily::Sha2,
+    ..SHAKE_192F
+};
+pub const SHA2_256S: Params = Params {
+    name: "SLH-DSA-SHA2-256s",
+    hash: HashFamily::Sha2,
+    ..SHAKE_256S
+};
+pub const SHA2_256F: Params = Params {
+    name: "SLH-DSA-SHA2-256f",
+    hash: HashFamily::Sha2,
+    ..SHAKE_256F
+};
+
+pub const ALL: [Params; 12] = [
+    SHAKE_128S, SHAKE_128F, SHAKE_192S, SHAKE_192F, SHAKE_256S, SHAKE_256F, SHA2_128S, SHA2_128F,
+    SHA2_192S, SHA2_192F, SHA2_256S, SHA2_256F,
 ];
 
 impl Params {
@@ -228,36 +286,174 @@ impl Adrs {
     fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// The 22-byte compressed address of §11.2.2, used by the SHA2 family: the
+    /// low byte of the layer, the 8-byte tree address, the low byte of the type,
+    /// and the twelve bytes after the type word. The bytes dropped are the ones
+    /// FIPS 205 fixes to zero for every address this scheme builds, so nothing
+    /// that varies is lost.
+    fn compressed(&self) -> [u8; 22] {
+        let mut c = [0u8; 22];
+        c[0] = self.0[3];
+        c[1..9].copy_from_slice(&self.0[8..16]);
+        c[9] = self.0[19];
+        c[10..22].copy_from_slice(&self.0[20..32]);
+        c
+    }
 }
 
 // ---------------------------------------------------------------------------
-// The six hash functions (FIPS 205 §11.2.1). For the SHAKE sets they are all
-// SHAKE256 over different inputs, which is why this family is the one to
-// implement first.
+// The six hash functions (FIPS 205 §11.2). The SHAKE family (§11.2.1) is
+// SHAKE256 over the 32-byte address; the SHA2 family (§11.2.2) is SHA-256 and,
+// for the higher categories, SHA-512, over the 22-byte compressed address, with
+// the message hash built from MGF1 and the message PRF from HMAC.
 // ---------------------------------------------------------------------------
 
+/// Whether this SHA2 set reaches for SHA-512 in the functions that §11.2.2 lets
+/// grow with the security category: `H`, `T_l`, `H_msg` and `PRF_msg`. `F` and
+/// `PRF` are SHA-256 for every set. The 128-bit sets are SHA-256 throughout.
+fn sha2_big(p: &Params) -> bool {
+    p.n > 16
+}
+
+/// `SHA-X(PK.seed ∥ toByte(0, B − n) ∥ ADRSc ∥ M)`, truncated to `n` — the shape
+/// `F`, `PRF`, `H` and `T_l` share in §11.2.2. `big` picks SHA-512 (block 128)
+/// over SHA-256 (block 64); the zero padding runs `PK.seed` out to one block.
+fn sha2_padded(pk_seed: &[u8], adrs_c: &[u8; 22], parts: &[&[u8]], n: usize, big: bool) -> Vec<u8> {
+    let block = if big { 128 } else { 64 };
+    let mut buf = Vec::with_capacity(block + 22 + parts.iter().map(|p| p.len()).sum::<usize>());
+    buf.extend_from_slice(pk_seed);
+    buf.resize(block, 0); // toByte(0, block − n): pad PK.seed out to one block
+    buf.extend_from_slice(adrs_c);
+    for m in parts {
+        buf.extend_from_slice(m);
+    }
+    let digest = if big {
+        sha512(&buf).to_vec()
+    } else {
+        sha256(&buf).to_vec()
+    };
+    digest[..n].to_vec()
+}
+
+/// MGF1 (RFC 8017 / FIPS 205 §11.2.2), over SHA-256 or SHA-512.
+fn mgf1(seed: &[u8], out_len: usize, big: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(out_len + if big { 64 } else { 32 });
+    let mut counter: u32 = 0;
+    while out.len() < out_len {
+        let mut inp = Vec::with_capacity(seed.len() + 4);
+        inp.extend_from_slice(seed);
+        inp.extend_from_slice(&counter.to_be_bytes());
+        if big {
+            out.extend_from_slice(&sha512(&inp));
+        } else {
+            out.extend_from_slice(&sha256(&inp));
+        }
+        counter += 1;
+    }
+    out.truncate(out_len);
+    out
+}
+
+/// HMAC (RFC 2104) over SHA-256 or SHA-512, returning the full mac.
+fn hmac(key: &[u8], msg: &[u8], big: bool) -> Vec<u8> {
+    let block = if big { 128 } else { 64 };
+    let mut k = vec![0u8; block];
+    if key.len() > block {
+        let h = if big {
+            sha512(key).to_vec()
+        } else {
+            sha256(key).to_vec()
+        };
+        k[..h.len()].copy_from_slice(&h);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = vec![0x36u8; block];
+    let mut opad = vec![0x5cu8; block];
+    for i in 0..block {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = ipad;
+    inner.extend_from_slice(msg);
+    let ih = if big {
+        sha512(&inner).to_vec()
+    } else {
+        sha256(&inner).to_vec()
+    };
+    let mut outer = opad;
+    outer.extend_from_slice(&ih);
+    if big {
+        sha512(&outer).to_vec()
+    } else {
+        sha256(&outer).to_vec()
+    }
+}
+
 fn h_msg(p: &Params, r: &[u8], pk_seed: &[u8], pk_root: &[u8], m: &[u8]) -> Vec<u8> {
-    shake256(&[r, pk_seed, pk_root, m], p.m)
+    match p.hash {
+        HashFamily::Shake => shake256(&[r, pk_seed, pk_root, m], p.m),
+        HashFamily::Sha2 => {
+            let big = sha2_big(p);
+            let mut inner = Vec::new();
+            for part in [r, pk_seed, pk_root, m] {
+                inner.extend_from_slice(part);
+            }
+            let inner = if big {
+                sha512(&inner).to_vec()
+            } else {
+                sha256(&inner).to_vec()
+            };
+            let mut seed = Vec::with_capacity(r.len() + pk_seed.len() + inner.len());
+            seed.extend_from_slice(r);
+            seed.extend_from_slice(pk_seed);
+            seed.extend_from_slice(&inner);
+            mgf1(&seed, p.m, big)
+        }
+    }
 }
 
 fn prf(p: &Params, pk_seed: &[u8], sk_seed: &[u8], adrs: &Adrs) -> Vec<u8> {
-    shake256(&[pk_seed, adrs.as_bytes(), sk_seed], p.n)
+    match p.hash {
+        HashFamily::Shake => shake256(&[pk_seed, adrs.as_bytes(), sk_seed], p.n),
+        // PRF is SHA-256 for every SHA2 set.
+        HashFamily::Sha2 => sha2_padded(pk_seed, &adrs.compressed(), &[sk_seed], p.n, false),
+    }
 }
 
 fn prf_msg(p: &Params, sk_prf: &[u8], opt_rand: &[u8], m: &[u8]) -> Vec<u8> {
-    shake256(&[sk_prf, opt_rand, m], p.n)
+    match p.hash {
+        HashFamily::Shake => shake256(&[sk_prf, opt_rand, m], p.n),
+        HashFamily::Sha2 => {
+            let mut msg = Vec::with_capacity(opt_rand.len() + m.len());
+            msg.extend_from_slice(opt_rand);
+            msg.extend_from_slice(m);
+            hmac(sk_prf, &msg, sha2_big(p))[..p.n].to_vec()
+        }
+    }
 }
 
 fn f(p: &Params, pk_seed: &[u8], adrs: &Adrs, m1: &[u8]) -> Vec<u8> {
-    shake256(&[pk_seed, adrs.as_bytes(), m1], p.n)
+    match p.hash {
+        HashFamily::Shake => shake256(&[pk_seed, adrs.as_bytes(), m1], p.n),
+        // F is SHA-256 for every SHA2 set.
+        HashFamily::Sha2 => sha2_padded(pk_seed, &adrs.compressed(), &[m1], p.n, false),
+    }
 }
 
 fn hh(p: &Params, pk_seed: &[u8], adrs: &Adrs, m2: &[u8]) -> Vec<u8> {
-    shake256(&[pk_seed, adrs.as_bytes(), m2], p.n)
+    match p.hash {
+        HashFamily::Shake => shake256(&[pk_seed, adrs.as_bytes(), m2], p.n),
+        HashFamily::Sha2 => sha2_padded(pk_seed, &adrs.compressed(), &[m2], p.n, sha2_big(p)),
+    }
 }
 
 fn t_l(p: &Params, pk_seed: &[u8], adrs: &Adrs, m: &[u8]) -> Vec<u8> {
-    shake256(&[pk_seed, adrs.as_bytes(), m], p.n)
+    match p.hash {
+        HashFamily::Shake => shake256(&[pk_seed, adrs.as_bytes(), m], p.n),
+        HashFamily::Sha2 => sha2_padded(pk_seed, &adrs.compressed(), &[m], p.n, sha2_big(p)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +941,10 @@ mod tests {
         // Table 2's signature sizes. These are the strongest cheap check there
         // is on `len1`, `len2` and the layer arithmetic: every one of them feeds
         // this number, and getting any wrong changes it.
+        // The SHA2 sets share every structural parameter with the SHAKE set of
+        // the same category, so their sizes are identical — the pairing here is
+        // also the check that the `..SHAKE_*` struct updates copied the right
+        // fields and changed only the name and the hash family.
         for (p, sig) in [
             (SHAKE_128S, 7856),
             (SHAKE_128F, 17088),
@@ -752,6 +952,12 @@ mod tests {
             (SHAKE_192F, 35664),
             (SHAKE_256S, 29792),
             (SHAKE_256F, 49856),
+            (SHA2_128S, 7856),
+            (SHA2_128F, 17088),
+            (SHA2_192S, 16224),
+            (SHA2_192F, 35664),
+            (SHA2_256S, 29792),
+            (SHA2_256F, 49856),
         ] {
             assert_eq!(p.signature_len(), sig, "{} signature", p.name);
             assert_eq!(p.public_key_len(), 2 * p.n, "{} public key", p.name);

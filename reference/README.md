@@ -97,7 +97,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
   the evidence rather than the assertion — BLAKE3, SHA-256, SHA-512, CRC-32C,
   CRC-64, Keccak-f[1600] with SHAKE128 and SHAKE256, Ed25519, NIST P-256 with
   ECDSA and RFC 6979 deterministic nonces, ML-DSA in all three FIPS 204
-  parameter sets, SLH-DSA in all six of FIPS 205's SHAKE sets, ChaCha20, deflate, Zstandard, LZ4, LZMA2 with its range coder,
+  parameter sets, SLH-DSA in all twelve of FIPS 205's parameter sets, ChaCha20, deflate, Zstandard, LZ4, LZMA2 with its range coder,
   rANS, XXH64 and a strict canonical CBOR codec are all implemented here. That list is longer
   than the C0 budget needs, which is the point: the budget covers a *reader*, and
   everything past it is what the constraint costs to keep once the crate does
@@ -258,18 +258,22 @@ implemented:
   agree with each other perfectly. Swapping `ExpandA`'s row and column indices
   leaves all twelve of the module's own tests passing and fails every NIST vector
   on the first byte — that experiment is in the commit that added it. **SLH-DSA** (FIPS 205) is here as
-  well, in all six SHAKE parameter sets, which completes §12.5.1: it rests on
+  well, in all twelve parameter sets — the six SHAKE and the six SHA2 — which
+  completes §12.5.1: it rests on
   nothing but the hash function, which is the reason to have it *beside* a
   lattice rather than instead of one, and §12.5.1 recommends dual-signing
   long-lived artifacts for exactly that. It is also checked against NIST's
   vectors, and needed them more: SLH-DSA is one hash function called through six
-  wrappers, domain-separated by a 32-byte address whose every field is hashed, and
+  wrappers, domain-separated by an address whose every field is hashed, and
   an implementation that sets one field wrong or concatenates a node's children in
-  the wrong order signs and verifies its own signatures perfectly.
-  What is *not* implemented is SLH-DSA's six **SHA2** parameter sets, which use a
-  different address encoding and an MGF1 construction, and ML-DSA's pre-hash and
-  external-mu interfaces — all refused by name. COSE has assigned no identifiers
-  for SLH-DSA, so the two this build offers come from the private-use range and
+  the wrong order signs and verifies its own signatures perfectly. The SHA2 sets
+  are the same scheme over a 22-byte compressed address, SHA-256 and SHA-512, and
+  MGF1 and HMAC — a second construction wearing the same six names, and each of
+  its twelve sets matches NIST byte for byte.
+  What is *not* implemented is ML-DSA's pre-hash and
+  external-mu interfaces — refused by name. COSE has assigned no identifiers
+  for SLH-DSA, so the two sets this build offers as container signatures come
+  from the private-use range and
   interoperate with nothing until §14's registry replaces them, which is stated
   where they are defined rather than discovered later
 - §06.7 the tokenizer IR: read structurally — the vocabulary as a string tensor,

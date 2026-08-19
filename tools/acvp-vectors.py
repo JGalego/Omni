@@ -74,22 +74,29 @@ ALGS = {
         "dir": "slhdsa",
         "acvp": "SLH-DSA",
         "fips": "FIPS205",
-        # The SHAKE family only. The SHA2 sets use a different address encoding
-        # and an MGF1 construction, and this build refuses them by name rather
-        # than half-implementing a second family.
+        # Both families. The SHA2 sets (§11.2.2) use the 22-byte compressed
+        # address, SHA-256/512, and MGF1/HMAC where the SHAKE sets use SHAKE256
+        # over the 32-byte address; the vectors are what pin that the two
+        # constructions were both read the way NIST wrote them.
         "sets": [
             "SLH-DSA-SHAKE-128s", "SLH-DSA-SHAKE-128f",
             "SLH-DSA-SHAKE-192s", "SLH-DSA-SHAKE-192f",
             "SLH-DSA-SHAKE-256s", "SLH-DSA-SHAKE-256f",
+            "SLH-DSA-SHA2-128s", "SLH-DSA-SHA2-128f",
+            "SLH-DSA-SHA2-192s", "SLH-DSA-SHA2-192f",
+            "SLH-DSA-SHA2-256s", "SLH-DSA-SHA2-256f",
         ],
         # Signing is where the parameter sets differ in cost by two orders of
         # magnitude, and a signature is also where the fixtures get large: a
         # 256f signature is 49 856 bytes, which is 99 712 hex digits. So `sigGen`
-        # keeps the one set that is fast to sign and small to store, while
-        # `sigVer` — which only verifies, and verification is cheap for every set
-        # — keeps both 128 sets, including the `s` one whose signing is skipped.
-        "siggen_sets": ["SLH-DSA-SHAKE-128f"],
-        "sigver_sets": ["SLH-DSA-SHAKE-128s", "SLH-DSA-SHAKE-128f"],
+        # keeps the one fast, small set from each family, while `sigVer` — which
+        # only verifies, and verification is cheap for every set — keeps both 128
+        # sets of each family, including the `s` ones whose signing is skipped.
+        "siggen_sets": ["SLH-DSA-SHAKE-128f", "SLH-DSA-SHA2-128f"],
+        "sigver_sets": [
+            "SLH-DSA-SHAKE-128s", "SLH-DSA-SHAKE-128f",
+            "SLH-DSA-SHA2-128s", "SLH-DSA-SHA2-128f",
+        ],
     },
 }
 

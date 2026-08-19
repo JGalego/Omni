@@ -224,7 +224,7 @@ in as well as out. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
 it — every importer but those ten, `https://` (TLS
 needs a dependency), `mount` (FUSE), `mmap` (`unsafe`), SIMD in the
-plugin host, SLH-DSA's SHA2 parameter sets, *producing* `brotli` (the decoder is
+plugin host, *producing* `brotli` (the decoder is
 complete and checked byte-for-byte against libbrotli, so brotli objects read; this
 build simply does not write brotli), and the two lossy codecs — and every one of
 them is reported as
