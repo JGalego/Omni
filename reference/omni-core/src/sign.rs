@@ -42,6 +42,33 @@ pub const COSE_ALG_ML_DSA_87: i64 = -50;
 /// file is fine and this reader cannot check it.
 pub const COSE_ALG_ES384: i64 = -35;
 
+/// SLH-DSA, §12.5.1's fourth algorithm and the conservative post-quantum one.
+///
+/// COSE has not assigned these, so the identifiers are drawn from the private-use
+/// range and are **not interoperable with anything**: a container signed with one
+/// is verifiable by this build and by whatever agrees to use the same numbers.
+/// They are here because the alternative is not signing with SLH-DSA at all, and
+/// §14's registry mechanism is what will replace them with real ones. Two of the
+/// twelve parameter sets get an identifier, being the two the CLI offers.
+pub const COSE_ALG_SLH_DSA_SHAKE_128S: i64 = -65537;
+pub const COSE_ALG_SLH_DSA_SHAKE_128F: i64 = -65538;
+
+fn slhdsa_alg(params: &crate::slhdsa::Params) -> Option<i64> {
+    match params.name {
+        "SLH-DSA-SHAKE-128s" => Some(COSE_ALG_SLH_DSA_SHAKE_128S),
+        "SLH-DSA-SHAKE-128f" => Some(COSE_ALG_SLH_DSA_SHAKE_128F),
+        _ => None,
+    }
+}
+
+fn slhdsa_params(alg: i64) -> Option<crate::slhdsa::Params> {
+    match alg {
+        COSE_ALG_SLH_DSA_SHAKE_128S => Some(crate::slhdsa::SHAKE_128S),
+        COSE_ALG_SLH_DSA_SHAKE_128F => Some(crate::slhdsa::SHAKE_128F),
+        _ => None,
+    }
+}
+
 /// The COSE identifier for an ML-DSA parameter set, or `None` for one this build
 /// has no identifier for.
 pub fn mldsa_alg(params: &crate::mldsa::Params) -> Option<i64> {
@@ -349,6 +376,11 @@ pub enum SigningKey {
     /// ECDSA on P-256 with SHA-256 — what an HSM, a KMS and a WebPKI
     /// certificate all already speak.
     Es256(crate::p256::SecretKey),
+    /// SLH-DSA (FIPS 205). The hash-based option: slower and far larger than
+    /// ML-DSA, and resting on nothing but the hash function, which is the whole
+    /// point of having both. §12.5.1 recommends dual-signing long-lived artifacts
+    /// against adversary A7, and this is the half you would pair with a lattice.
+    SlhDsa(Box<crate::slhdsa::KeyPair>),
     /// ML-DSA (FIPS 204), any of the three parameter sets. The one of the three
     /// algorithms whose reason for existing is §12.11 rather than compatibility:
     /// a container signed today and verified in twenty years cannot be re-signed
@@ -363,6 +395,7 @@ impl SigningKey {
             SigningKey::Ed25519(_) => COSE_ALG_EDDSA,
             SigningKey::Es256(_) => COSE_ALG_ES256,
             SigningKey::MlDsa(k) => mldsa_alg(&k.params).unwrap_or(COSE_ALG_ML_DSA_44),
+            SigningKey::SlhDsa(k) => slhdsa_alg(&k.params).unwrap_or(COSE_ALG_SLH_DSA_SHAKE_128S),
         }
     }
 
@@ -371,6 +404,7 @@ impl SigningKey {
             SigningKey::Ed25519(_) => "EdDSA",
             SigningKey::Es256(_) => "ES256",
             SigningKey::MlDsa(k) => k.params.name,
+            SigningKey::SlhDsa(k) => k.params.name,
         }
     }
 
@@ -382,6 +416,7 @@ impl SigningKey {
             SigningKey::Ed25519(k) => k.public_key().to_vec(),
             SigningKey::Es256(k) => k.public_key().to_vec(),
             SigningKey::MlDsa(k) => k.public.clone(),
+            SigningKey::SlhDsa(k) => k.public.clone(),
         }
     }
 
@@ -395,6 +430,10 @@ impl SigningKey {
             // and the purpose. A second, redundant label that a verifier would
             // have to guess is worse than none.
             SigningKey::MlDsa(k) => crate::mldsa::sign(k, message, b"")
+                .expect("an empty context and a well-formed key cannot fail"),
+            // The same empty context, for the same reason: §12.5.2's payload
+            // already names the container and the purpose.
+            SigningKey::SlhDsa(k) => crate::slhdsa::sign(k, message, b"")
                 .expect("an empty context and a well-formed key cannot fail"),
         }
     }
@@ -457,10 +496,34 @@ fn verify_with_key(public: &[u8], alg: i64, message: &[u8], signature: &[u8]) ->
             }
             Ok(())
         }
+        a if slhdsa_params(a).is_some() => {
+            let p = slhdsa_params(a).expect("just matched");
+            if public.len() != p.public_key_len() {
+                return Err(Error::Malformed(format!(
+                    "{} public keys are {} bytes, got {}",
+                    p.name,
+                    p.public_key_len(),
+                    public.len()
+                )));
+            }
+            if signature.len() != p.signature_len() {
+                return Err(Error::Malformed(format!(
+                    "{} signatures are {} bytes, got {}",
+                    p.name,
+                    p.signature_len(),
+                    signature.len()
+                )));
+            }
+            if !crate::slhdsa::verify(&p, public, message, b"", signature) {
+                return Err(Error::Malformed("signature does not verify".into()));
+            }
+            Ok(())
+        }
         other => Err(Error::Unsupported(format!(
             "COSE algorithm {other}; this build implements EdDSA ({COSE_ALG_EDDSA}), \
              ES256 ({COSE_ALG_ES256}) and ML-DSA ({COSE_ALG_ML_DSA_44}, \
-             {COSE_ALG_ML_DSA_65}, {COSE_ALG_ML_DSA_87}), and an \
+             {COSE_ALG_ML_DSA_65}, {COSE_ALG_ML_DSA_87}) and SLH-DSA-SHAKE-128s/f \
+             ({COSE_ALG_SLH_DSA_SHAKE_128S}, {COSE_ALG_SLH_DSA_SHAKE_128F}), and an \
              unsupported algorithm is indeterminate rather than invalid (§15.1)"
         ))),
     }
@@ -529,6 +592,8 @@ impl Signature {
             Ok(COSE_ALG_ML_DSA_65) => "ML-DSA-65",
             Ok(COSE_ALG_ML_DSA_87) => "ML-DSA-87",
             Ok(COSE_ALG_ES384) => "ES384",
+            Ok(COSE_ALG_SLH_DSA_SHAKE_128S) => "SLH-DSA-SHAKE-128s",
+            Ok(COSE_ALG_SLH_DSA_SHAKE_128F) => "SLH-DSA-SHAKE-128f",
             _ => "EdDSA",
         };
         Signature {
@@ -1353,6 +1418,44 @@ mod tests {
         assert_eq!(v.invalid_count(), 0);
         assert!(v.outcomes[0].indeterminate);
         assert!(v.outcomes[0].message.contains("-35"));
+    }
+
+    #[test]
+    fn an_slh_dsa_signature_verifies_through_the_same_path() {
+        // §12.5.1's fourth algorithm, end to end. Only the fast set here: the
+        // `s` set signs identically and takes a hundred times as long, which is
+        // the trade the suffix names and not something a unit test needs to
+        // re-measure.
+        let algo = HashAlgo::default();
+        let m = manifest();
+        let params = crate::slhdsa::SHAKE_128F;
+        let kp = crate::slhdsa::keygen(&params, &[4u8; 16], &[5u8; 16], &[6u8; 16]);
+        let public = kp.public.clone();
+        let signer = SigningKey::SlhDsa(Box::new(kp));
+        assert_eq!(signer.alg_name(), params.name);
+        let cose = sign_cose_with(&signer, &tbs_for(&m, algo, 1));
+        assert_eq!(cose.alg().unwrap(), COSE_ALG_SLH_DSA_SHAKE_128F);
+        let sig = Signature::new(&cose);
+        assert_eq!(sig.alg, params.name);
+        assert_eq!(cose.signature.len(), params.signature_len());
+        let v = verify_signatures(
+            std::slice::from_ref(&sig),
+            &signing_root(&m, algo),
+            &canonical_digest(&m, algo, &|d| d == &[2u8; 32]),
+            &Policy::keys(vec![TrustedKey::from_bytes(public)]),
+        );
+        assert!(v.satisfied, "{:?}", v.outcomes);
+
+        // An SLH-DSA public key is 32 bytes, the same length as an Ed25519 one.
+        // The algorithm in the protected header is what separates them, so a
+        // genuine Ed25519 key of that length must not verify this.
+        let v = verify_signatures(
+            &[sig],
+            &signing_root(&m, algo),
+            &canonical_digest(&m, algo, &|d| d == &[2u8; 32]),
+            &Policy::keys(vec![TrustedKey::new(key(11).public_key())]),
+        );
+        assert!(!v.satisfied);
     }
 
     #[test]

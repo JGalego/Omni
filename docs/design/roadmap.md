@@ -332,7 +332,7 @@ Deliverables:
 - Verified streaming (Bao) end to end; progressive load.
 - `omni mount` (FUSE) with synthesized safetensors and tokenizer views.
 - `omni serve`: an object server. ✅
-- Signatures (Ed25519 ✅, ES256 ✅, ML-DSA ✅), Sigstore keyless, in-toto/SLSA
+- Signatures (Ed25519 ✅, ES256 ✅, ML-DSA ✅, SLH-DSA ✅), Sigstore keyless, in-toto/SLSA
   provenance, revocation ✅.
 - Published benchmark suite (§performance.10).
 
@@ -405,10 +405,10 @@ What the gate actually asks for is still untouched: there is no mirror of 10 000
 models, and no dedup, delta-size, load-time or TTFT figures over real ones. There
 is no `mount` and no `by-novelty` partitioning. The signature stack of §12.5 is implemented (Ed25519, ES256 and
 ML-DSA in all three parameter sets, COSE_Sign1, trust policies) and has had no
-third-party review — though ML-DSA is checked against NIST's own ACVP
-known-answer vectors, which is a different and better assurance than review of
-the other two have. SLH-DSA is not implemented, and a container signed with one
-is reported indeterminate by name. The distribution
+third-party review — though ML-DSA and SLH-DSA are both checked against NIST's
+own ACVP known-answer vectors, which is a different and better assurance than
+review of the classical two have. What remains unimplemented in §12.5.1 is
+SLH-DSA's SHA2 parameter sets and RSA-PSS, each reported indeterminate by name. The distribution
 *mechanisms* are now demonstrated rather than claimed; the distribution
 *measurements* are what remains, and they need a corpus rather than more code.
 

@@ -1,7 +1,7 @@
 The files in this directory are derived from test vectors published by the
 National Institute of Standards and Technology (NIST) in the ACVP-Server
 project, https://github.com/usnistgov/ACVP-Server, under
-gen-val/json-files/ML-DSA-{keyGen,sigGen,sigVer}-FIPS204/internalProjection.json.
+gen-val/json-files/SLH-DSA-{keyGen,sigGen,sigVer}-FIPS205/internalProjection.json.
 
 NIST is acknowledged as the source, as its terms ask.
 

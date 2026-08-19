@@ -3666,7 +3666,7 @@ jobs:
       # vectors for FIPS 204. The vector test runs in `cargo test`; this step
       # checks the other half — that the algorithm is reachable from the CLI and
       # survives a real container, which is what a user actually does with it.
-      - name: ML-DSA signs a real container, and every parameter set round-trips
+      - name: The post-quantum algorithms sign real containers and match NIST
         run: |
           OMNI=reference/target/release/omni
           SEED=$(python3 -c "print('a7'*32)")
@@ -3697,7 +3697,38 @@ jobs:
           # A signature this build cannot check must be indeterminate, not
           # invalid (§15.1). SLH-DSA is §12.5.1's MAY-level algorithm and is the
           # one deliberately left unimplemented to keep that path exercised.
-          echo "all three ML-DSA parameter sets signed, verified and reproduced"
+          # SLH-DSA, §12.5.1's other post-quantum algorithm. Both sets the CLI
+          # offers, and the `s` one signs in seconds rather than milliseconds,
+          # which is the whole reason there are two.
+          for alg in slh-dsa-128s slh-dsa-128f; do
+            "$OMNI" keygen --alg "$alg" --seed "$SEED" --out "/tmp/pq-$alg.hex" >/dev/null
+            "$OMNI" sign /tmp/pq.omni --key "$SEED" --alg "$alg" -o "/tmp/pq-$alg.omni" >/dev/null
+            "$OMNI" sign --verify "/tmp/pq-$alg.omni" --key "@/tmp/pq-$alg.hex" \
+              > "/tmp/pq-$alg.txt"
+            grep -q 'policy satisfied' "/tmp/pq-$alg.txt"
+            "$OMNI" sign /tmp/pq.omni --key "$SEED" --alg "$alg" -o "/tmp/pq-$alg-2.omni" >/dev/null
+            cmp "/tmp/pq-$alg.omni" "/tmp/pq-$alg-2.omni"
+          done
+
+          # An SLH-DSA public key is 32 bytes, exactly an Ed25519 key's length, so
+          # the protected header rather than the length has to be what decides.
+          "$OMNI" keygen --alg ed25519 --seed "$SEED" --out /tmp/pq-ed.hex >/dev/null
+          if "$OMNI" sign --verify /tmp/pq-slh-dsa-128f.omni --key @/tmp/pq-ed.hex \
+               > /tmp/pq-cross.txt 2>&1; then
+            echo "::error::an SLH-DSA signature verified under an Ed25519 key"
+            cat /tmp/pq-cross.txt; exit 1
+          fi
+
+          # And the whole vector suite in release, where nothing is skipped: the
+          # `s` parameter sets' key generation is a minute each without
+          # optimisation, so `cargo test` skips them and says so, and this is the
+          # run that does not.
+          cargo test --release --manifest-path reference/Cargo.toml \
+            -p omni-core --test slhdsa_vectors --test mldsa_vectors -- --nocapture \
+            | tee /tmp/pqc.txt
+          grep -q 'keyGen: 6 of 6 vectors' /tmp/pqc.txt
+
+          echo "ML-DSA and SLH-DSA: signed, verified, reproduced, and checked against NIST"
 
       - name: ES256 agrees with a real ECDSA implementation, both ways
         run: |
@@ -4106,12 +4137,16 @@ jobs:
           # `-` belongs in the class: without it a hyphenated path does not fail
           # this check, it silently stops being covered by it, which is the worse
           # of the two outcomes because it looks like a pass.
-          paths = re.findall(r'^  ([A-Za-z0-9_.\-/]+(?:\*\*)?)\s{2,}\S', text, re.M)
-          # 14 rows in the table plus the one third-party directory called out
-          # under "Third-party material", which carries NIST's terms rather than
-          # either of ours and still has to be a path that exists.
-          if len(paths) != 15:
-              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 15; the table has '
+          # The trailing context is a lookahead, not a match: consuming it eats
+          # the start of the *next* line, so two path lines in a row silently
+          # counted as one. Adding the slhdsa directory beside the mldsa one is
+          # what surfaced that — the count stayed put instead of going up.
+          paths = re.findall(r'^  ([A-Za-z0-9_.\-/]+(?:\*\*)?)(?=\s{2,}\S)', text, re.M)
+          # 14 rows in the table plus the two third-party directories called out
+          # under "Third-party material", which carry NIST's terms rather than
+          # either of ours and still have to be paths that exist.
+          if len(paths) != 16:
+              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 16; the table has '
                                      'changed shape and this check may no longer read all of it'))
           for p in paths:
               root = p.split('/')[0].replace('**', '')

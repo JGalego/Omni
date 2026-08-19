@@ -248,7 +248,9 @@ VERBS:
     plan    <file> [--caps caps.cbor] [--objective O] [--memory N]
                               [--optimistic] [--allow-lossy]
                               Resolve a model against a runtime (§10.5)
-    keygen  [--out key.hex] [--seed <hex>] [--alg ed25519|es256|ml-dsa-44|ml-dsa-65|ml-dsa-87]
+    keygen  [--out key.hex] [--seed <hex>]
+                              [--alg ed25519|es256|ml-dsa-44|ml-dsa-65|ml-dsa-87|
+                                     slh-dsa-128s|slh-dsa-128f]
                               Make a signing key (§12.5.1). ES256 is the one an
                               HSM, a KMS and a WebPKI certificate already speak
     sign    <file> --key <hex> [--alg ed25519|es256|ml-dsa-44|..] [-o <out.omni>]
@@ -7944,6 +7946,36 @@ fn mldsa_params(spelling: &str) -> Option<omni_core::mldsa::Params> {
     }
 }
 
+/// The `--alg` spellings for SLH-DSA. Only the two 128-bit SHAKE sets, because
+/// those are the two with a COSE identifier here; the other four are implemented
+/// and reachable through the library, and a container signed with one would have
+/// no algorithm number to record.
+fn slhdsa_params(spelling: &str) -> Option<omni_core::slhdsa::Params> {
+    let norm: String = spelling
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    match norm.as_str() {
+        "slhdsa128s" | "slhdsashake128s" | "slhdsa" => Some(omni_core::slhdsa::SHAKE_128S),
+        "slhdsa128f" | "slhdsashake128f" => Some(omni_core::slhdsa::SHAKE_128F),
+        _ => None,
+    }
+}
+
+/// The three seeds FIPS 205 takes, derived from one 32-byte `--seed` so the CLI
+/// has one thing to hand a user. SLH-DSA's seeds are independent inputs, not a
+/// hierarchy, so they are separated by domain rather than by truncation — the
+/// same seed must not appear twice under different roles.
+fn slhdsa_seeds(
+    params: &omni_core::slhdsa::Params,
+    seed: &[u8; 32],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let expand =
+        |label: &[u8]| omni_core::shake::shake256(&[b"omni/slh-dsa", label, seed], params.n);
+    (expand(b"sk.seed"), expand(b"sk.prf"), expand(b"pk.seed"))
+}
+
 /// `--arch-param k=v`, repeatable, for the `arch.params` of §06.2.
 ///
 /// Naming a family without its parameters produces a container `graph
@@ -8064,6 +8096,12 @@ fn cmd_keygen(args: &[String]) -> R {
             let sk = omni_core::p256::from_seed(&seed);
             ("ES256", hex(&sk.public_key()), hex(&sk.to_bytes()))
         }
+        other if slhdsa_params(other).is_some() => {
+            let params = slhdsa_params(other).expect("just matched");
+            let (sk_seed, sk_prf, pk_seed) = slhdsa_seeds(&params, &seed);
+            let kp = omni_core::slhdsa::keygen(&params, &sk_seed, &sk_prf, &pk_seed);
+            (params.name, hex(&kp.public), hex(&seed))
+        }
         other if mldsa_params(other).is_some() => {
             let params = mldsa_params(other).expect("just matched");
             let kp = omni_core::mldsa::keygen(&params, &seed);
@@ -8076,7 +8114,7 @@ fn cmd_keygen(args: &[String]) -> R {
         other => {
             prr!(
                 "omni: unknown --alg `{other}`. §12.5 names ed25519, es256 and \
-                 ml-dsa (44, 65, 87)\n"
+                 ml-dsa (44, 65, 87) and slh-dsa (128s, 128f)\n"
             );
             return Ok(2);
         }
@@ -8164,7 +8202,8 @@ fn cmd_sign(args: &[String]) -> R {
             {
                 return Err(
                     "--key takes 32 bytes of hex (Ed25519), 65 (uncompressed ES256), \
-                     or 1312/1952/2592 (ML-DSA-44/65/87); `@path` reads a keygen file"
+                     1312/1952/2592 (ML-DSA-44/65/87), or 32/48/64 (SLH-DSA); \
+                     `@path` reads a keygen file"
                         .into(),
                 );
             }
@@ -8259,6 +8298,13 @@ fn cmd_sign(args: &[String]) -> R {
         "es256" | "ES256" | "p256" => {
             omni_core::sign::SigningKey::Es256(omni_core::p256::from_seed(&seed))
         }
+        other if slhdsa_params(other).is_some() => {
+            let params = slhdsa_params(other).expect("just matched");
+            let (sk_seed, sk_prf, pk_seed) = slhdsa_seeds(&params, &seed);
+            omni_core::sign::SigningKey::SlhDsa(Box::new(omni_core::slhdsa::keygen(
+                &params, &sk_seed, &sk_prf, &pk_seed,
+            )))
+        }
         other if mldsa_params(other).is_some() => {
             let params = mldsa_params(other).expect("just matched");
             omni_core::sign::SigningKey::MlDsa(Box::new(omni_core::mldsa::keygen(&params, &seed)))
@@ -8266,7 +8312,7 @@ fn cmd_sign(args: &[String]) -> R {
         other => {
             prr!(
                 "omni: unknown --alg `{other}`. §12.5 names ed25519, es256 and \
-                 ml-dsa (44, 65, 87)\n"
+                 ml-dsa (44, 65, 87) and slh-dsa (128s, 128f)\n"
             );
             return Ok(2);
         }

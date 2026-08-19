@@ -9,7 +9,7 @@
 //! perfectly uniform-looking polynomials, valid-looking keys, and signatures that
 //! verify. Against NIST's vectors, both fail on the first byte.
 //!
-//! Fixtures come from `tools/mldsa-vectors.py`; see that file for provenance.
+//! Fixtures come from `tools/acvp-vectors.py`; see that file for provenance.
 
 use std::collections::BTreeMap;
 

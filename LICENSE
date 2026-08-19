@@ -41,9 +41,10 @@ Third-party material
 --------------------
 
 There is no vendored third-party *code* in this repository, because there are no
-dependencies to vendor. There is one piece of third-party *data*:
+dependencies to vendor. There are two directories of third-party *data*:
 
   reference/omni-core/tests/vectors/mldsa/
+  reference/omni-core/tests/vectors/slhdsa/
       Test vectors derived from NIST's ACVP-Server, redistributed under NIST's
       own terms rather than under either licence above. Those terms permit
       copying and modification provided the notice is kept intact and NIST is
@@ -51,7 +52,7 @@ dependencies to vendor. There is one piece of third-party *data*:
       which also states what was changed. Software written by NIST employees is
       not subject to copyright protection within the United States.
 
-That directory is the exception to the table above, and it is called out here
+Those directories are the exception to the table above, and it is called out here
 rather than left to be inferred from the table's silence — an unlisted file is a
 file whose terms somebody has to guess at.
 
