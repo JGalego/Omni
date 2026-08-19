@@ -412,15 +412,26 @@ pub fn analyze(base: &Tensor, tuned: &Tensor, opts: &Options) -> Res<Plan> {
         });
     }
 
-    // low-rank — lossy unless the change genuinely was low-rank.
+    // low-rank — lossy unless the change genuinely was low-rank. The search
+    // extends one component at a time from a running residual rather than
+    // refactorizing from scratch per candidate rank: power iteration with
+    // deflation is sequential, so rank r's first r−1 components are rank
+    // r−1's, and recomputing them made the search quadratic in rank — with
+    // the worst case, a full fine-tune where *no* rank passes, being the
+    // common case over real base/fine-tune pairs. Same components, same
+    // seeding, once each.
     if approximable && tuned.shape.len() == 2 {
         let (rows, cols) = (tuned.shape[0] as usize, tuned.shape[1] as usize);
         let max_rank = opts.max_rank.min(rows.min(cols));
+        let mut lr = LowRank::start(&diff, rows, cols, opts.seed);
         for rank in 1..=max_rank {
-            let (b, a) = low_rank(&diff, rows, cols, rank, opts.seed);
-            let err = residual_error(&diff, &b, &a, rows, cols, rank) / scale;
+            if !lr.extend() {
+                break; // the residual has no signal left to extract
+            }
+            let err = lr.residual_max() / scale;
             let bytes = ((rows + cols) * rank) as u64 * opts.store_dtype.packed_bytes(1);
             if err <= opts.max_err {
+                let (b, a) = lr.factors();
                 candidates.push(Plan {
                     kind: Kind::LowRank,
                     max_rel_err: err,
@@ -607,70 +618,110 @@ pub fn chunk_diff(a: &[u8], b: &[u8], chunk: u64) -> (Vec<u64>, u64) {
     (changed, total)
 }
 
-/// A deterministic rank-`r` factorization of `diff` by power iteration with
-/// deflation: `diff ≈ B @ A`.
+/// An incremental deterministic factorization of `diff` by power iteration
+/// with deflation: after `k` calls to [`LowRank::extend`], `diff ≈ B @ A` at
+/// rank `k`, and the running residual *is* `diff − B @ A`, so the error a
+/// candidate rank would leave is a read rather than a recomputation.
 ///
 /// Not a general SVD, and not trying to be: it converges on the dominant
 /// subspace, which is exactly the case §08.6 cares about (a change that came
-/// from a low-rank update). The seed fixes the starting vector so two runs of
-/// `omni delta` produce the same factors and therefore the same digests.
-fn low_rank(
-    diff: &[f64],
+/// from a low-rank update). The seed fixes each component's starting vector so
+/// two runs of `omni delta` produce the same factors and therefore the same
+/// digests.
+struct LowRank {
+    residual: Vec<f64>,
     rows: usize,
     cols: usize,
-    rank: usize,
     seed: u64,
-) -> (Vec<f64>, Vec<f64>) {
-    let mut residual = diff.to_vec();
-    let mut b = vec![0.0f64; rows * rank];
-    let mut a = vec![0.0f64; rank * cols];
-    for k in 0..rank {
+    /// Extracted components, `u` carrying its σ, matching what the old
+    /// per-rank refactorization produced.
+    us: Vec<Vec<f64>>,
+    vs: Vec<Vec<f64>>,
+}
+
+impl LowRank {
+    fn start(diff: &[f64], rows: usize, cols: usize, seed: u64) -> Self {
+        LowRank {
+            residual: diff.to_vec(),
+            rows,
+            cols,
+            seed,
+            us: Vec::new(),
+            vs: Vec::new(),
+        }
+    }
+
+    /// Extracts the next component from the residual and deflates. Returns
+    /// `false` when there is no signal left, in which case nothing was added.
+    fn extend(&mut self) -> bool {
+        let (rows, cols) = (self.rows, self.cols);
+        let k = self.us.len();
         // Start from a reproducible pseudo-random vector.
         let mut v: Vec<f64> = (0..cols)
-            .map(|j| crate::expr::uniform01(seed ^ (k as u64 + 1), j as u64) - 0.5)
+            .map(|j| crate::expr::uniform01(self.seed ^ (k as u64 + 1), j as u64) - 0.5)
             .collect();
         normalize(&mut v);
         let mut u = vec![0.0f64; rows];
         for _ in 0..64 {
             // u = M v
-            for i in 0..rows {
-                u[i] = (0..cols).map(|j| residual[i * cols + j] * v[j]).sum();
+            for (i, ui) in u.iter_mut().enumerate() {
+                *ui = (0..cols).map(|j| self.residual[i * cols + j] * v[j]).sum();
             }
             if normalize(&mut u) == 0.0 {
-                break;
+                return false;
             }
             // v = M^T u
-            for j in 0..cols {
-                v[j] = (0..rows).map(|i| residual[i * cols + j] * u[i]).sum();
+            for (j, vj) in v.iter_mut().enumerate() {
+                *vj = (0..rows).map(|i| self.residual[i * cols + j] * u[i]).sum();
             }
             if normalize(&mut v) == 0.0 {
-                break;
+                return false;
             }
         }
         // sigma = u^T M v
         let mut sigma = 0.0f64;
-        for i in 0..rows {
-            for j in 0..cols {
-                sigma += u[i] * residual[i * cols + j] * v[j];
+        for (i, ui) in u.iter().enumerate() {
+            for (j, vj) in v.iter().enumerate() {
+                sigma += ui * self.residual[i * cols + j] * vj;
             }
         }
         if sigma.abs() < 1e-300 {
-            break;
-        }
-        for i in 0..rows {
-            b[i * rank + k] = u[i] * sigma;
-        }
-        for j in 0..cols {
-            a[k * cols + j] = v[j];
+            return false;
         }
         // Deflate.
-        for i in 0..rows {
-            for j in 0..cols {
-                residual[i * cols + j] -= sigma * u[i] * v[j];
+        for (i, ui) in u.iter().enumerate() {
+            for (j, vj) in v.iter().enumerate() {
+                self.residual[i * cols + j] -= sigma * ui * vj;
             }
         }
+        for ui in u.iter_mut() {
+            *ui *= sigma;
+        }
+        self.us.push(u);
+        self.vs.push(v);
+        true
     }
-    (b, a)
+
+    /// The largest absolute entry of `diff − B @ A` at the current rank.
+    fn residual_max(&self) -> f64 {
+        self.residual.iter().fold(0.0f64, |m, x| m.max(x.abs()))
+    }
+
+    /// Materializes `B` (`rows × k`, σ folded in) and `A` (`k × cols`).
+    fn factors(&self) -> (Vec<f64>, Vec<f64>) {
+        let k = self.us.len();
+        let mut b = vec![0.0f64; self.rows * k];
+        let mut a = vec![0.0f64; k * self.cols];
+        for (kk, (u, v)) in self.us.iter().zip(&self.vs).enumerate() {
+            for (i, ui) in u.iter().enumerate() {
+                b[i * k + kk] = *ui;
+            }
+            for (j, vj) in v.iter().enumerate() {
+                a[kk * self.cols + j] = *vj;
+            }
+        }
+        (b, a)
+    }
 }
 
 fn normalize(v: &mut [f64]) -> f64 {
@@ -681,28 +732,6 @@ fn normalize(v: &mut [f64]) -> f64 {
         }
     }
     n
-}
-
-/// The largest absolute residual of `diff - B @ A`.
-fn residual_error(
-    diff: &[f64],
-    b: &[f64],
-    a: &[f64],
-    rows: usize,
-    cols: usize,
-    rank: usize,
-) -> f64 {
-    let mut worst = 0.0f64;
-    for i in 0..rows {
-        for j in 0..cols {
-            let mut approx = 0.0;
-            for k in 0..rank {
-                approx += b[i * rank + k] * a[k * cols + j];
-            }
-            worst = worst.max((diff[i * cols + j] - approx).abs());
-        }
-    }
-    worst
 }
 
 // -------------------------------------------------------------------- reports --
