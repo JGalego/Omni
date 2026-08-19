@@ -3744,12 +3744,9 @@ jobs:
             fi
           done
 
-          # A signature this build cannot check must be indeterminate, not
-          # invalid (§15.1). SLH-DSA is §12.5.1's MAY-level algorithm and is the
-          # one deliberately left unimplemented to keep that path exercised.
-          # SLH-DSA, §12.5.1's other post-quantum algorithm. Both sets the CLI
-          # offers, and the `s` one signs in seconds rather than milliseconds,
-          # which is the whole reason there are two.
+          # SLH-DSA, §12.5.1's other post-quantum algorithm: both of the sets the
+          # CLI offers as container signatures, the `s` one signing in seconds
+          # rather than milliseconds, which is the whole reason there are two.
           for alg in slh-dsa-128s slh-dsa-128f; do
             "$OMNI" keygen --alg "$alg" --seed "$SEED" --out "/tmp/pq-$alg.hex" >/dev/null
             "$OMNI" sign /tmp/pq.omni --key "$SEED" --alg "$alg" -o "/tmp/pq-$alg.omni" >/dev/null
@@ -3772,11 +3769,12 @@ jobs:
           # And the whole vector suite in release, where nothing is skipped: the
           # `s` parameter sets' key generation is a minute each without
           # optimisation, so `cargo test` skips them and says so, and this is the
-          # run that does not.
+          # run that does not. All twelve sets — the six SHAKE and the six SHA2 —
+          # generate keys against NIST here.
           cargo test --release --manifest-path reference/Cargo.toml \
             -p omni-core --test slhdsa_vectors --test mldsa_vectors -- --nocapture \
             | tee /tmp/pqc.txt
-          grep -q 'keyGen: 6 of 6 vectors' /tmp/pqc.txt
+          grep -q 'keyGen: 12 of 12 vectors' /tmp/pqc.txt
 
           echo "ML-DSA and SLH-DSA: signed, verified, reproduced, and checked against NIST"
 
