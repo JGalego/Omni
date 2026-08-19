@@ -10,7 +10,7 @@ what follows is how to satisfy them.
 
 ```console
 $ cd reference
-$ cargo test --all --all-features          # 658 tests, about 40 seconds
+$ cargo test --all --all-features          # 660 tests, about 40 seconds
 $ cargo fmt --all
 $ cargo clippy --all-targets --all-features -- -D warnings
 ```

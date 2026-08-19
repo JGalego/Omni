@@ -331,6 +331,22 @@ implemented:
   Concatenating the layers reproduces the container byte for byte, and importing
   verifies every blob against the digest that named it before anything becomes a
   file
+- §01.9 **pack partitioning**, all five strategies, as `omni pack --strategy`:
+  `linear`, `by-tensor`, `by-layer`, `by-dtype` and `by-novelty`. A strategy is a
+  deterministic *ordering* of the data objects — the container writer takes a
+  grouping and writes one run per group, so R-W1's byte-reproducibility holds for
+  every strategy and the object set and the root digest are identical whichever
+  is chosen, which is §01.2's point that identity is content and not layout.
+  `by-novelty` takes `--base` and puts what the base already has last. What that
+  buys is stated precisely where it is implemented, because the obvious reading of
+  it is wrong: it does *not* make two independently packed containers share blobs,
+  and no ordering rule could. It changes which layers a client has to *ask* for —
+  digest order is uncorrelated with novelty, so packed `linear` the new objects
+  are smeared across nearly every layer, and grouped by novelty they are one
+  contiguous run. `oci::fetch_plan` computes what a client holding the base still
+  has to fetch, and the test compares the two layouts of the same objects rather
+  than asserting the improvement: **2 of 10 layers and 1.1 MB against `linear`'s 5
+  of 10 and 4.2 MB**
 - §13.5 **the registry client**, which was the missing half: `omni oci push` and
   `omni oci pull` over the distribution API, with credentials, **chunked blob
   uploads** and the **referrers API**, tested in CI against a real `registry:2`
@@ -782,7 +798,7 @@ it.
 
 ## Tests
 
-658 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+660 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -1085,7 +1101,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 658 passed; 0 failed
+test result: ok. 660 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

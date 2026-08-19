@@ -326,9 +326,10 @@ second framework; what they no longer need is code.
 Deliverables:
 - HTTP and object-store stores with range coalescing and resumption.
 - OCI push/pull with `by-novelty` pack partitioning; referrers for adapters and
-  signatures. ◐ (the mapping, the layout and the client exist and CI pushes to a
-  real registry, with credentials, chunked uploads and the referrers API;
-  `by-novelty` partitioning does not)
+  signatures. ✅ (the mapping, the layout and the client exist and CI pushes to a
+  real registry, with credentials, chunked uploads and the referrers API; all five
+  of §01.9's partitioning strategies are `omni pack --strategy`, and `oci::fetch_plan`
+  measures what a client holding the base still has to fetch)
 - Verified streaming (Bao) end to end; progressive load.
 - `omni mount` (FUSE) with synthesized safetensors and tokenizer views.
 - `omni serve`: an object server. ✅
@@ -403,7 +404,7 @@ real model, over a real link.
 
 What the gate actually asks for is still untouched: there is no mirror of 10 000
 models, and no dedup, delta-size, load-time or TTFT figures over real ones. There
-is no `mount` and no `by-novelty` partitioning. The signature stack of §12.5 is implemented (Ed25519, ES256 and
+is no `mount`. The signature stack of §12.5 is implemented (Ed25519, ES256 and
 ML-DSA in all three parameter sets, COSE_Sign1, trust policies) and has had no
 third-party review — though ML-DSA and SLH-DSA are both checked against NIST's
 own ACVP known-answer vectors, which is a different and better assurance than

@@ -171,6 +171,7 @@ fn roundtrip() -> Vec<Case> {
         creator: "omni-conformance".into(),
         reproducible: true,
         codec,
+        blob_groups: Vec::new(),
     };
     // Several tensors of different sizes, so the index is sorted by digest and
     // the payloads are not: a writer that emits objects in index order writes a
@@ -236,6 +237,7 @@ fn valid_features() -> Vec<Case> {
         creator: "omni-conformance".into(),
         reproducible: true,
         codec,
+        blob_groups: Vec::new(),
     };
 
     // 1. A compressed container. §03.7 makes `zstd` the one codec a reader MUST

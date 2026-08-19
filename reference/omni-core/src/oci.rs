@@ -53,6 +53,28 @@
 //! partial pull land on object edges — but the dedup story lives in the object
 //! graph, not in the slicing.
 //!
+//! ### What `by-novelty` adds, which is a different thing again
+//!
+//! §01.9's partitioning is now implemented (`omni pack --strategy`), and it is
+//! worth saying exactly which of the two mechanisms above it belongs to, because
+//! it belongs to neither quite.
+//!
+//! `by-novelty` does **not** make two independently packed containers share
+//! blobs; the paragraph above still holds and no ordering rule can repeal it.
+//! What it changes is *which layers a client has to ask for*. A client that
+//! already holds the base knows the digests it holds, and the `.omni.idx`
+//! sidecar (§13.4.1) tells it which byte ranges hold what — so it can compute
+//! the set of layers containing anything it lacks and fetch only those. Packed
+//! in digest order the new objects are smeared across nearly every layer,
+//! because digest order is uncorrelated with novelty, and that set is nearly all
+//! of them. Grouped by novelty the new objects are one contiguous run and the
+//! set is small.
+//!
+//! So the saving is in the *request*, not in the registry's blob store: identical
+//! bytes are still not shared, but a much smaller fraction of them has to move.
+//! [`fetch_plan`] computes that fraction, and the test beside it compares the two
+//! layouts of the same objects rather than asserting the improvement.
+//!
 //! ## What is deliberately not synthesized
 //!
 //! §13.5 shows `subject: <the base model's manifest>` for the OCI referrers API.
@@ -230,6 +252,73 @@ fn index_extent(c: &Container) -> Res<(u64, u64)> {
         return Err(Error::Malformed("an implausible index offset".into()));
     }
     Ok((off, len))
+}
+
+/// What a client that already holds some objects would have to fetch.
+///
+/// This is the number §01.9's partitioning exists to move, so it is a number
+/// this crate reports rather than a property it asserts. A layer is needed when
+/// any object the client lacks falls inside it; the index layer is always needed,
+/// because a reader cannot find anything without it, and layer 0 carries the
+/// header and the structure objects, which are what a reader opens first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchPlan {
+    pub layers_total: usize,
+    pub layers_needed: usize,
+    pub bytes_total: u64,
+    pub bytes_needed: u64,
+    /// Data objects in this container that the client does not already hold.
+    pub objects_missing: usize,
+}
+
+/// Computes the [`FetchPlan`] for a client holding `held`.
+///
+/// `held` is a set of object digests — what a client that already pulled the
+/// base model has. The partitioning strategy the container was *packed* with is
+/// what decides the answer: the same objects laid out in a different order give
+/// the same `objects_missing` and a different `bytes_needed`, which is the whole
+/// claim of §01.9 and is why this is measured against two layouts rather than
+/// stated about one.
+pub fn fetch_plan(
+    c: &Container,
+    opts: &ExportOpts,
+    held: &std::collections::BTreeSet<Digest>,
+) -> Res<FetchPlan> {
+    let (packs, index) = cut_points(c, opts.pack_bytes)?;
+
+    // The extents of every data object the client is missing. Structure objects
+    // are not consulted: they live before the first data object, so they are in
+    // layer 0, which is needed either way.
+    let missing: Vec<Extent> = c
+        .index
+        .iter()
+        .filter(|e| e.otype == otype::BLOB && e.stored_len > 0 && !held.contains(&e.digest))
+        .map(|e| (e.offset, e.offset + e.stored_len))
+        .collect();
+
+    let mut layers_needed = 0usize;
+    let mut bytes_needed = 0u64;
+    let mut bytes_total = 0u64;
+    for (i, (start, end)) in packs.iter().enumerate() {
+        bytes_total += end - start;
+        // Layer 0 holds the header and the structure objects, so it is always
+        // fetched; any other layer only when it carries something missing.
+        let needed = i == 0 || missing.iter().any(|(s, e)| s < end && e > start);
+        if needed {
+            layers_needed += 1;
+            bytes_needed += end - start;
+        }
+    }
+    // The index layer, always.
+    bytes_total += index.1 - index.0;
+    bytes_needed += index.1 - index.0;
+    Ok(FetchPlan {
+        layers_total: packs.len() + 1,
+        layers_needed: layers_needed + 1,
+        bytes_total,
+        bytes_needed,
+        objects_missing: missing.len(),
+    })
 }
 
 /// Options for the mapping. Reproducibility is not one of them: the layout is a
@@ -612,7 +701,11 @@ mod tests {
             .collect()
     }
 
-    fn model(name: &str, fill: u8, tensors: usize) -> Container {
+    fn build_model(
+        name: &str,
+        fill: u8,
+        tensors: usize,
+    ) -> (Vec<crate::container::Object>, Digest) {
         let mut b = ModelBuilder::new(name);
         for i in 0..tensors {
             b = b.tensor(TensorSpec {
@@ -625,8 +718,20 @@ mod tests {
                 layout: None,
             });
         }
-        let (objs, root) = b.build();
+        b.build()
+    }
+
+    fn model(name: &str, fill: u8, tensors: usize) -> Container {
+        let (objs, root) = build_model(name, fill, tensors);
         Container::open(pack(&objs, &root, &PackOptions::default()).unwrap()).unwrap()
+    }
+
+    fn data_digests(c: &Container) -> std::collections::BTreeSet<Digest> {
+        c.index
+            .iter()
+            .filter(|e| e.otype == otype::BLOB && e.stored_len > 0)
+            .map(|e| e.digest)
+            .collect()
     }
 
     fn layout_reader(l: &Layout) -> impl Fn(&str) -> Option<Vec<u8>> + '_ {
@@ -635,6 +740,117 @@ mod tests {
                 .iter()
                 .find(|(p, _)| p == rel)
                 .map(|(_, b)| b.clone())
+        }
+    }
+
+    /// §01.9's `by-novelty`, measured rather than asserted.
+    ///
+    /// A fine-tune that shares most of its weights with a base is the case the
+    /// strategy exists for. Packed `linear` the shared objects land in digest
+    /// order, which is uncorrelated with novelty, so the few new objects are
+    /// smeared across nearly every layer and a client holding the base has to
+    /// fetch nearly all of them. Grouped by novelty the new objects are one
+    /// contiguous run, and the layers that hold only inherited objects can be
+    /// skipped. The assertion is a comparison between the two layouts of *the
+    /// same objects*, because that isolates the ordering as the only cause.
+    #[test]
+    fn by_novelty_puts_the_inherited_objects_in_layers_a_client_can_skip() {
+        let base = model("test/base", 0, 32);
+        let held = data_digests(&base);
+
+        // The fine-tune: the same 32 tensors, plus 4 the base has never seen.
+        let (objs, root) = build_model("test/finetune", 0, 36);
+        let opts = ExportOpts {
+            pack_bytes: MIN_PACK_BYTES,
+            reference: None,
+        };
+
+        let linear = Container::open(pack(&objs, &root, &PackOptions::default()).unwrap()).unwrap();
+        let pl = fetch_plan(&linear, &opts, &held).unwrap();
+
+        // Novel first: layer 0 carries the header and the structure objects and
+        // is fetched no matter what, so the new data may as well start there.
+        let novel: std::collections::BTreeSet<Digest> =
+            data_digests(&linear).difference(&held).copied().collect();
+        assert_eq!(novel.len(), 4, "the fine-tune should have four new tensors");
+        let po = PackOptions {
+            blob_groups: vec![novel.clone(), held.clone()],
+            ..Default::default()
+        };
+        let sorted = Container::open(pack(&objs, &root, &po).unwrap()).unwrap();
+        let pn = fetch_plan(&sorted, &opts, &held).unwrap();
+
+        // Same objects either way — only their order in the file differs. If this
+        // failed the comparison below would be measuring two different models.
+        assert_eq!(data_digests(&linear), data_digests(&sorted));
+        assert_eq!(pl.objects_missing, pn.objects_missing);
+        assert_eq!(pl.objects_missing, 4);
+        assert_eq!(pl.layers_total, pn.layers_total);
+
+        assert!(
+            pn.layers_needed < pl.layers_needed,
+            "by-novelty needed {} of {} layers, linear needed {}",
+            pn.layers_needed,
+            pn.layers_total,
+            pl.layers_needed
+        );
+        assert!(
+            pn.bytes_needed < pl.bytes_needed,
+            "by-novelty needed {} bytes, linear needed {}",
+            pn.bytes_needed,
+            pl.bytes_needed
+        );
+        // And the win is the one claimed: what has to come down is close to the
+        // novel payload rather than to the whole model.
+        assert!(
+            pn.bytes_needed * 2 < pn.bytes_total,
+            "by-novelty still fetched {} of {} bytes",
+            pn.bytes_needed,
+            pn.bytes_total
+        );
+        println!(
+            "by-novelty: {}/{} layers and {} of {} bytes; linear: {}/{} layers and {} bytes",
+            pn.layers_needed,
+            pn.layers_total,
+            pn.bytes_needed,
+            pn.bytes_total,
+            pl.layers_needed,
+            pl.layers_total,
+            pl.bytes_needed
+        );
+    }
+
+    /// R-W1 reaches the strategies: a grouping re-orders the file and must still
+    /// be a pure function of the inputs, or `by-novelty` would trade dedup for
+    /// reproducibility and be worth less than `linear`.
+    #[test]
+    fn every_partitioning_strategy_is_byte_reproducible() {
+        let (objs, root) = build_model("test/repro", 3, 8);
+        let all = {
+            let c = Container::open(pack(&objs, &root, &PackOptions::default()).unwrap()).unwrap();
+            data_digests(&c)
+        };
+        // A two-group split, a one-group split and a grouping that names a digest
+        // this model does not contain — each has to be stable across runs.
+        let half: std::collections::BTreeSet<Digest> = all.iter().take(4).copied().collect();
+        let absent: std::collections::BTreeSet<Digest> = [[0xabu8; 32]].into_iter().collect();
+        for groups in [
+            vec![],
+            vec![all.clone()],
+            vec![half.clone(), all.clone()],
+            vec![absent, half],
+        ] {
+            let po = PackOptions {
+                blob_groups: groups.clone(),
+                ..Default::default()
+            };
+            let a = pack(&objs, &root, &po).unwrap();
+            let b = pack(&objs, &root, &po).unwrap();
+            assert_eq!(a, b, "{} group(s) packed differently twice", groups.len());
+            // And whatever the order, the container still holds every object.
+            let c = Container::open(a).unwrap();
+            assert_eq!(data_digests(&c), all);
+            crate::container::verify(&c).expect("a re-ordered container is still valid");
         }
     }
 

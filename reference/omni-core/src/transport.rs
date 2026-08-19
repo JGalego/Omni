@@ -254,6 +254,7 @@ pub fn index_only(c: &Container) -> Res<Vec<u8>> {
         reproducible: true,
         hash: c.header.hash,
         codec: crate::codec::Codec::Raw,
+        blob_groups: Vec::new(),
     };
     crate::container::pack_partial(&objects, &absent, &c.header.root_digest, &opts)
         .map_err(|err| Error::Malformed(err.to_string()))

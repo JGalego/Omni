@@ -83,8 +83,14 @@ VERBS:
                               Render the OMNI-CT chat template (§06.9);
                               --inputs lists the variables it reads
     pack    <dir.omnid> -o <file.omni> [--align N] [--codec ID[:level]]
-                              [--creator STRING]
-                              Build a container from a directory store
+                              [--creator STRING] [--strategy S] [--base F.omni]
+                              Build a container from a directory store.
+                              --strategy is §01.9's pack partitioning: linear
+                              (default), by-tensor, by-layer, by-dtype, or
+                              by-novelty, which needs --base and puts the
+                              objects that base already has in trailing packs a
+                              client holding it can skip. Every strategy is a
+                              deterministic ordering, so R-W1 still holds
     unpack  <file.omni> -o <dir.omnid>
                               Explode a container into a directory store
     repack  <file.omni> -o <out.omni> [--codec ID[:level]] [--align N]
@@ -4053,6 +4059,146 @@ fn cmd_repack(args: &[String]) -> R {
 /// `omni pack <dir.omnid> -o <file.omni>` — the inverse. Object types are
 /// recovered by walking from the root, since a directory store has no index to
 /// record them in.
+/// §01.9's pack partitioning strategies, computed as data-object groups.
+///
+/// The packer takes a grouping and writes group 0's objects first, group 1's
+/// next, and so on (see `PackOptions::blob_groups`); which grouping a strategy
+/// name denotes is a question about the *model*, which is why it is answered
+/// here — the CLI can read the tensor table and the caller's `--base` — rather
+/// than inside the container writer, which sees opaque objects.
+///
+/// `linear` returns no groups, which is the packer's own digest order, so it
+/// costs nothing and is the default. The other four each need the graph:
+///
+/// * `by-tensor` — one group per tensor, in load order. A client fetching one
+///   tensor fetches the packs holding it and no others.
+/// * `by-layer`  — tensors grouped by the leading dotted components of their
+///   name, which is what §01.9 means by graph depth for a checkpoint whose
+///   names carry it (`model.layers.0.…`). Names without that structure fall in
+///   one group, which is honest: there is no depth to group by.
+/// * `by-dtype`  — one group per stored dtype, so a mixed-precision partial
+///   fetch can take the f32 packs and leave the int4 ones.
+/// * `by-novelty`— two groups: what `--base` does *not* have, then what it does.
+///   The novel objects go first because layer 0 carries the header and the
+///   structure objects and is fetched no matter what, so it may as well carry
+///   the new data too.
+///
+/// A tensor whose value depends on no stored object contributes nothing, and an
+/// object no tensor reaches ends up in the trailing ungrouped run rather than
+/// being dropped: the grouping is an ordering, never a filter.
+fn blob_groups_for(
+    strategy: &str,
+    src: &DirStore,
+    root: &Digest,
+    base: Option<&str>,
+) -> Result<Vec<std::collections::BTreeSet<Digest>>, Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if strategy == "linear" {
+        return Ok(Vec::new());
+    }
+
+    // `by-novelty` is the one strategy that needs no graph at all: it is a
+    // question about two object sets.
+    if strategy == "by-novelty" {
+        let Some(path) = base else {
+            return Err("--strategy by-novelty needs --base <file.omni>".into());
+        };
+        let b = Container::open(std::fs::read(path)?)?;
+        if b.header.hash != src.hash() {
+            return Err(format!(
+                "--base is a {} container and this one is {}, so their digests \
+                 name different things",
+                b.header.hash.name(),
+                src.hash().name()
+            )
+            .into());
+        }
+        let held: BTreeSet<Digest> = b
+            .index
+            .iter()
+            .filter(|e| e.otype == otype::BLOB)
+            .map(|e| e.digest)
+            .collect();
+        let novel: BTreeSet<Digest> = src
+            .iter()?
+            .into_iter()
+            .filter(|d| !held.contains(d))
+            .collect();
+        return Ok(vec![novel, held]);
+    }
+
+    // The remaining three read the tensor table and each tensor's dependencies.
+    let ctx = Ctx::new(src);
+    let manifest = ctx.value(root)?;
+    let model_d = manifest
+        .get("assets")
+        .and_then(|a| a.get("model"))
+        .and_then(as_ref_digest)
+        .ok_or("this store has no `model` asset, so there is no graph to group by")?;
+    let model = ctx.value(&model_d)?;
+    let tt_d = model
+        .get("tensors")
+        .and_then(as_ref_digest)
+        .ok_or("the model has no tensor table")?;
+    let table = TensorTable::from_value(&ctx.value(&tt_d)?)?;
+
+    // Each tensor's data objects, in load order.
+    //
+    // Reachability rather than `Expr::deps_all`: a dependency's `source` is the
+    // object the bytes are *described by*, which for a chunked literal is the
+    // ChunkList and not the chunks themselves — grouping by those digests would
+    // name objects the BLOB segment does not contain and quietly leave the order
+    // alone. `walk` recovers types from the graph, so filtering it to `BLOB` is
+    // exactly the set the packer will place.
+    let mut per_tensor: Vec<(String, DType, BTreeSet<Digest>)> = Vec::new();
+    for name in table.load_order() {
+        let Some(r) = table.get(name) else { continue };
+        let desc = TensorDesc::load(&ctx, r)?;
+        let reached = walk(src, r.0, &r.1)?;
+        let objs: BTreeSet<Digest> = reached
+            .objects
+            .iter()
+            .filter(|(_, t)| **t == otype::BLOB)
+            .map(|(d, _)| *d)
+            .collect();
+        if !objs.is_empty() {
+            per_tensor.push((name.clone(), desc.dtype.clone(), objs));
+        }
+    }
+
+    match strategy {
+        "by-tensor" => Ok(per_tensor.into_iter().map(|(_, _, o)| o).collect()),
+        "by-layer" => {
+            // `model.layers.12.attn.q_proj.weight` groups under
+            // `model.layers.12`; a name with fewer components groups under
+            // itself, so nothing is silently lumped in with something else.
+            let mut by: BTreeMap<String, BTreeSet<Digest>> = BTreeMap::new();
+            for (name, _, objs) in per_tensor {
+                let parts: Vec<&str> = name.split('.').collect();
+                let key = parts[..parts.len().min(3)].join(".");
+                by.entry(key).or_default().extend(objs);
+            }
+            Ok(by.into_values().collect())
+        }
+        "by-dtype" => {
+            let mut by: BTreeMap<String, BTreeSet<Digest>> = BTreeMap::new();
+            for (_, dtype, objs) in per_tensor {
+                // The key only has to be stable and distinct per dtype; it never
+                // reaches the file, so its spelling is not a format question and
+                // `Debug` is the honest one to use.
+                by.entry(format!("{dtype:?}")).or_default().extend(objs);
+            }
+            Ok(by.into_values().collect())
+        }
+        other => Err(format!(
+            "--strategy: `{other}` is not one of §01.9's strategies (linear, \
+             by-tensor, by-layer, by-dtype, by-novelty)"
+        )
+        .into()),
+    }
+}
+
 fn cmd_pack(args: &[String]) -> R {
     let (Some(input), Some(out)) = (args.get(1), flag(args, "-o").or(flag(args, "--out"))) else {
         eprint!("{USAGE}");
@@ -4121,6 +4267,14 @@ fn cmd_pack(args: &[String]) -> R {
     if let Some(c) = flag(args, "--creator") {
         opts.creator = c.to_string();
     }
+    let strategy = flag(args, "--strategy").unwrap_or("linear").to_string();
+    match blob_groups_for(&strategy, &src, &root, flag(args, "--base")) {
+        Ok(g) => opts.blob_groups = g,
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(2);
+        }
+    }
     let bytes = pack(&objects, &root, &opts)?;
     std::fs::write(out, &bytes)?;
 
@@ -4128,6 +4282,14 @@ fn cmd_pack(args: &[String]) -> R {
     let r = verify(&c)?;
     pr!("packed {input} -> {out}");
     pr!("  size           {}", human(bytes.len() as u64));
+    pr!(
+        "  strategy       {strategy}{}",
+        if opts.blob_groups.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} group(s) of data objects)", opts.blob_groups.len())
+        }
+    );
     pr!("  hash           {}", src.hash().name());
     pr!("  root           {}", short(src.hash(), &root));
     pr!("  objects        {}", objects.len());

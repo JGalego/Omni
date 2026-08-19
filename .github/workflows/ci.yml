@@ -1304,6 +1304,98 @@ jobs:
           grep -q 'hashes to' /tmp/ocibad.txt
           echo "a tampered blob is refused before it becomes a file"
 
+      # §01.9's partitioning. Every strategy is an *ordering*, so the two things
+      # that must hold are that the ordering actually changes (a grouping that
+      # quietly matched digest order would pass a weaker test while doing
+      # nothing) and that nothing else does: same objects, same root, still
+      # reproducible, still valid.
+      - name: Every pack partitioning strategy reorders the file and nothing else
+        run: |
+          OMNI=$PWD/reference/target/release/omni
+          "$OMNI" example --quantized /tmp/part.omni >/dev/null
+          "$OMNI" example /tmp/part-base.omni >/dev/null
+          rm -rf /tmp/part.omnid
+          "$OMNI" unpack /tmp/part.omni -o /tmp/part.omnid >/dev/null
+
+          "$OMNI" pack /tmp/part.omnid -o /tmp/p-linear.omni --strategy linear \
+            | tee /tmp/plin.txt
+          grep -q 'strategy       linear' /tmp/plin.txt
+          for s in by-tensor by-layer by-dtype; do
+            "$OMNI" pack /tmp/part.omnid -o "/tmp/p-$s.omni" --strategy "$s" \
+              | tee "/tmp/p-$s.txt"
+            grep -q "group(s) of data objects" "/tmp/p-$s.txt"
+          done
+          "$OMNI" pack /tmp/part.omnid -o /tmp/p-novelty.omni \
+            --strategy by-novelty --base /tmp/part-base.omni | tee /tmp/pnov.txt
+          grep -q 'by-novelty (2 group(s)' /tmp/pnov.txt
+
+          # by-novelty without a base has nothing to compare against, and a
+          # strategy nobody defined is not silently the default.
+          set +e
+          "$OMNI" pack /tmp/part.omnid -o /tmp/p-x.omni --strategy by-novelty \
+            > /tmp/pnobase.txt 2>&1
+          rc=$?; set -e
+          test "$rc" != 0
+          grep -q 'needs --base' /tmp/pnobase.txt
+          set +e
+          "$OMNI" pack /tmp/part.omnid -o /tmp/p-x.omni --strategy by-vibes \
+            > /tmp/pbad.txt 2>&1
+          rc=$?; set -e
+          test "$rc" != 0
+          grep -q 'not one of' /tmp/pbad.txt
+
+          python3 - <<'PY_PART'
+          import hashlib, subprocess, pathlib, sys
+          omni = str(pathlib.Path("reference/target/release/omni").resolve())
+          names = ["linear", "by-tensor", "by-layer", "by-dtype", "novelty"]
+          files = {n: f"/tmp/p-{n}.omni" for n in names}
+
+          def digests(f):
+              out = subprocess.run([omni, "ls", f], capture_output=True, text=True,
+                                   check=True).stdout.splitlines()[1:]
+              # digest and type only: the offset is what the strategy moves.
+              return sorted(" ".join(l.split()[:2]) for l in out if l.strip())
+
+          def root(f):
+              out = subprocess.run([omni, "inspect", f], capture_output=True,
+                                   text=True, check=True).stdout
+              return [l for l in out.splitlines() if l.strip().startswith("root")][0]
+
+          base = digests(files["linear"])
+          base_root = root(files["linear"])
+          bad = []
+          layouts = {}
+          for n, f in files.items():
+              layouts[n] = hashlib.sha256(pathlib.Path(f).read_bytes()).hexdigest()
+              if digests(f) != base:
+                  bad.append(f"{n}: different object set")
+              if root(f) != base_root:
+                  bad.append(f"{n}: different root digest")
+          # The orderings that are supposed to differ, do. by-novelty over a base
+          # that shares only some objects is its own ordering too.
+          for n in ("by-tensor", "by-layer", "by-dtype"):
+              if layouts[n] == layouts["linear"]:
+                  bad.append(f"{n} produced the same bytes as linear, so the "
+                             f"grouping changed nothing")
+          for b in bad:
+              print(f"::error::{b}")
+          print(f"{len(files)} strategies: one object set, one root, "
+                f"{len(set(layouts.values()))} distinct layouts")
+          sys.exit(1 if bad else 0)
+          PY_PART
+
+          # R-W1 for every strategy, and every result is a valid container.
+          for s in linear by-tensor by-layer by-dtype; do
+            "$OMNI" pack /tmp/part.omnid -o /tmp/p-again.omni --strategy "$s" >/dev/null
+            cmp "/tmp/p-$s.omni" /tmp/p-again.omni
+            "$OMNI" verify "/tmp/p-$s.omni" --level 6 | grep -q '^valid'
+          done
+          "$OMNI" pack /tmp/part.omnid -o /tmp/p-again.omni --strategy by-novelty \
+            --base /tmp/part-base.omni >/dev/null
+          cmp /tmp/p-novelty.omni /tmp/p-again.omni
+          "$OMNI" verify /tmp/p-novelty.omni --level 6 | grep -q '^valid'
+          echo "every §01.9 strategy is reproducible, valid, and the same model"
+
       # The four measurements Gate 1 and Gate 2 ask for. None of them is blocked
       # on code and all four are blocked on a corpus, so what runs here is the
       # *instrument*, over a corpus this repository can build. A run that saw

@@ -411,6 +411,22 @@ pub struct PackOptions {
     /// tiny, they are on the parse hot path, and §03.1 already keeps tensor
     /// payloads out of them.
     pub codec: crate::codec::Codec,
+    /// §01.9's pack partitioning, expressed as an ordering of the data objects.
+    ///
+    /// Group 0's objects are written first, then group 1's, and so on; a digest
+    /// in no group is written after every group. Within a group the order is by
+    /// digest, exactly as it is when there are no groups at all, so the layout
+    /// stays a pure function of the inputs and R-W1's byte-reproducibility holds
+    /// for every strategy rather than only the default one.
+    ///
+    /// This is the whole mechanism §01.9 needs. A strategy is a *grouping*, and
+    /// which grouping a name denotes — `by-tensor`, `by-dtype`, `by-novelty` —
+    /// is a question about the model, which the packer cannot see and does not
+    /// need to: it receives the answer. `omni pack --strategy` computes them.
+    ///
+    /// Empty means the default: one run of every data object in digest order,
+    /// which is §01.9's `linear`.
+    pub blob_groups: Vec<BTreeSet<Digest>>,
 }
 
 impl Default for PackOptions {
@@ -421,6 +437,7 @@ impl Default for PackOptions {
             reproducible: true,
             hash: HashAlgo::default(),
             codec: crate::codec::Codec::Raw,
+            blob_groups: Vec::new(),
         }
     }
 }
@@ -491,8 +508,30 @@ pub fn pack_partial(
         uniq.insert((c.otype, c.digest(opts.hash)), c);
     }
     let ordered: Vec<&Object> = uniq.values().copied().collect();
-    let (blobs, structs): (Vec<&Object>, Vec<&Object>) =
+    let (mut blobs, structs): (Vec<&Object>, Vec<&Object>) =
         ordered.iter().partition(|o| o.otype == otype::BLOB);
+    // §01.9's partitioning. `uniq` already put the data objects in digest order,
+    // which is `linear`; a grouping re-orders them into runs without disturbing
+    // the order *within* a run, so the result is still determined by the inputs
+    // alone. The digest of each object is taken once here rather than inside the
+    // comparator, which would rehash every payload a logarithmic number of times.
+    if !opts.blob_groups.is_empty() {
+        let last = opts.blob_groups.len();
+        let mut keyed: Vec<(usize, Digest, &Object)> = blobs
+            .iter()
+            .map(|o| {
+                let d = o.digest(opts.hash);
+                let rank = opts
+                    .blob_groups
+                    .iter()
+                    .position(|g| g.contains(&d))
+                    .unwrap_or(last);
+                (rank, d, *o)
+            })
+            .collect();
+        keyed.sort_by_key(|k| (k.0, k.1));
+        blobs = keyed.into_iter().map(|(_, _, o)| o).collect();
+    }
 
     let present: BTreeSet<Digest> = uniq.keys().map(|(_, d)| *d).collect();
     let mut absent: Vec<IndexEntry> = external
