@@ -213,14 +213,16 @@ lossless safetensors, GGUF, PEFT LoRA, GPTQ and AWQ import *and* export — the
 quantized ones as expressions over the packed words rather than as a conversion
 of them, checked by dequantizing every layer and comparing against arithmetic
 done in Python, and GGUF byte-for-byte in both directions across its eleven
-block types — NumPy `.npy` and `.npz` both ways, PyTorch `.bin` import through a
-restricted unpickler in a confined child process, a whole Hugging
+block types — bitsandbytes NF4, FP4 and LLM.int8, checked against the library that
+defines them rather than against our reading of it — NumPy `.npy` and `.npz` both
+ways, PyTorch `.bin` import through a restricted unpickler in a confined child
+process, a whole Hugging
 Face repo (weights, config, tokenizer and chat template) as one container, and a
 [C ABI](reference/omni-ffi/include/omni.h) that a C program drives end to end
 in both directions — reading a container, and *writing* one, with DLPack going
 in as well as out. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
-it — every importer but those nine, `https://` (TLS
+it — every importer but those ten, `https://` (TLS
 needs a dependency), `mount` (FUSE), `mmap` (`unsafe`), SIMD in the
 plugin host, SLH-DSA's SHA2 parameter sets, and `brotli` and the two lossy codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See

@@ -84,7 +84,7 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 
 | Crate | Contents | Spec |
 |---|---|---|
-| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, lz4, xz/LZMA2, ans-lut, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server, the OCI mapping with the `.omni.idx` sidecar and a registry client, COSE signatures under Ed25519 and ES256, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), GGUF, ONNX, NumPy, PEFT, GPTQ and AWQ import and export, whole-Hugging-Face-repo import, model builder | §01–§13 |
+| `omni-core` | container framing, object index, canonical CBOR, BLAKE3, SHA-256, CRC-32C, Bao trees, object stores, compression codecs (zstd, deflate, lz4, xz/LZMA2, ans-lut, bitshuffle), dtype algebra, layouts, the tensor expression algebra, sparsity and quantization schemes, tokenizer IR, OMNI-CT, OMNI-IR and an interpreter for it, training state, a WebAssembly host, an HTTP range store, object server, the OCI mapping with the `.omni.idx` sidecar and a registry client, COSE signatures under Ed25519, ES256, ML-DSA and SLH-DSA, a JSON codec, a Jinja2 translator, safetensors, PyTorch (ZIP + a restricted unpickler), GGUF, ONNX, NumPy, PEFT, GPTQ, AWQ and bitsandbytes import and export, whole-Hugging-Face-repo import, model builder | §01–§13 |
 | `omni-cli` | `omni inspect · verify · ls · dump · cat · deps · open · index · fetch · serve · oci · import · export · tokenize · render · graph · plugin · strip · log · reshard · pack · unpack · repack · fsck · caps · plan · keygen · sign · delta · adapter · example` | design/cli.md |
 | `omni-ffi` | the C ABI (`omni.h`): opaque handles, panic-proof entry points, CLI-matching status codes, DLPack in *and* out, and a container writer. Built as `cdylib` + `staticlib`. The only crate here that uses `unsafe` | design/sdk.md §3 |
 | `omni-conformance` | corpus generator, cross-implementation runner, mutation fuzzer | §15.3 |
@@ -685,9 +685,9 @@ What is **not** implemented, and is reported as such rather than faked:
   refusing the whole verb was refusing more than the argument supported
 - `omni mount` (§13.9), which needs FUSE
 - Every importer and exporter except safetensors, PyTorch, GGUF, ONNX, PEFT,
-  GPTQ, AWQ, NumPy and a whole Hugging Face repo.
+  GPTQ, AWQ, bitsandbytes, NumPy and a whole Hugging Face repo.
   The capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
-  build implements nine of them; EXL2 does not exist, and a
+  build implements ten of them; EXL2 does not exist, and a
   request for one is refused by name rather than half-attempted. Export covers
   safetensors, GGUF, ONNX, PEFT, GPTQ and AWQ — not PyTorch, because §12.10
   clause 4 says never to re-emit pickle. 3-bit GPTQ and AWQ's `gemv`/`marlin`
@@ -778,7 +778,7 @@ it.
 
 ## Tests
 
-645 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+652 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -1076,7 +1076,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 645 passed; 0 failed
+test result: ok. 652 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

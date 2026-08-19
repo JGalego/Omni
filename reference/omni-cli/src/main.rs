@@ -184,6 +184,11 @@ VERBS:
                               run outcome rather than a failure. External data
                               is read from beside the file, and a path that
                               leaves that directory is refused
+    import  bitsandbytes <in.safetensors> -o <out.omni> [--name N] [--arch F]
+                              NF4, FP4 or LLM.int8, as expressions over the packed
+                              words: a 16-entry codebook with a per-block scale,
+                              and under double quantization that scale is itself a
+                              dequantize (§05.4)
     import  npz <in.npz|in.npy> -o <out.omni> [--name N] [--arch FAMILY]
                               NumPy arrays, one tensor each. A column-major
                               array keeps its bytes and gets §04.4's layout; a
@@ -4714,13 +4719,16 @@ fn cmd_import(args: &[String]) -> R {
     if matches!(format.as_str(), "npz" | "npy" | "numpy") {
         return cmd_import_npz(args, input);
     }
+    if matches!(format.as_str(), "bnb" | "bitsandbytes" | "nf4" | "fp4") {
+        return cmd_import_bnb(args, input);
+    }
     if let Some(method) = omni_core::hfquant::Method::parse(format) {
         return cmd_import_hfquant(args, input, method);
     }
     if format != "safetensors" {
         prr!(
             "omni: no importer for `{format}`. This build imports safetensors, \
-             pytorch, hf, gguf, onnx, npz, peft, gptq and awq; \
+             pytorch, hf, gguf, onnx, npz, peft, gptq, awq and bitsandbytes; \
              `docs/design/import-export.md` §3 lists what the others would \
              need\n"
         );
@@ -6069,6 +6077,75 @@ fn cmd_export(args: &[String]) -> R {
 /// there is no architecture to read, no tokenizer, no licence. I1's rule is
 /// that absence is information, so each of those is *reported as absent*
 /// rather than filled in with something plausible.
+/// `omni import bitsandbytes` — NF4, FP4 and LLM.int8 (§05.4, §05.2).
+fn cmd_import_bnb(args: &[String], input: &str) -> R {
+    use omni_core::bnb::{import, ImportOpts};
+    let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {
+        eprint!("{USAGE}");
+        return Ok(2);
+    };
+    let bytes = std::fs::read(input)?;
+    let opts = ImportOpts {
+        name: flag(args, "--name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("imported/{}", stem(input))),
+        weights_path: input.to_string(),
+        hash: if flag(args, "--hash") == Some("sha256") {
+            HashAlgo::Sha256
+        } else {
+            HashAlgo::Blake3_256
+        },
+        chunk_size: flag(args, "--chunk")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1 << 20),
+        license: flag(args, "--license").map(str::to_string),
+        arch: flag(args, "--arch").map(str::to_string),
+    };
+    let imported = match import(&bytes, &opts) {
+        Ok(i) => i,
+        Err(e @ omni_core::bnb::Error::Unsupported(_)) => {
+            prr!("omni: {e}\n");
+            return Ok(3);
+        }
+        Err(e) => {
+            prr!("omni: {e}\n");
+            return Ok(1);
+        }
+    };
+    let packed = pack(
+        &imported.objects,
+        &imported.root,
+        &PackOptions {
+            hash: opts.hash,
+            codec: codec_flag(args)?.unwrap_or(omni_core::codec::Codec::Raw),
+            ..Default::default()
+        },
+    )?;
+    std::fs::write(out, &packed)?;
+    let r = &imported.report;
+    pr!("imported {input} -> {out}");
+    pr!("  source       bitsandbytes, {}", human(r.source_size));
+    pr!("  quantized    {} weight(s)", imported.layers.len());
+    for l in &imported.layers {
+        pr!(
+            "    {:<44} {} block {}{}",
+            l.name,
+            l.quant.name(),
+            l.blocksize,
+            if l.double { " (double)" } else { "" }
+        );
+    }
+    pr!("  plain        {} tensor(s)", imported.plain);
+    for n in &r.assumptions {
+        pr!("  assumed      {} — {}", n.item, n.reason);
+    }
+    for n in &r.unrepresented {
+        pr!("  lost         {} — {}", n.item, n.reason);
+    }
+    pr!("  values are expressions over the packed words; `omni cat` evaluates them");
+    Ok(0)
+}
+
 fn cmd_import_npz(args: &[String], input: &str) -> R {
     use omni_core::npy::{import, ImportOpts};
     let Some(out) = flag(args, "-o").or(flag(args, "--out")) else {

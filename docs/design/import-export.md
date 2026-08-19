@@ -104,7 +104,7 @@ everything": it records what the importer *chose not to invent*.
 | **GPTQ (HF)** | ● | ● | ● | ○ | — | — | ◐ | ○ | — | ○ | ● |
 | **AWQ (HF)** | ● | ● | ● | ○ | — | — | ◐ | ○ | — | ○ | ● |
 | **EXL2** | ● | ● | ● | ○ | ◐ | ○ | ◐ | ○ | ◐ | ○ | ● |
-| **bitsandbytes NF4/INT8** | ● | ● | ● | ○ | — | — | ◐ | ● | ● | ○ | ● |
+| **bitsandbytes NF4/INT8** | ● | ● | ● | ○ | — | — | ◐ | ● | ● | ○ | ● lossless¹⁷ |
 | **PEFT LoRA/DoRA** | ● | ● | — | ○ | — | — | ● | ◐ | ● | ○ | ● lossless |
 | **Ollama bundle** | ● | ● | ● | ○ | ● | ● | ● | ○ | ◐ | ◐¹³ | ● |
 | **Hugging Face repo** | ● | ● | ● | ○ | ● | ● | ● | ◐ | ● | ◐ | ● (as a bundle) |
@@ -138,6 +138,20 @@ report and refused without `--allow-lossy`, rather than a drop. Column-major
 arrays keep their bytes and are described with §04.4's `strided` layout; a
 big-endian array is *converted*, because §03.9 makes OMNI little-endian, and the
 report says so. `descr: '|O'` is pickle and is refused under §12.10 clause 1.
+
+¹⁷ implemented, and checked against bitsandbytes itself rather than against this
+repository's reading of the format — the library that defines NF4 is a pip install
+away, so it writes the fixture and says what the numbers are. NF4 and FP4 import
+as a §05.4 codebook with a per-block scale, and double quantization needs no new
+formula because a scheme's `scale` is an *expression*: the outer dequantize's
+scale is an inner dequantize plus the stored offset. Blocking is over the
+flattened tensor, so the dequantize is built one-dimensional and reshaped rather
+than forced into an axis-aligned block shape that would only divide some tensors.
+Agreement is bit-exact for single-quantized scales and for LLM.int8, and one
+float32 ULP for double-quantized scales, where bitsandbytes rounds the
+reconstructed scale to f32 and this evaluator does not. What a checkpoint cannot
+give back is the f16/bf16 weights it was quantized *from*: they are not in the
+file, and the fidelity report says so rather than implying a round trip.
 
 ## 4 Notable import paths in detail
 

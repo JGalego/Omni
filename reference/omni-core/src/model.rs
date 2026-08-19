@@ -159,6 +159,18 @@ impl ModelBuilder {
         }
     }
 
+    /// Adds an object built by the caller and returns the ref that points at it.
+    ///
+    /// For the objects an importer assembles itself — a codebook, a sparsity
+    /// structure — where the builder has no opinion about the contents but the
+    /// digest and the placement still have to be its business.
+    pub fn object(&mut self, obj: Object) -> Ref {
+        let d = obj.digest(self.hash);
+        let t = obj.otype;
+        self.extra_objects.push(obj);
+        (t, d)
+    }
+
     /// Stores bytes as a single blob and returns the ref.
     ///
     /// `chunk_list` is for tensor data, where chunking is what makes partial

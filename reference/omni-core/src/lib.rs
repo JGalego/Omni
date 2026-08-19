@@ -59,6 +59,7 @@ pub mod adapter;
 pub mod ans;
 pub mod bao;
 pub mod blake3;
+pub mod bnb;
 pub mod cbor;
 pub mod codec;
 pub mod container;

@@ -1338,6 +1338,57 @@ mod tests {
         assert!((normal_cdf(1.96) - 0.975_002_104_851_780_2).abs() < 1e-12);
     }
 
+    /// §05.4's `normal-float` recipe against the table bitsandbytes ships.
+    ///
+    /// NF4 was defined by the QLoRA paper and is *implemented* by bitsandbytes,
+    /// which carries the sixteen values as a constant. §05.4 instead states a
+    /// construction — normal quantiles at an offset, normalised to ±1 — and this
+    /// is the check that the construction is the same thing. It agrees to
+    /// 1.2e-7, which is about one float32 ULP at the largest entry.
+    ///
+    /// That is close enough to validate the recipe and *not* close enough to
+    /// substitute for the shipped table, which is why `bnb.rs` imports the
+    /// values a checkpoint contains rather than reconstructing them. A lossless
+    /// importer does not get to be one ULP out (§01.1: nothing invented).
+    #[test]
+    fn the_normal_float_recipe_reproduces_bitsandbytes_nf4_table() {
+        // bitsandbytes 0.50.1, `bitsandbytes.functional.quantize_4bit(...).code`.
+        const BNB_NF4: [f64; 16] = [
+            -1.0,
+            -0.696_192_8,
+            -0.525_073_05,
+            -0.394_917_49,
+            -0.284_441_38,
+            -0.184_773_43,
+            -0.091_050_04,
+            0.0,
+            0.079_580_3,
+            0.160_930_2,
+            0.246_112_3,
+            0.337_915_24,
+            0.440_709_83,
+            0.562_617,
+            0.722_956_84,
+            1.0,
+        ];
+        let got = normal_float(4, 0.967_708_3);
+        assert_eq!(got.len(), BNB_NF4.len());
+        let worst = got
+            .iter()
+            .zip(BNB_NF4.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst < 2e-7,
+            "the recipe deviates from bitsandbytes' NF4 table by {worst:.3e}"
+        );
+        // And it is not exact, which is the fact `bnb.rs` depends on.
+        assert!(
+            worst > 0.0,
+            "if this became exact, bnb.rs could store the recipe"
+        );
+    }
+
     #[test]
     fn a_codebook_object_dequantizes_nf4_indices() {
         let mut s = MemoryStore::new(HashAlgo::default());

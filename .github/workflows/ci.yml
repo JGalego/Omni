@@ -2457,6 +2457,52 @@ jobs:
       # runs — it is that the numbers come out right, so the fixture is built
       # from the two formats' own packing rules in Python and the dequantized
       # result is compared against Python's arithmetic, not against OMNI's.
+      # Row 19 of the capability matrix. Unlike GPTQ and AWQ — whose expected
+      # numbers this repository computes in Python from the format's
+      # documentation — bitsandbytes *is* installable, so the library that
+      # defines NF4 produces the checkpoint and says what it means. Nothing in
+      # the comparison comes from OMNI.
+      - name: A bitsandbytes checkpoint dequantizes to what bitsandbytes says
+        run: |
+          OMNI=reference/target/release/omni
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet safetensors numpy bitsandbytes
+          for variant in "" "--double" "--double --int8"; do
+            rm -rf /tmp/bnbfix
+            # shellcheck disable=SC2086
+            python3 tools/bnb-fixture.py /tmp/bnbfix $variant
+            "$OMNI" import bitsandbytes /tmp/bnbfix/model.safetensors \
+              -o /tmp/bnb.omni | tee /tmp/bnb.txt
+            "$OMNI" verify /tmp/bnb.omni --level 6 >/dev/null
+            grep -q 'plain        1 tensor' /tmp/bnb.txt
+
+            # The values are read back through the C ABI rather than off `omni
+            # cat`, whose six printed decimals are coarser than the difference
+            # being measured. The tolerance and the reason for it are in the
+            # checker, which is a file rather than a heredoc because a heredoc
+            # inside this loop cannot find its own delimiter.
+            OMNI_LIB=reference/target/release/libomni.so \
+              python3 tools/bnb-check.py /tmp/bnb.omni /tmp/bnbfix
+          done
+
+          # A checkpoint with nothing quantized in it is refused by name rather
+          # than imported as an empty model.
+          python3 -c "
+          import json, struct
+          hdr = json.dumps({'norm.weight': {'dtype': 'F32', 'shape': [1],
+                                            'data_offsets': [0, 4]}},
+                           separators=(',', ':')).encode()
+          open('/tmp/notbnb.safetensors','wb').write(
+              struct.pack('<Q', len(hdr)) + hdr + b'\0\0\x80?')"
+          if "$OMNI" import bitsandbytes /tmp/notbnb.safetensors -o /tmp/no.omni \
+               > /tmp/nobnb.txt 2>&1; then
+            echo "::error::a file with no bitsandbytes weights imported anyway"
+            cat /tmp/nobnb.txt; exit 1
+          fi
+          grep -q 'quant_state.bitsandbytes__nf4' /tmp/nobnb.txt
+
+          echo "bitsandbytes nf4, fp4 and int8 agree with the library that defines them"
+
       - name: A GPTQ and an AWQ checkpoint dequantize to the right numbers
         run: |
           OMNI=reference/target/release/omni
