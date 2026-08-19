@@ -476,6 +476,23 @@ pub fn tokenizer_of(tj: &json::Value, notes: &mut Vec<Note>) -> Res<TokenizerPar
         .get("model")
         .ok_or_else(|| Error::Malformed("tokenizer.json has no `model`".into()))?;
     let mtype = model.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    // Files serialized before `tokenizers` 0.9 have no `model.type` —
+    // gpt2's and bert-base-uncased's `tokenizer.json` are both this old —
+    // and the source library reads them untagged, deciding by the fields
+    // present. That is not guessing, it is the format's actual legacy
+    // encoding, and the two shapes that exist in the wild are decidable the
+    // same way the library decides them: `merges` is a field only BPE has,
+    // and `max_input_chars_per_word` one only WordPiece has. A typeless
+    // model that is neither stays refused by name below.
+    let mtype = if !mtype.is_empty() {
+        mtype
+    } else if model.get("merges").is_some() {
+        "BPE"
+    } else if model.get("max_input_chars_per_word").is_some() {
+        "WordPiece"
+    } else {
+        mtype
+    };
 
     // The vocabulary, in id order. HF stores it as token → id, and the ids are
     // dense; a gap would mean the file disagrees with itself, so it is checked
@@ -1391,6 +1408,27 @@ mod tests {
         assert_eq!(t.kind, "unigram");
         assert_eq!(t.scores, vec![0.0, -2.5, -3.25]);
         assert_eq!(t.unk, Some(0));
+    }
+
+    #[test]
+    fn a_legacy_tokenizer_without_a_type_is_read_by_its_fields() {
+        // gpt2's and bert-base-uncased's `tokenizer.json` predate the
+        // `model.type` field; the source library reads them untagged, by the
+        // fields present. `merges` only BPE has; `max_input_chars_per_word`
+        // only WordPiece has.
+        let bpe = br#"{"model":{"vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]}}"#;
+        let mut notes = Vec::new();
+        let t = tokenizer_of(&json::parse(bpe).expect("parses"), &mut notes).expect("reads");
+        assert_eq!(t.kind, "bpe");
+
+        let wp = br###"{"model":{"vocab":{"[UNK]":0,"a":1},"unk_token":"[UNK]",
+                      "continuing_subword_prefix":"##","max_input_chars_per_word":100}}"###;
+        let t = tokenizer_of(&json::parse(wp).expect("parses"), &mut notes).expect("reads");
+        assert_eq!(t.kind, "wordpiece");
+
+        // Typeless and neither shape: still refused rather than guessed.
+        let neither = br#"{"model":{"vocab":{"a":0}}}"#;
+        assert!(tokenizer_of(&json::parse(neither).expect("parses"), &mut notes).is_err());
     }
 
     #[test]
