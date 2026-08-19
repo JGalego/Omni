@@ -209,11 +209,20 @@ implemented:
   restricted profile — imports refused unless they are `omni_plugin/1`, fuel
   metered per instruction, memory capped, `memory.grow` failing rather than
   exceeding it, NaN results canonicalized so two runs cannot differ, and threads,
-  exceptions, GC and SIMD refused by opcode at *load* time. The instruction set a
-  plugin compiled from C or Rust uses is implemented: the whole i32/i64/f32/f64
+  exceptions, GC and relaxed-SIMD refused by opcode at *load* time. The instruction
+  set a plugin compiled from C or Rust uses is implemented: the whole i32/i64/f32/f64
   numeric set with conversions and saturating truncation, sign extension, every
   load and store, globals, structured control flow with `br_table`, `call` and
-  `call_indirect`, `select` and the bulk-memory operations. On top of it, §11.5's
+  `call_indirect`, `select` and the bulk-memory operations — and **fixed-width
+  SIMD**, the `v128` type and the whole of §11.6's deterministic vector subset,
+  which is what `-msimd128` emits. Its ~230 lane-wise instructions are checked
+  against `wasmtime` rather than against this host's own opinion, because a table
+  that size is not something reading can verify: the saturating forms, the two
+  different NaN rules separating `min` from `pmin`, the rounding Q15 multiply and
+  the narrowing saturations are each a place where a plausible implementation is
+  wrong and its own tests agree with it. Relaxed-SIMD shares that opcode prefix
+  and is *forbidden* rather than absent — it may give different answers on
+  different hosts, which is the one thing §11.6 rules out. On top of it, §11.5's
   plugin manifest as an embedded, content-addressed object, and the §04.7.7
   extension point wired through: `omni example --plugin` builds a container whose
   tensor is a `plugin` node with **no fallback**, and reading it runs the module
@@ -798,7 +807,7 @@ it.
 
 ## Tests
 
-660 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+662 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -1021,7 +1030,11 @@ runs out instead of hanging, that the memory cap makes `memory.grow` return −1
 rather than allocating, and that a module declaring more memory than the cap never
 instantiates; that an import from anywhere but `omni_plugin/1` and an opcode from
 a forbidden proposal are refused at load; that every NaN the host produces is the
-same NaN and `min`/`max` follow WebAssembly's rules rather than Rust's; that
+same NaN and `min`/`max` follow WebAssembly's rules rather than Rust's; that all
+238 fixed-width SIMD cases — every lane shape, the saturating and narrowing
+forms, the `min`/`pmin` NaN split, the Q15 multiply, the `trunc_sat` clamps, the
+lane loads and stores and the shuffles — produce the same bytes as `wasmtime`,
+while a relaxed-SIMD opcode is refused at load for being nondeterministic; that
 `read_object` sees only the objects it was given and returns −1 otherwise, and
 that `abort` traps with the plugin's own message; that a malformed module, and the
 same module truncated at every length, are errors rather than panics; and, end to
@@ -1101,7 +1114,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 660 passed; 0 failed
+test result: ok. 662 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

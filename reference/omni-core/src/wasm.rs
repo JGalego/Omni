@@ -23,9 +23,21 @@
 //! Rust actually uses: the full i32/i64/f32/f64 numeric set with conversions and
 //! saturating truncation, sign extension, all memory loads and stores, globals,
 //! structured control flow with `br_table`, `call` and `call_indirect`, `select`,
-//! and the bulk-memory operations. SIMD is *not* implemented, and §11.6 permits
-//! it in the deterministic subset — so a module using it is reported as
-//! unsupported rather than half-executed.
+//! and the bulk-memory operations — plus **fixed-width SIMD**, the `v128` type
+//! and the whole of §11.6's deterministic vector subset, which is what a plugin
+//! compiled with `-msimd128` emits and what a hand-written kernel reaches for.
+//!
+//! Relaxed-SIMD lives in the same `0xfd` prefix and is *forbidden* rather than
+//! merely absent, at load time, by opcode: its results are permitted to differ
+//! between hosts, and a plugin whose output depends on the engine is the one
+//! thing §11.6 rules out. The distinction matters enough to be a different error.
+//!
+//! The vector instructions are checked differentially against `wasmtime` rather
+//! than against this host's own opinion — see `tests/wasm_simd_vectors.rs`. A
+//! table of ~230 lane-wise operations is not something reading can verify: the
+//! saturating forms, the two different NaN rules that separate `min` from
+//! `pmin`, the rounding Q15 multiply and the narrowing saturations are each a
+//! place where a plausible implementation is wrong and its own tests agree.
 //!
 //! Validation here is structural plus dynamic: the module's shape, its types,
 //! its imports and its opcodes are checked when it is loaded, and everything
@@ -84,6 +96,8 @@ pub enum ValType {
     I64,
     F32,
     F64,
+    /// `v128`, the fixed-width SIMD vector §11.6 permits.
+    V128,
     /// `funcref`, for tables. Represented as a function index.
     FuncRef,
 }
@@ -95,9 +109,9 @@ impl ValType {
             0x7e => ValType::I64,
             0x7d => ValType::F32,
             0x7c => ValType::F64,
+            0x7b => ValType::V128,
             0x70 => ValType::FuncRef,
             0x6f => return Err(Error::Unsupported("externref".into())),
-            0x7b => return Err(Error::Unsupported("v128 (SIMD)".into())),
             other => return malformed(format!("value type {other:#04x}")),
         })
     }
@@ -109,6 +123,10 @@ pub enum Value {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// A 128-bit vector. Held as a `u128` whose least significant byte is lane
+    /// 0, which is the order the vector has in memory — so a `v128.load` is a
+    /// little-endian read and needs no lane shuffling.
+    V128(u128),
     /// A function index, or `None` for a null reference.
     Ref(Option<u32>),
 }
@@ -120,6 +138,7 @@ impl Value {
             Value::I64(_) => ValType::I64,
             Value::F32(_) => ValType::F32,
             Value::F64(_) => ValType::F64,
+            Value::V128(_) => ValType::V128,
             Value::Ref(_) => ValType::FuncRef,
         }
     }
@@ -130,7 +149,15 @@ impl Value {
             ValType::I64 => Value::I64(0),
             ValType::F32 => Value::F32(0.0),
             ValType::F64 => Value::F64(0.0),
+            ValType::V128 => Value::V128(0),
             ValType::FuncRef => Value::Ref(None),
+        }
+    }
+
+    pub fn as_v128(&self) -> Res<u128> {
+        match self {
+            Value::V128(v) => Ok(*v),
+            other => Err(Error::Trap(format!("expected v128, found {other:?}"))),
         }
     }
 
@@ -674,7 +701,6 @@ fn scan_body(body: &[u8]) -> Res<()> {
         let op = r.byte()?;
         match op {
             // Prefixes that carry whole proposals.
-            0xfd => return Err(Error::Unsupported("SIMD (v128) instructions".into())),
             0xfe => return Err(Error::Forbidden("atomic instructions (threads)".into())),
             0x06 | 0x07 | 0x08 | 0x09 | 0x18 | 0x19 => {
                 return Err(Error::Forbidden("exception handling".into()))
@@ -774,6 +800,43 @@ fn skip_immediates(r: &mut Reader<'_>, op: u8) -> Res<()> {
                     r.u()?;
                 }
                 other => return Err(Error::Unsupported(format!("0xfc {other}"))),
+            }
+        }
+        // The SIMD prefix. The walk has to know each form's immediates or it
+        // loses alignment and starts reading operands as opcodes — which is how
+        // a scanner reports a forbidden instruction that is not there.
+        0xfd => {
+            let sub = r.u()?;
+            match sub {
+                // Loads and stores: a memarg, and for the lane forms a lane index.
+                0x00..=0x0b | 0x5c | 0x5d => {
+                    r.u()?;
+                    r.u()?;
+                }
+                0x54..=0x5b => {
+                    r.u()?;
+                    r.u()?;
+                    r.byte()?;
+                }
+                // v128.const and i8x16.shuffle: sixteen immediate bytes each.
+                0x0c | 0x0d => {
+                    for _ in 0..16 {
+                        r.byte()?;
+                    }
+                }
+                // extract_lane / replace_lane: one lane index.
+                0x15..=0x22 => {
+                    r.byte()?;
+                }
+                // Everything else in the fixed-width set takes its operands from
+                // the stack and carries no immediates.
+                0x0e..=0x14 | 0x23..=0x53 | 0x5e..=0xff => {}
+                0x100..=0x15f => {
+                    return Err(Error::Forbidden(format!(
+                        "relaxed-SIMD instruction {sub:#x} (nondeterministic)"
+                    )))
+                }
+                other => return Err(Error::Unsupported(format!("SIMD opcode {other:#x}"))),
             }
         }
         other => return malformed(format!("opcode {other:#04x}")),
@@ -1642,6 +1705,10 @@ impl Instance<'_, '_> {
                     let sub = r.u()?;
                     self.misc(sub, &mut r, &mut stack)?;
                 }
+                0xfd => {
+                    let sub = r.u()?;
+                    self.simd(sub, &mut r, &mut stack)?;
+                }
                 other => return malformed(format!("opcode {other:#04x} at {}", r.at - 1)),
             }
         }
@@ -1676,6 +1743,24 @@ impl Instance<'_, '_> {
             )));
         }
         Ok(&self.mem[at as usize..at as usize + n])
+    }
+
+    /// A bounds-checked guest store. Distinct from `write`, which is the host
+    /// ABI and reports `Abi` rather than trapping: an out-of-bounds store by the
+    /// *module* is a trap, which is what the module is entitled to.
+    fn store_bytes(&mut self, at: u64, bytes: &[u8]) -> Res<()> {
+        let end = at
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| Error::Trap("address overflow".into()))?;
+        if end > self.mem.len() as u64 {
+            return Err(Error::Trap(format!(
+                "out of bounds memory access at {at} ({} bytes, memory is {})",
+                bytes.len(),
+                self.mem.len()
+            )));
+        }
+        self.mem[at as usize..end as usize].copy_from_slice(bytes);
+        Ok(())
     }
 
     fn load(&mut self, op: u8, at: u64) -> Res<Value> {
@@ -1726,6 +1811,592 @@ impl Instance<'_, '_> {
             )));
         }
         self.mem[at as usize..at as usize + bytes.len()].copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    /// The `0xfd` family: fixed-width SIMD (§11.6's deterministic subset).
+    ///
+    /// One line per opcode against the specification's table, which is the only
+    /// way ~230 instructions stay checkable by reading. Relaxed-SIMD lives above
+    /// `0xff` in the same prefix and is *forbidden* rather than unimplemented,
+    /// because its results are permitted to differ between hosts and §11.6's
+    /// whole requirement is determinism.
+    fn simd(&mut self, sub: u64, r: &mut Reader<'_>, stack: &mut Vec<Value>) -> Res<()> {
+        // Memory operands, shared by the load and store forms.
+        macro_rules! addr {
+            () => {{
+                let _align = r.u()?;
+                let offset = r.u()?;
+                let base = pop(stack)?.as_i32()? as u32 as u64;
+                base.checked_add(offset)
+                    .ok_or_else(|| Error::Trap("address overflow".into()))?
+            }};
+        }
+        // A load whose address is popped *before* the vector operand, which is
+        // the order `load_lane` and `store_lane` take their operands in.
+        macro_rules! lane_addr {
+            ($v:ident) => {{
+                let _align = r.u()?;
+                let offset = r.u()?;
+                let lane = r.byte()? as usize;
+                let $v = pop(stack)?.as_v128()?;
+                let base = pop(stack)?.as_i32()? as u32 as u64;
+                let at = base
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::Trap("address overflow".into()))?;
+                (at, lane, $v)
+            }};
+        }
+        macro_rules! un {
+            ($f:expr) => {{
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::V128($f(a)));
+            }};
+        }
+        macro_rules! bin {
+            ($f:expr) => {{
+                let b = pop(stack)?.as_v128()?;
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::V128($f(a, b)));
+            }};
+        }
+        // A shift takes a vector and an i32 count; the count is taken modulo the
+        // lane width, which is why each arm masks it rather than trapping.
+        macro_rules! shift {
+            ($width:expr, $f:expr) => {{
+                let n = pop(stack)?.as_i32()? as u32 % $width;
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::V128($f(a, n)));
+            }};
+        }
+        macro_rules! test {
+            ($f:expr) => {{
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::I32(i32::from($f(a))));
+            }};
+        }
+
+        match sub {
+            // -- loads and stores ------------------------------------------
+            0x00 => {
+                let at = addr!();
+                let b = self.slice(at, 16)?;
+                stack.push(Value::V128(u128::from_le_bytes(b.try_into().unwrap())));
+            }
+            0x01..=0x06 => {
+                // Widening loads: eight bytes, four halves or two words, each
+                // extended to the next lane width up.
+                let at = addr!();
+                let b: [u8; 8] = self.slice(at, 8)?.try_into().unwrap();
+                let v = match sub {
+                    0x01 => of_u16s(std::array::from_fn(|i| b[i] as i8 as i16 as u16)),
+                    0x02 => of_u16s(std::array::from_fn(|i| b[i] as u16)),
+                    0x03 => of_u32s(std::array::from_fn(|i| {
+                        i16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as i32 as u32
+                    })),
+                    0x04 => of_u32s(std::array::from_fn(|i| {
+                        u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32
+                    })),
+                    0x05 => of_u64s(std::array::from_fn(|i| {
+                        i32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()) as i64 as u64
+                    })),
+                    _ => of_u64s(std::array::from_fn(|i| {
+                        u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()) as u64
+                    })),
+                };
+                stack.push(Value::V128(v));
+            }
+            0x07 => {
+                let at = addr!();
+                let x = self.slice(at, 1)?[0];
+                stack.push(Value::V128(of_u8s([x; 16])));
+            }
+            0x08 => {
+                let at = addr!();
+                let x = u16::from_le_bytes(self.slice(at, 2)?.try_into().unwrap());
+                stack.push(Value::V128(of_u16s([x; 8])));
+            }
+            0x09 => {
+                let at = addr!();
+                let x = u32::from_le_bytes(self.slice(at, 4)?.try_into().unwrap());
+                stack.push(Value::V128(of_u32s([x; 4])));
+            }
+            0x0a => {
+                let at = addr!();
+                let x = u64::from_le_bytes(self.slice(at, 8)?.try_into().unwrap());
+                stack.push(Value::V128(of_u64s([x; 2])));
+            }
+            0x0b => {
+                let _align = r.u()?;
+                let offset = r.u()?;
+                let v = pop(stack)?.as_v128()?;
+                let base = pop(stack)?.as_i32()? as u32 as u64;
+                let at = base
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::Trap("address overflow".into()))?;
+                self.store_bytes(at, &v.to_le_bytes())?;
+            }
+            0x0c => {
+                let mut b = [0u8; 16];
+                for x in b.iter_mut() {
+                    *x = r.byte()?;
+                }
+                stack.push(Value::V128(u128::from_le_bytes(b)));
+            }
+            0x0d => {
+                // i8x16.shuffle: sixteen immediate lane indices into the pair.
+                let mut idx = [0u8; 16];
+                for x in idx.iter_mut() {
+                    *x = r.byte()?;
+                    if *x > 31 {
+                        return malformed("a shuffle lane index above 31");
+                    }
+                }
+                let b = pop(stack)?.as_v128()?;
+                let a = pop(stack)?.as_v128()?;
+                let (la, lb) = (u8s(a), u8s(b));
+                stack.push(Value::V128(of_u8s(std::array::from_fn(|i| {
+                    let k = idx[i] as usize;
+                    if k < 16 {
+                        la[k]
+                    } else {
+                        lb[k - 16]
+                    }
+                }))));
+            }
+            0x0e => {
+                // i8x16.swizzle: a dynamic gather; an index past the end is 0.
+                let b = pop(stack)?.as_v128()?;
+                let a = pop(stack)?.as_v128()?;
+                let (la, lb) = (u8s(a), u8s(b));
+                stack.push(Value::V128(of_u8s(std::array::from_fn(|i| {
+                    let k = lb[i] as usize;
+                    if k < 16 {
+                        la[k]
+                    } else {
+                        0
+                    }
+                }))));
+            }
+            // -- splats ----------------------------------------------------
+            0x0f => {
+                let x = pop(stack)?.as_i32()? as u8;
+                stack.push(Value::V128(of_u8s([x; 16])));
+            }
+            0x10 => {
+                let x = pop(stack)?.as_i32()? as u16;
+                stack.push(Value::V128(of_u16s([x; 8])));
+            }
+            0x11 => {
+                let x = pop(stack)?.as_i32()? as u32;
+                stack.push(Value::V128(of_u32s([x; 4])));
+            }
+            0x12 => {
+                let x = pop(stack)?.as_i64()? as u64;
+                stack.push(Value::V128(of_u64s([x; 2])));
+            }
+            0x13 => {
+                let x = pop(stack)?.as_f32()?;
+                stack.push(Value::V128(of_f32s([x; 4])));
+            }
+            0x14 => {
+                let x = pop(stack)?.as_f64()?;
+                stack.push(Value::V128(of_f64s([x; 2])));
+            }
+            // -- lane access -----------------------------------------------
+            0x15 | 0x16 | 0x18 | 0x19 | 0x1b | 0x1d | 0x1f | 0x21 => {
+                let lane = r.byte()? as usize;
+                let a = pop(stack)?.as_v128()?;
+                let v = match sub {
+                    0x15 => Value::I32(*at_lane(&u8s(a), lane)? as i8 as i32),
+                    0x16 => Value::I32(*at_lane(&u8s(a), lane)? as i32),
+                    0x18 => Value::I32(*at_lane(&u16s(a), lane)? as i16 as i32),
+                    0x19 => Value::I32(*at_lane(&u16s(a), lane)? as i32),
+                    0x1b => Value::I32(*at_lane(&u32s(a), lane)? as i32),
+                    0x1d => Value::I64(*at_lane(&u64s(a), lane)? as i64),
+                    0x1f => Value::F32(*at_lane(&f32s(a), lane)?),
+                    _ => Value::F64(*at_lane(&f64s(a), lane)?),
+                };
+                stack.push(v);
+            }
+            0x17 | 0x1a | 0x1c | 0x1e | 0x20 | 0x22 => {
+                let lane = r.byte()? as usize;
+                let x = pop(stack)?;
+                let a = pop(stack)?.as_v128()?;
+                let v = match sub {
+                    0x17 => {
+                        let mut l = u8s(a);
+                        *at_lane_mut(&mut l, lane)? = x.as_i32()? as u8;
+                        of_u8s(l)
+                    }
+                    0x1a => {
+                        let mut l = u16s(a);
+                        *at_lane_mut(&mut l, lane)? = x.as_i32()? as u16;
+                        of_u16s(l)
+                    }
+                    0x1c => {
+                        let mut l = u32s(a);
+                        *at_lane_mut(&mut l, lane)? = x.as_i32()? as u32;
+                        of_u32s(l)
+                    }
+                    0x1e => {
+                        let mut l = u64s(a);
+                        *at_lane_mut(&mut l, lane)? = x.as_i64()? as u64;
+                        of_u64s(l)
+                    }
+                    0x20 => {
+                        let mut l = f32s(a);
+                        *at_lane_mut(&mut l, lane)? = x.as_f32()?;
+                        of_f32s(l)
+                    }
+                    _ => {
+                        let mut l = f64s(a);
+                        *at_lane_mut(&mut l, lane)? = x.as_f64()?;
+                        of_f64s(l)
+                    }
+                };
+                stack.push(Value::V128(v));
+            }
+            // -- comparisons -----------------------------------------------
+            0x23 => bin!(|a, b| mask8(a, b, |x, y| x == y)),
+            0x24 => bin!(|a, b| mask8(a, b, |x, y| x != y)),
+            0x25 => bin!(|a, b| mask8(a, b, |x, y| (x as i8) < (y as i8))),
+            0x26 => bin!(|a, b| mask8(a, b, |x, y| x < y)),
+            0x27 => bin!(|a, b| mask8(a, b, |x, y| (x as i8) > (y as i8))),
+            0x28 => bin!(|a, b| mask8(a, b, |x, y| x > y)),
+            0x29 => bin!(|a, b| mask8(a, b, |x, y| (x as i8) <= (y as i8))),
+            0x2a => bin!(|a, b| mask8(a, b, |x, y| x <= y)),
+            0x2b => bin!(|a, b| mask8(a, b, |x, y| (x as i8) >= (y as i8))),
+            0x2c => bin!(|a, b| mask8(a, b, |x, y| x >= y)),
+            0x2d => bin!(|a, b| mask16(a, b, |x, y| x == y)),
+            0x2e => bin!(|a, b| mask16(a, b, |x, y| x != y)),
+            0x2f => bin!(|a, b| mask16(a, b, |x, y| (x as i16) < (y as i16))),
+            0x30 => bin!(|a, b| mask16(a, b, |x, y| x < y)),
+            0x31 => bin!(|a, b| mask16(a, b, |x, y| (x as i16) > (y as i16))),
+            0x32 => bin!(|a, b| mask16(a, b, |x, y| x > y)),
+            0x33 => bin!(|a, b| mask16(a, b, |x, y| (x as i16) <= (y as i16))),
+            0x34 => bin!(|a, b| mask16(a, b, |x, y| x <= y)),
+            0x35 => bin!(|a, b| mask16(a, b, |x, y| (x as i16) >= (y as i16))),
+            0x36 => bin!(|a, b| mask16(a, b, |x, y| x >= y)),
+            0x37 => bin!(|a, b| mask32(a, b, |x, y| x == y)),
+            0x38 => bin!(|a, b| mask32(a, b, |x, y| x != y)),
+            0x39 => bin!(|a, b| mask32(a, b, |x, y| (x as i32) < (y as i32))),
+            0x3a => bin!(|a, b| mask32(a, b, |x, y| x < y)),
+            0x3b => bin!(|a, b| mask32(a, b, |x, y| (x as i32) > (y as i32))),
+            0x3c => bin!(|a, b| mask32(a, b, |x, y| x > y)),
+            0x3d => bin!(|a, b| mask32(a, b, |x, y| (x as i32) <= (y as i32))),
+            0x3e => bin!(|a, b| mask32(a, b, |x, y| x <= y)),
+            0x3f => bin!(|a, b| mask32(a, b, |x, y| (x as i32) >= (y as i32))),
+            0x40 => bin!(|a, b| mask32(a, b, |x, y| x >= y)),
+            0x41 => bin!(|a, b| fmask32(a, b, |x, y| x == y)),
+            0x42 => bin!(|a, b| fmask32(a, b, |x, y| x != y)),
+            0x43 => bin!(|a, b| fmask32(a, b, |x, y| x < y)),
+            0x44 => bin!(|a, b| fmask32(a, b, |x, y| x > y)),
+            0x45 => bin!(|a, b| fmask32(a, b, |x, y| x <= y)),
+            0x46 => bin!(|a, b| fmask32(a, b, |x, y| x >= y)),
+            0x47 => bin!(|a, b| fmask64(a, b, |x, y| x == y)),
+            0x48 => bin!(|a, b| fmask64(a, b, |x, y| x != y)),
+            0x49 => bin!(|a, b| fmask64(a, b, |x, y| x < y)),
+            0x4a => bin!(|a, b| fmask64(a, b, |x, y| x > y)),
+            0x4b => bin!(|a, b| fmask64(a, b, |x, y| x <= y)),
+            0x4c => bin!(|a, b| fmask64(a, b, |x, y| x >= y)),
+            // -- bitwise ---------------------------------------------------
+            0x4d => un!(|a: u128| !a),
+            0x4e => bin!(|a: u128, b: u128| a & b),
+            0x4f => bin!(|a: u128, b: u128| a & !b),
+            0x50 => bin!(|a: u128, b: u128| a | b),
+            0x51 => bin!(|a: u128, b: u128| a ^ b),
+            0x52 => {
+                let m = pop(stack)?.as_v128()?;
+                let b = pop(stack)?.as_v128()?;
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::V128((a & m) | (b & !m)));
+            }
+            0x53 => test!(|a: u128| a != 0),
+            // -- lane loads and stores -------------------------------------
+            0x54 => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = self.slice(at, 1)?[0];
+                let mut l = u8s(v);
+                *at_lane_mut(&mut l, lane)? = x;
+                stack.push(Value::V128(of_u8s(l)));
+            }
+            0x55 => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = u16::from_le_bytes(self.slice(at, 2)?.try_into().unwrap());
+                let mut l = u16s(v);
+                *at_lane_mut(&mut l, lane)? = x;
+                stack.push(Value::V128(of_u16s(l)));
+            }
+            0x56 => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = u32::from_le_bytes(self.slice(at, 4)?.try_into().unwrap());
+                let mut l = u32s(v);
+                *at_lane_mut(&mut l, lane)? = x;
+                stack.push(Value::V128(of_u32s(l)));
+            }
+            0x57 => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = u64::from_le_bytes(self.slice(at, 8)?.try_into().unwrap());
+                let mut l = u64s(v);
+                *at_lane_mut(&mut l, lane)? = x;
+                stack.push(Value::V128(of_u64s(l)));
+            }
+            0x58 => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = *at_lane(&u8s(v), lane)?;
+                self.store_bytes(at, &[x])?;
+            }
+            0x59 => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = *at_lane(&u16s(v), lane)?;
+                self.store_bytes(at, &x.to_le_bytes())?;
+            }
+            0x5a => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = *at_lane(&u32s(v), lane)?;
+                self.store_bytes(at, &x.to_le_bytes())?;
+            }
+            0x5b => {
+                let (at, lane, v) = lane_addr!(v);
+                let x = *at_lane(&u64s(v), lane)?;
+                self.store_bytes(at, &x.to_le_bytes())?;
+            }
+            0x5c => {
+                let at = addr!();
+                let x = u32::from_le_bytes(self.slice(at, 4)?.try_into().unwrap());
+                stack.push(Value::V128(x as u128));
+            }
+            0x5d => {
+                let at = addr!();
+                let x = u64::from_le_bytes(self.slice(at, 8)?.try_into().unwrap());
+                stack.push(Value::V128(x as u128));
+            }
+            // -- float width changes ---------------------------------------
+            0x5e => un!(|a: u128| {
+                let l = f64s(a);
+                of_f32s([canon32(l[0] as f32), canon32(l[1] as f32), 0.0, 0.0])
+            }),
+            0x5f => un!(|a: u128| {
+                let l = f32s(a);
+                of_f64s([canon64(l[0] as f64), canon64(l[1] as f64)])
+            }),
+            // -- i8x16 -----------------------------------------------------
+            0x60 => un!(|a| map8i(a, |x| x.wrapping_abs())),
+            0x61 => un!(|a| map8i(a, |x| x.wrapping_neg())),
+            0x62 => un!(|a| map8(a, |x| x.count_ones() as u8)),
+            0x63 => test!(|a| u8s(a).iter().all(|x| *x != 0)),
+            0x64 => {
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::I32(bitmask(u8s(a).iter().map(|x| (*x as i8) < 0))));
+            }
+            0x65 => bin!(narrow8_s),
+            0x66 => bin!(narrow8_u),
+            0x67 => un!(|a| mapf32(a, f32::ceil)),
+            0x68 => un!(|a| mapf32(a, f32::floor)),
+            0x69 => un!(|a| mapf32(a, f32::trunc)),
+            0x6a => un!(|a| mapf32(a, nearest32)),
+            0x6b => shift!(8, |a, n| map8(a, |x| x.wrapping_shl(n))),
+            0x6c => shift!(8, |a, n| map8i(a, |x| x.wrapping_shr(n))),
+            0x6d => shift!(8, |a, n| map8(a, |x| x.wrapping_shr(n))),
+            0x6e => bin!(|a, b| zip8(a, b, u8::wrapping_add)),
+            0x6f => bin!(|a, b| zip8i(a, b, i8::saturating_add)),
+            0x70 => bin!(|a, b| zip8(a, b, u8::saturating_add)),
+            0x71 => bin!(|a, b| zip8(a, b, u8::wrapping_sub)),
+            0x72 => bin!(|a, b| zip8i(a, b, i8::saturating_sub)),
+            0x73 => bin!(|a, b| zip8(a, b, u8::saturating_sub)),
+            0x74 => un!(|a| mapf64(a, f64::ceil)),
+            0x75 => un!(|a| mapf64(a, f64::floor)),
+            0x76 => bin!(|a, b| zip8i(a, b, i8::min)),
+            0x77 => bin!(|a, b| zip8(a, b, u8::min)),
+            0x78 => bin!(|a, b| zip8i(a, b, i8::max)),
+            0x79 => bin!(|a, b| zip8(a, b, u8::max)),
+            0x7a => un!(|a| mapf64(a, f64::trunc)),
+            0x7b => bin!(|a, b| zip8(a, b, |x, y| (x as u16 + y as u16).div_ceil(2) as u8)),
+            0x7c => un!(|a| {
+                let l = u8s(a);
+                of_u16s(std::array::from_fn(|i| {
+                    (l[2 * i] as i8 as i16).wrapping_add(l[2 * i + 1] as i8 as i16) as u16
+                }))
+            }),
+            0x7d => un!(|a| {
+                let l = u8s(a);
+                of_u16s(std::array::from_fn(|i| {
+                    l[2 * i] as u16 + l[2 * i + 1] as u16
+                }))
+            }),
+            0x7e => un!(|a| {
+                let l = u16s(a);
+                of_u32s(std::array::from_fn(|i| {
+                    (l[2 * i] as i16 as i32).wrapping_add(l[2 * i + 1] as i16 as i32) as u32
+                }))
+            }),
+            0x7f => un!(|a| {
+                let l = u16s(a);
+                of_u32s(std::array::from_fn(|i| {
+                    l[2 * i] as u32 + l[2 * i + 1] as u32
+                }))
+            }),
+            // -- i16x8 -----------------------------------------------------
+            0x80 => un!(|a| map16i(a, |x| x.wrapping_abs())),
+            0x81 => un!(|a| map16i(a, |x| x.wrapping_neg())),
+            0x82 => bin!(|a, b| zip16i(a, b, |x, y| {
+                // Rounding Q15 multiply: (x*y + 2^14) >> 15, saturated.
+                (((x as i32 * y as i32) + (1 << 14)) >> 15).clamp(-32768, 32767) as i16
+            })),
+            0x83 => test!(|a| u16s(a).iter().all(|x| *x != 0)),
+            0x84 => {
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::I32(bitmask(u16s(a).iter().map(|x| (*x as i16) < 0))));
+            }
+            0x85 => bin!(narrow16_s),
+            0x86 => bin!(narrow16_u),
+            0x87 => un!(|a| of_u16s(half8(a, false).map(|x| x as i8 as i16 as u16))),
+            0x88 => un!(|a| of_u16s(half8(a, true).map(|x| x as i8 as i16 as u16))),
+            0x89 => un!(|a| of_u16s(half8(a, false).map(|x| x as u16))),
+            0x8a => un!(|a| of_u16s(half8(a, true).map(|x| x as u16))),
+            0x8b => shift!(16, |a, n| map16(a, |x| x.wrapping_shl(n))),
+            0x8c => shift!(16, |a, n| map16i(a, |x| x.wrapping_shr(n))),
+            0x8d => shift!(16, |a, n| map16(a, |x| x.wrapping_shr(n))),
+            0x8e => bin!(|a, b| zip16(a, b, u16::wrapping_add)),
+            0x8f => bin!(|a, b| zip16i(a, b, i16::saturating_add)),
+            0x90 => bin!(|a, b| zip16(a, b, u16::saturating_add)),
+            0x91 => bin!(|a, b| zip16(a, b, u16::wrapping_sub)),
+            0x92 => bin!(|a, b| zip16i(a, b, i16::saturating_sub)),
+            0x93 => bin!(|a, b| zip16(a, b, u16::saturating_sub)),
+            0x94 => un!(|a| mapf64(a, nearest64)),
+            0x95 => bin!(|a, b| zip16(a, b, u16::wrapping_mul)),
+            0x96 => bin!(|a, b| zip16i(a, b, i16::min)),
+            0x97 => bin!(|a, b| zip16(a, b, u16::min)),
+            0x98 => bin!(|a, b| zip16i(a, b, i16::max)),
+            0x99 => bin!(|a, b| zip16(a, b, u16::max)),
+            0x9b => bin!(|a, b| zip16(a, b, |x, y| (x as u32 + y as u32).div_ceil(2) as u16)),
+            0x9c => bin!(|a, b| extmul8(a, b, false, true)),
+            0x9d => bin!(|a, b| extmul8(a, b, true, true)),
+            0x9e => bin!(|a, b| extmul8(a, b, false, false)),
+            0x9f => bin!(|a, b| extmul8(a, b, true, false)),
+            // -- i32x4 -----------------------------------------------------
+            0xa0 => un!(|a| map32i(a, |x| x.wrapping_abs())),
+            0xa1 => un!(|a| map32i(a, |x| x.wrapping_neg())),
+            0xa3 => test!(|a| u32s(a).iter().all(|x| *x != 0)),
+            0xa4 => {
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::I32(bitmask(u32s(a).iter().map(|x| (*x as i32) < 0))));
+            }
+            0xa7 => un!(|a| of_u32s(half16(a, false).map(|x| x as i16 as i32 as u32))),
+            0xa8 => un!(|a| of_u32s(half16(a, true).map(|x| x as i16 as i32 as u32))),
+            0xa9 => un!(|a| of_u32s(half16(a, false).map(|x| x as u32))),
+            0xaa => un!(|a| of_u32s(half16(a, true).map(|x| x as u32))),
+            0xab => shift!(32, |a, n| map32(a, |x| x.wrapping_shl(n))),
+            0xac => shift!(32, |a, n| map32i(a, |x| x.wrapping_shr(n))),
+            0xad => shift!(32, |a, n| map32(a, |x| x.wrapping_shr(n))),
+            0xae => bin!(|a, b| zip32(a, b, u32::wrapping_add)),
+            0xb1 => bin!(|a, b| zip32(a, b, u32::wrapping_sub)),
+            0xb5 => bin!(|a, b| zip32(a, b, u32::wrapping_mul)),
+            0xb6 => bin!(|a, b| zip32i(a, b, i32::min)),
+            0xb7 => bin!(|a, b| zip32(a, b, u32::min)),
+            0xb8 => bin!(|a, b| zip32i(a, b, i32::max)),
+            0xb9 => bin!(|a, b| zip32(a, b, u32::max)),
+            0xba => bin!(|a, b| {
+                // i32x4.dot_i16x8_s: adjacent pairs of products summed.
+                let (x, y) = (u16s(a), u16s(b));
+                of_u32s(std::array::from_fn(|i| {
+                    let p0 = x[2 * i] as i16 as i32 * y[2 * i] as i16 as i32;
+                    let p1 = x[2 * i + 1] as i16 as i32 * y[2 * i + 1] as i16 as i32;
+                    p0.wrapping_add(p1) as u32
+                }))
+            }),
+            0xbc => bin!(|a, b| extmul16(a, b, false, true)),
+            0xbd => bin!(|a, b| extmul16(a, b, true, true)),
+            0xbe => bin!(|a, b| extmul16(a, b, false, false)),
+            0xbf => bin!(|a, b| extmul16(a, b, true, false)),
+            // -- i64x2 -----------------------------------------------------
+            0xc0 => un!(|a| map64i(a, |x| x.wrapping_abs())),
+            0xc1 => un!(|a| map64i(a, |x| x.wrapping_neg())),
+            0xc3 => test!(|a| u64s(a).iter().all(|x| *x != 0)),
+            0xc4 => {
+                let a = pop(stack)?.as_v128()?;
+                stack.push(Value::I32(bitmask(u64s(a).iter().map(|x| (*x as i64) < 0))));
+            }
+            0xc7 => un!(|a| of_u64s(half32(a, false).map(|x| x as i32 as i64 as u64))),
+            0xc8 => un!(|a| of_u64s(half32(a, true).map(|x| x as i32 as i64 as u64))),
+            0xc9 => un!(|a| of_u64s(half32(a, false).map(|x| x as u64))),
+            0xca => un!(|a| of_u64s(half32(a, true).map(|x| x as u64))),
+            0xcb => shift!(64, |a, n| of_u64s(u64s(a).map(|x| x.wrapping_shl(n)))),
+            0xcc => shift!(64, |a, n| map64i(a, |x| x.wrapping_shr(n))),
+            0xcd => shift!(64, |a, n| of_u64s(u64s(a).map(|x| x.wrapping_shr(n)))),
+            0xce => bin!(|a, b| zip64(a, b, u64::wrapping_add)),
+            0xd1 => bin!(|a, b| zip64(a, b, u64::wrapping_sub)),
+            0xd5 => bin!(|a, b| zip64(a, b, u64::wrapping_mul)),
+            0xd6 => bin!(|a, b| mask64(a, b, |x, y| x == y)),
+            0xd7 => bin!(|a, b| mask64(a, b, |x, y| x != y)),
+            0xd8 => bin!(|a, b| mask64(a, b, |x, y| (x as i64) < (y as i64))),
+            0xd9 => bin!(|a, b| mask64(a, b, |x, y| (x as i64) > (y as i64))),
+            0xda => bin!(|a, b| mask64(a, b, |x, y| (x as i64) <= (y as i64))),
+            0xdb => bin!(|a, b| mask64(a, b, |x, y| (x as i64) >= (y as i64))),
+            0xdc => bin!(|a, b| extmul32(a, b, false, true)),
+            0xdd => bin!(|a, b| extmul32(a, b, true, true)),
+            0xde => bin!(|a, b| extmul32(a, b, false, false)),
+            0xdf => bin!(|a, b| extmul32(a, b, true, false)),
+            // -- f32x4 -----------------------------------------------------
+            // `abs` and `neg` are bit operations, specified exactly even on a
+            // NaN: they clear and flip the sign and touch nothing else. Routing
+            // them through the float helpers would canonicalise the payload and
+            // lose the sign, which is a real difference a real engine shows.
+            0xe0 => un!(|a| map32(a, |x| x & 0x7fff_ffff)),
+            0xe1 => un!(|a| map32(a, |x| x ^ 0x8000_0000)),
+            0xe3 => un!(|a| mapf32(a, f32::sqrt)),
+            0xe4 => bin!(|a, b| zipf32(a, b, |x, y| x + y)),
+            0xe5 => bin!(|a, b| zipf32(a, b, |x, y| x - y)),
+            0xe6 => bin!(|a, b| zipf32(a, b, |x, y| x * y)),
+            0xe7 => bin!(|a, b| zipf32(a, b, |x, y| x / y)),
+            0xe8 => bin!(|a, b| zipf32(a, b, fmin32)),
+            0xe9 => bin!(|a, b| zipf32(a, b, fmax32)),
+            0xea => bin!(|a, b| zipf32(a, b, pmin32)),
+            0xeb => bin!(|a, b| zipf32(a, b, pmax32)),
+            // -- f64x2 -----------------------------------------------------
+            0xec => un!(|a| of_u64s(u64s(a).map(|x| x & 0x7fff_ffff_ffff_ffff))),
+            0xed => un!(|a| of_u64s(u64s(a).map(|x| x ^ 0x8000_0000_0000_0000))),
+            0xef => un!(|a| mapf64(a, f64::sqrt)),
+            0xf0 => bin!(|a, b| zipf64(a, b, |x, y| x + y)),
+            0xf1 => bin!(|a, b| zipf64(a, b, |x, y| x - y)),
+            0xf2 => bin!(|a, b| zipf64(a, b, |x, y| x * y)),
+            0xf3 => bin!(|a, b| zipf64(a, b, |x, y| x / y)),
+            0xf4 => bin!(|a, b| zipf64(a, b, fmin64)),
+            0xf5 => bin!(|a, b| zipf64(a, b, fmax64)),
+            0xf6 => bin!(|a, b| zipf64(a, b, pmin64)),
+            0xf7 => bin!(|a, b| zipf64(a, b, pmax64)),
+            // -- conversions -----------------------------------------------
+            0xf8 => un!(|a| of_u32s(f32s(a).map(|x| sat32_s(x) as u32))),
+            0xf9 => un!(|a| of_u32s(f32s(a).map(sat32_u))),
+            0xfa => un!(|a| of_f32s(u32s(a).map(|x| canon32(x as i32 as f32)))),
+            0xfb => un!(|a| of_f32s(u32s(a).map(|x| canon32(x as f32)))),
+            0xfc => un!(|a| {
+                let l = f64s(a);
+                of_u32s([sat64_s(l[0]) as u32, sat64_s(l[1]) as u32, 0, 0])
+            }),
+            0xfd => un!(|a| {
+                let l = f64s(a);
+                of_u32s([sat64_u(l[0]), sat64_u(l[1]), 0, 0])
+            }),
+            0xfe => un!(|a| {
+                let l = u32s(a);
+                of_f64s([canon64(l[0] as i32 as f64), canon64(l[1] as i32 as f64)])
+            }),
+            0xff => un!(|a| {
+                let l = u32s(a);
+                of_f64s([canon64(l[0] as f64), canon64(l[1] as f64)])
+            }),
+            // Relaxed-SIMD is a *different* proposal in the same prefix, and
+            // §11.6 forbids it by name: its results may differ between hosts,
+            // which is the one thing a deterministic plugin may not do.
+            0x100..=0x15f => {
+                return Err(Error::Forbidden(format!(
+                    "relaxed-SIMD instruction {sub:#x} (nondeterministic)"
+                )))
+            }
+            other => return malformed(format!("SIMD opcode {other:#x}")),
+        }
         Ok(())
     }
 
@@ -2024,6 +2695,370 @@ fn sat_i64(a: f64, unsigned: bool) -> i64 {
     }
 }
 
+// ------------------------------------------------------------- SIMD lanes --
+
+// The lane helpers. A `v128` is a `u128` with lane 0 in the least significant
+// bits, so every one of these is a byte-order-free reinterpretation of the same
+// integer and `v128.load`/`store` are plain little-endian moves.
+//
+// Each family is a get/put pair plus the two shapes every opcode takes: a
+// lane-wise map and a lane-wise zip. Writing them once is what keeps the
+// opcode table below one line per instruction, which is the only way a table
+// this size stays checkable by eye against the specification.
+
+fn u8s(v: u128) -> [u8; 16] {
+    v.to_le_bytes()
+}
+fn of_u8s(l: [u8; 16]) -> u128 {
+    u128::from_le_bytes(l)
+}
+fn u16s(v: u128) -> [u16; 8] {
+    let b = v.to_le_bytes();
+    std::array::from_fn(|i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]))
+}
+fn of_u16s(l: [u16; 8]) -> u128 {
+    let mut b = [0u8; 16];
+    for (i, x) in l.iter().enumerate() {
+        b[2 * i..2 * i + 2].copy_from_slice(&x.to_le_bytes());
+    }
+    u128::from_le_bytes(b)
+}
+fn u32s(v: u128) -> [u32; 4] {
+    let b = v.to_le_bytes();
+    std::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
+}
+fn of_u32s(l: [u32; 4]) -> u128 {
+    let mut b = [0u8; 16];
+    for (i, x) in l.iter().enumerate() {
+        b[4 * i..4 * i + 4].copy_from_slice(&x.to_le_bytes());
+    }
+    u128::from_le_bytes(b)
+}
+fn u64s(v: u128) -> [u64; 2] {
+    [v as u64, (v >> 64) as u64]
+}
+fn of_u64s(l: [u64; 2]) -> u128 {
+    (l[0] as u128) | ((l[1] as u128) << 64)
+}
+fn f32s(v: u128) -> [f32; 4] {
+    u32s(v).map(f32::from_bits)
+}
+fn of_f32s(l: [f32; 4]) -> u128 {
+    of_u32s(l.map(|x| x.to_bits()))
+}
+fn f64s(v: u128) -> [f64; 2] {
+    u64s(v).map(f64::from_bits)
+}
+fn of_f64s(l: [f64; 2]) -> u128 {
+    of_u64s(l.map(|x| x.to_bits()))
+}
+
+fn map8(v: u128, f: impl Fn(u8) -> u8) -> u128 {
+    of_u8s(u8s(v).map(f))
+}
+fn map8i(v: u128, f: impl Fn(i8) -> i8) -> u128 {
+    of_u8s(u8s(v).map(|x| f(x as i8) as u8))
+}
+fn zip8(a: u128, b: u128, f: impl Fn(u8, u8) -> u8) -> u128 {
+    let (x, y) = (u8s(a), u8s(b));
+    of_u8s(std::array::from_fn(|i| f(x[i], y[i])))
+}
+fn zip8i(a: u128, b: u128, f: impl Fn(i8, i8) -> i8) -> u128 {
+    zip8(a, b, |x, y| f(x as i8, y as i8) as u8)
+}
+fn map16(v: u128, f: impl Fn(u16) -> u16) -> u128 {
+    of_u16s(u16s(v).map(f))
+}
+fn map16i(v: u128, f: impl Fn(i16) -> i16) -> u128 {
+    of_u16s(u16s(v).map(|x| f(x as i16) as u16))
+}
+fn zip16(a: u128, b: u128, f: impl Fn(u16, u16) -> u16) -> u128 {
+    let (x, y) = (u16s(a), u16s(b));
+    of_u16s(std::array::from_fn(|i| f(x[i], y[i])))
+}
+fn zip16i(a: u128, b: u128, f: impl Fn(i16, i16) -> i16) -> u128 {
+    zip16(a, b, |x, y| f(x as i16, y as i16) as u16)
+}
+fn map32(v: u128, f: impl Fn(u32) -> u32) -> u128 {
+    of_u32s(u32s(v).map(f))
+}
+fn map32i(v: u128, f: impl Fn(i32) -> i32) -> u128 {
+    of_u32s(u32s(v).map(|x| f(x as i32) as u32))
+}
+fn zip32(a: u128, b: u128, f: impl Fn(u32, u32) -> u32) -> u128 {
+    let (x, y) = (u32s(a), u32s(b));
+    of_u32s(std::array::from_fn(|i| f(x[i], y[i])))
+}
+fn zip32i(a: u128, b: u128, f: impl Fn(i32, i32) -> i32) -> u128 {
+    zip32(a, b, |x, y| f(x as i32, y as i32) as u32)
+}
+fn map64i(v: u128, f: impl Fn(i64) -> i64) -> u128 {
+    of_u64s(u64s(v).map(|x| f(x as i64) as u64))
+}
+fn zip64(a: u128, b: u128, f: impl Fn(u64, u64) -> u64) -> u128 {
+    let (x, y) = (u64s(a), u64s(b));
+    of_u64s(std::array::from_fn(|i| f(x[i], y[i])))
+}
+fn mapf32(v: u128, f: impl Fn(f32) -> f32) -> u128 {
+    of_f32s(f32s(v).map(|x| canon32(f(x))))
+}
+fn zipf32(a: u128, b: u128, f: impl Fn(f32, f32) -> f32) -> u128 {
+    let (x, y) = (f32s(a), f32s(b));
+    of_f32s(std::array::from_fn(|i| canon32(f(x[i], y[i]))))
+}
+fn mapf64(v: u128, f: impl Fn(f64) -> f64) -> u128 {
+    of_f64s(f64s(v).map(|x| canon64(f(x))))
+}
+fn zipf64(a: u128, b: u128, f: impl Fn(f64, f64) -> f64) -> u128 {
+    let (x, y) = (f64s(a), f64s(b));
+    of_f64s(std::array::from_fn(|i| canon64(f(x[i], y[i]))))
+}
+
+/// A lane-wise comparison result: all ones for true, all zeros for false, which
+/// is what makes `v128.bitselect` compose with a comparison.
+fn mask8(a: u128, b: u128, f: impl Fn(u8, u8) -> bool) -> u128 {
+    zip8(a, b, |x, y| if f(x, y) { 0xff } else { 0 })
+}
+fn mask16(a: u128, b: u128, f: impl Fn(u16, u16) -> bool) -> u128 {
+    zip16(a, b, |x, y| if f(x, y) { 0xffff } else { 0 })
+}
+fn mask32(a: u128, b: u128, f: impl Fn(u32, u32) -> bool) -> u128 {
+    zip32(a, b, |x, y| if f(x, y) { 0xffff_ffff } else { 0 })
+}
+fn mask64(a: u128, b: u128, f: impl Fn(u64, u64) -> bool) -> u128 {
+    zip64(a, b, |x, y| if f(x, y) { u64::MAX } else { 0 })
+}
+
+// `f32x4.min`/`max` share the scalar rules above: NaN propagates and −0 <
+// +0, so `fmin32`/`fmax64` and friends are reused rather than restated.
+
+/// `pmin`/`pmax`: "pseudo-minimum", defined as `y < x ? y : x`, which returns
+/// the *second* operand when either is NaN and does not distinguish zeros.
+fn pmin32(x: f32, y: f32) -> f32 {
+    if y < x {
+        y
+    } else {
+        x
+    }
+}
+fn pmax32(x: f32, y: f32) -> f32 {
+    if x < y {
+        y
+    } else {
+        x
+    }
+}
+fn pmin64(x: f64, y: f64) -> f64 {
+    if y < x {
+        y
+    } else {
+        x
+    }
+}
+fn pmax64(x: f64, y: f64) -> f64 {
+    if x < y {
+        y
+    } else {
+        x
+    }
+}
+
+/// `iNxM.nearest`: round half to even, which is `f32::round_ties_even`.
+fn nearest32(x: f32) -> f32 {
+    if x.is_nan() || x.is_infinite() {
+        x
+    } else {
+        x.round_ties_even()
+    }
+}
+fn nearest64(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        x
+    } else {
+        x.round_ties_even()
+    }
+}
+
+/// Saturating float-to-int, the `trunc_sat` rule: NaN is 0, and anything past
+/// the range clamps rather than wrapping or trapping.
+fn sat32_s(x: f32) -> i32 {
+    if x.is_nan() {
+        0
+    } else {
+        let t = x.trunc();
+        if t <= i32::MIN as f32 {
+            i32::MIN
+        } else if t >= i32::MAX as f32 {
+            i32::MAX
+        } else {
+            t as i32
+        }
+    }
+}
+fn sat32_u(x: f32) -> u32 {
+    if x.is_nan() {
+        0
+    } else {
+        let t = x.trunc();
+        if t <= 0.0 {
+            0
+        } else if t >= u32::MAX as f32 {
+            u32::MAX
+        } else {
+            t as u32
+        }
+    }
+}
+fn sat64_s(x: f64) -> i32 {
+    if x.is_nan() {
+        0
+    } else {
+        let t = x.trunc();
+        if t <= i32::MIN as f64 {
+            i32::MIN
+        } else if t >= i32::MAX as f64 {
+            i32::MAX
+        } else {
+            t as i32
+        }
+    }
+}
+fn sat64_u(x: f64) -> u32 {
+    if x.is_nan() {
+        0
+    } else {
+        let t = x.trunc();
+        if t <= 0.0 {
+            0
+        } else if t >= u32::MAX as f64 {
+            u32::MAX
+        } else {
+            t as u32
+        }
+    }
+}
+
+/// A lane count's worth of high or low halves, for the `extend`/`extmul` family.
+fn half8(v: u128, high: bool) -> [u8; 8] {
+    let l = u8s(v);
+    std::array::from_fn(|i| l[i + if high { 8 } else { 0 }])
+}
+fn half16(v: u128, high: bool) -> [u16; 4] {
+    let l = u16s(v);
+    std::array::from_fn(|i| l[i + if high { 4 } else { 0 }])
+}
+fn half32(v: u128, high: bool) -> [u32; 2] {
+    let l = u32s(v);
+    std::array::from_fn(|i| l[i + if high { 2 } else { 0 }])
+}
+
+/// `i8x16.bitmask` and friends: the sign bit of each lane, packed into an i32.
+fn bitmask(signs: impl Iterator<Item = bool>) -> i32 {
+    let mut m = 0i32;
+    for (i, s) in signs.enumerate() {
+        if s {
+            m |= 1 << i;
+        }
+    }
+    m
+}
+
+fn fmask32(a: u128, b: u128, f: impl Fn(f32, f32) -> bool) -> u128 {
+    let (x, y) = (f32s(a), f32s(b));
+    of_u32s(std::array::from_fn(|i| {
+        if f(x[i], y[i]) {
+            0xffff_ffff
+        } else {
+            0
+        }
+    }))
+}
+fn fmask64(a: u128, b: u128, f: impl Fn(f64, f64) -> bool) -> u128 {
+    let (x, y) = (f64s(a), f64s(b));
+    of_u64s(std::array::from_fn(|i| {
+        if f(x[i], y[i]) {
+            u64::MAX
+        } else {
+            0
+        }
+    }))
+}
+
+/// A lane index from an immediate. Out of range is a malformed module rather
+/// than a trap: the index is in the code, not in the data.
+fn at_lane<T>(l: &[T], i: usize) -> Res<&T> {
+    l.get(i)
+        .ok_or_else(|| Error::Malformed(format!("lane index {i} past {} lanes", l.len())))
+}
+fn at_lane_mut<T>(l: &mut [T], i: usize) -> Res<&mut T> {
+    let n = l.len();
+    l.get_mut(i)
+        .ok_or_else(|| Error::Malformed(format!("lane index {i} past {n} lanes")))
+}
+
+/// `i8x16.narrow_i16x8_*`: two vectors of eight 16-bit lanes saturated down to
+/// one vector of sixteen 8-bit lanes, `a`'s lanes first.
+fn narrow8_s(a: u128, b: u128) -> u128 {
+    let (x, y) = (u16s(a), u16s(b));
+    of_u8s(std::array::from_fn(|i| {
+        let v = if i < 8 { x[i] } else { y[i - 8] } as i16;
+        v.clamp(-128, 127) as i8 as u8
+    }))
+}
+fn narrow8_u(a: u128, b: u128) -> u128 {
+    let (x, y) = (u16s(a), u16s(b));
+    of_u8s(std::array::from_fn(|i| {
+        let v = if i < 8 { x[i] } else { y[i - 8] } as i16;
+        v.clamp(0, 255) as u8
+    }))
+}
+fn narrow16_s(a: u128, b: u128) -> u128 {
+    let (x, y) = (u32s(a), u32s(b));
+    of_u16s(std::array::from_fn(|i| {
+        let v = if i < 4 { x[i] } else { y[i - 4] } as i32;
+        v.clamp(-32768, 32767) as i16 as u16
+    }))
+}
+fn narrow16_u(a: u128, b: u128) -> u128 {
+    let (x, y) = (u32s(a), u32s(b));
+    of_u16s(std::array::from_fn(|i| {
+        let v = if i < 4 { x[i] } else { y[i - 4] } as i32;
+        v.clamp(0, 65535) as u16
+    }))
+}
+
+/// The `extmul` family: multiply one half of each operand, widening as it goes.
+fn extmul8(a: u128, b: u128, high: bool, signed: bool) -> u128 {
+    let (x, y) = (half8(a, high), half8(b, high));
+    of_u16s(std::array::from_fn(|i| {
+        if signed {
+            ((x[i] as i8 as i16).wrapping_mul(y[i] as i8 as i16)) as u16
+        } else {
+            (x[i] as u16).wrapping_mul(y[i] as u16)
+        }
+    }))
+}
+fn extmul16(a: u128, b: u128, high: bool, signed: bool) -> u128 {
+    let (x, y) = (half16(a, high), half16(b, high));
+    of_u32s(std::array::from_fn(|i| {
+        if signed {
+            ((x[i] as i16 as i32).wrapping_mul(y[i] as i16 as i32)) as u32
+        } else {
+            (x[i] as u32).wrapping_mul(y[i] as u32)
+        }
+    }))
+}
+fn extmul32(a: u128, b: u128, high: bool, signed: bool) -> u128 {
+    let (x, y) = (half32(a, high), half32(b, high));
+    of_u64s(std::array::from_fn(|i| {
+        if signed {
+            ((x[i] as i32 as i64).wrapping_mul(y[i] as i32 as i64)) as u64
+        } else {
+            (x[i] as u64).wrapping_mul(y[i] as u64)
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2078,6 +3113,7 @@ mod tests {
             ValType::I64 => 0x7e,
             ValType::F32 => 0x7d,
             ValType::F64 => 0x7c,
+            ValType::V128 => 0x7b,
             ValType::FuncRef => 0x70,
         }
     }
@@ -2567,15 +3603,31 @@ mod tests {
 
     #[test]
     fn forbidden_and_unimplemented_proposals_are_refused_at_load() {
-        // A SIMD instruction in a body: unsupported, and caught before the
-        // function ever runs.
+        // Fixed-width SIMD is *implemented*, so a `v128.load` — opcode, memarg
+        // and all — loads rather than being refused. `wasm_simd_vectors.rs`
+        // checks what it computes; this only checks that it is admitted.
         let mut b = Build::default();
         b.memory(1, None);
-        b.func("f", &[], &[], &[], vec![0xfd, 0x00]);
-        assert!(matches!(
-            Module::load(&b.finish()),
-            Err(Error::Unsupported(_))
-        ));
+        b.func(
+            "f",
+            &[],
+            &[],
+            &[],
+            vec![0x41, 0x00, 0xfd, 0x00, 0x04, 0x00, 0x1a, 0x0b],
+        );
+        assert!(Module::load(&b.finish()).is_ok());
+
+        // Relaxed-SIMD shares that prefix and is forbidden rather than absent:
+        // it is permitted to give different answers on different hosts, which is
+        // the one thing §11.6 rules out. `0xfd 0x100` is relaxed_swizzle.
+        let mut b = Build::default();
+        b.memory(1, None);
+        b.func("f", &[], &[], &[], vec![0xfd, 0x80, 0x02, 0x0b]);
+        match Module::load(&b.finish()) {
+            Err(Error::Forbidden(m)) => assert!(m.contains("relaxed"), "{m}"),
+            Err(other) => panic!("relaxed-SIMD refused, but not as forbidden: {other}"),
+            Ok(_) => panic!("a relaxed-SIMD module loaded"),
+        }
 
         // An atomic: forbidden (threads).
         let mut b = Build::default();

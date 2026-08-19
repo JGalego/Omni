@@ -570,6 +570,24 @@ jobs:
       # from 2076 can execute a 2026 custom op without the 2026 toolchain; the
       # testable part is that an op *this* build has never heard of computes the
       # right numbers from the module the model shipped.
+      # §11.6 permits fixed-width SIMD and forbids the relaxed kind. The host
+      # implements ~230 lane-wise instructions, and the only thing that can tell
+      # a correct implementation from a self-consistent one is another engine —
+      # so the fixtures are regenerated here from `wasmtime` rather than trusted
+      # as committed, which is what makes them a check on this code rather than a
+      # record of what it once did.
+      - name: The SIMD fixtures still say what wasmtime says
+        run: |
+          pip install --quiet wasmtime
+          python3 tools/wasm-simd-fixture.py /tmp/simdfix | tee /tmp/simd.txt
+          grep -qE '[0-9]+ SIMD cases from wasmtime' /tmp/simd.txt
+          # Every regenerated module and every expected result must match what is
+          # committed. A drift here is either a wasmtime change worth knowing
+          # about or a fixture edited by hand.
+          diff -r /tmp/simdfix reference/omni-core/tests/vectors/wasmsimd \
+            --exclude=NOTICE
+          echo "the committed SIMD fixtures are the ones wasmtime produces"
+
       - name: A plugin op runs under the restricted profile
         run: |
           OMNI=reference/target/release/omni
