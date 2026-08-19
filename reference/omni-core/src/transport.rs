@@ -16,16 +16,44 @@
 //!   absence for the weights, which the object model already handles because
 //!   §01.4 makes a partial graph incomplete rather than invalid.
 //! * **An HTTP range store** (§13.4.2), speaking HTTP/1.1 over a TCP socket with
-//!   range coalescing and resumption. Plain HTTP only: TLS needs a
-//!   cryptographic transport stack, this crate has zero dependencies, and
-//!   implementing TLS 1.3 from scratch to fetch a model would be a worse idea
-//!   than saying so. An `https://` URL is refused with that reason rather than
-//!   silently downgraded.
+//!   range coalescing and resumption. Plain HTTP only. An `https://` URL is
+//!   refused, with the reason, rather than silently downgraded.
 //!
-//! What is not here: the OCI mapping of §13.5, `omni mount` (§13.9) and
-//! `omni serve`. Each needs something outside this crate's reach — a JSON
-//! codec and a registry client, FUSE, a server — and none of them is pretended
-//! to exist.
+//! ## Why there is no `https://`, in full
+//!
+//! This is the largest thing this crate declines, so the reasoning belongs here
+//! rather than in a commit message. There are exactly two ways to have TLS and
+//! both cost more than the feature is worth.
+//!
+//! **Write it.** TLS 1.3 needs X25519, HKDF, an AEAD, X.509 parsing, RSA and
+//! ECDSA signature verification, chain building, name matching and expiry — and
+//! then it needs to be *right*, because the failure mode of a subtly wrong
+//! certificate check is not a crash but a model fetched from an attacker while
+//! the tool reports success. Several thousand lines of unreviewed cryptographic
+//! code on the path that decides where a model came from is a worse security
+//! outcome than not offering the feature, and §12's whole subject is provenance.
+//! A refusal is loud; a bad chain check is silent.
+//!
+//! **Take a dependency.** `rustls` would do it well. But zero dependencies is a
+//! property of this whole workspace, not a preference of one module: it is what
+//! makes `cargo install` resolve nothing, what makes the supply chain of a
+//! *format reader* auditable by reading it, and what a reader in 2060 needs when
+//! it has to build this from source. Spending that on a URL scheme is the wrong
+//! trade, and spending it in one crate while claiming it elsewhere would be worse.
+//!
+//! So the honest answer is a refusal that says why, and a note on what to do
+//! instead: TLS is a transport concern, and every deployment already has
+//! something that terminates it. Fetch over `http://` inside a trusted network,
+//! put a terminating proxy or a mirror in front, or hand the tool a file — the
+//! container is content-addressed, so its integrity does not depend on the
+//! transport that carried it, which is the one part of this that the format
+//! genuinely solves. What would change the answer is an audited pure-Rust TLS
+//! implementation small enough to vendor, or a decision to spend the dependency;
+//! neither is this module's to make.
+//!
+//! What is not here: `omni mount` (§13.9), which needs FUSE and therefore both
+//! `unsafe` and a kernel interface this crate cannot test — see the reference
+//! README for what stands in for it.
 
 use crate::cbor::Value;
 use crate::container::{oflags, Container, Digest, HashAlgo, IndexEntry};
@@ -310,8 +338,12 @@ impl Url {
         if let Some(rest) = s.strip_prefix("https://") {
             let _ = rest;
             return Err(Error::Unsupported(
-                "https needs a TLS stack, and this crate has no dependencies to \
-                 provide one; fetch over http, or hand it a file"
+                "https needs a TLS stack: writing one would put unreviewed \
+                 cryptography on the path that decides a model's provenance, and \
+                 taking a dependency would spend a property of the whole \
+                 workspace on a URL scheme. Terminate TLS in front of this, fetch \
+                 over http inside a trusted network, or hand it a file — the \
+                 container's integrity is in its digests, not its transport"
                     .into(),
             ));
         }
@@ -1369,8 +1401,12 @@ mod tests {
         assert_eq!(Url::parse("http://h:8080").unwrap().path, "/");
         match Url::parse("https://example.org/a.omni") {
             Err(Error::Unsupported(m)) => {
+                // The refusal has to say what is missing *and* what to do about
+                // it, because a dead end and a redirection are different answers
+                // to whoever hit this.
                 assert!(m.contains("TLS"), "{m}");
-                assert!(m.contains("no dependencies"), "{m}");
+                assert!(m.contains("dependency"), "{m}");
+                assert!(m.contains("digests"), "{m}");
             }
             other => panic!("https was not refused: {other:?}"),
         }

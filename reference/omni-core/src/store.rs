@@ -13,6 +13,33 @@
 //! cache-coherence design, and it is a consequence of content addressing
 //! rather than a feature anyone had to build.
 //!
+//! ## Why there is no mmap-backed store
+//!
+//! [`FileStore`] opens a container lazily — four reads for the framing, then one
+//! read per object range — so a container larger than memory *is* readable, and
+//! the CLI uses that path. What is missing is the other half of the promise:
+//! handing a caller a `&[u8]` that points straight at the file, with no copy and
+//! no read syscall, which is what a memory mapping is for and what a GPU upload
+//! wants.
+//!
+//! That needs `mmap`, and `mmap` needs `unsafe` — a raw pointer to memory whose
+//! contents another process may change under us, which is exactly the kind of
+//! thing `#![forbid(unsafe_code)]` is here to keep out of a *parser*. The
+//! substitutes do not substitute: reading the ranges into `Vec`s is what
+//! [`FileStore`] already does and copies by construction, and putting the
+//! mapping in `omni-ffi` (where `unsafe` is permitted, because a C ABI requires
+//! it) would only move the problem, since [`Container`] owns a `Vec<u8>` and
+//! cannot borrow a mapping without a copy anyway.
+//!
+//! So the honest position: large containers are readable, zero-copy from a
+//! *mapping* is not, and the gap is a deliberate consequence of the no-`unsafe`
+//! rule rather than an oversight. What would change it is a decision to allow
+//! `unsafe` in a dedicated I/O crate together with making [`Container`] generic
+//! over borrowed bytes — two changes, both real, neither of them small, and the
+//! second is the one that actually matters. `docs/design/performance.md` §11
+//! records the one measurement that is on the other side of this: huge pages
+//! would take the tail off an index lookup and need the same mapping.
+//!
 //! ## Types live in refs, not in stores
 //!
 //! A store maps digest to bytes and nothing else — no otype column, no

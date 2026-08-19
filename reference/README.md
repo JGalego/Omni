@@ -725,7 +725,29 @@ What is **not** implemented, and is reported as such rather than faked:
   nothing. The verb was refused for a while on the argument that quantizing needs
   activations; that is true of those two and false of round-to-nearest, and
   refusing the whole verb was refusing more than the argument supported
-- `omni mount` (§13.9), which needs FUSE
+- `sz3`, the second of §03.7.1's lossy codecs, which is the one codec here refused
+  for a reason that is not about effort. zfp has a versioned header and a format
+  its own sources define in numbers; SZ3 does not. It serializes its own
+  configuration into the stream, and that stream has changed incompatibly between
+  releases — SZ2 and SZ3 do not interoperate, and neither do all SZ3 versions. A
+  decoder written against one release would read that release and silently
+  mis-read the next, which is precisely the promise an *archival* format must not
+  make. An oracle exists (`pysz`), so this is not a testability problem; it is
+  that there is nothing stable to be tested *against*. What would change it is a
+  specification, or a format version in the stream that a reader can refuse on
+- `omni mount` (§13.9), which needs FUSE — and the reason is worth being precise
+  about, because the *capability* mount exists for is already here. §13.9's value
+  is the compatibility bridge: a tool that only opens safetensors should be able
+  to open an OMNI model without a conversion. `omni export safetensors` does that
+  eagerly and `omni serve` does it lazily over HTTP, so what is missing is the
+  filesystem *presentation*, not the ability to synthesize the views. Mounting one
+  needs `unsafe` and `libc` — `mount(2)`, or passing a `/dev/fuse` descriptor over
+  a Unix socket with `SCM_RIGHTS` — and, worse for this repository's standards, it
+  cannot be tested where the tests run: a container without `/dev/fuse` cannot
+  mount anything, so the feature would ship with its correctness asserted rather
+  than measured, which is the one thing nothing else here does. What would change
+  it is a runner with FUSE and a decision to allow `unsafe` in a crate outside
+  `omni-core`
 - Every importer and exporter except safetensors, PyTorch, GGUF, ONNX, PEFT,
   GPTQ, AWQ, bitsandbytes, NumPy and a whole Hugging Face repo.
   The capability matrix in `docs/design/import-export.md` §3 has 25 rows and this
@@ -751,9 +773,18 @@ What is **not** implemented, and is reported as such rather than faked:
 - `mmap`, which needs `unsafe`. `store::FileStore` is the answer to what `mmap` was
   for here: a container opened and read one range at a time, counting its reads,
   so §02.7's two-read open and §04.7.4's partial reads are measurements
-  (`omni open`) rather than constructions. What a production reader gains from
+  (`omni open`) rather than constructions — and a container larger than memory is
+  readable through it. What a production reader gains from
   `mmap` is the page cache doing the buffering; what it does not gain is a
-  different parse
+  different parse. The part that is genuinely lost is zero-copy from a *mapping*:
+  a `&[u8]` pointing straight at the file, which is what a GPU upload wants. Two
+  things would have to change for it, and the second is the one that matters —
+  allowing `unsafe` in a dedicated I/O crate, and making `Container` generic over
+  borrowed bytes instead of owning a `Vec<u8>`, since without that a mapping has
+  to be copied in to be parsed and the mapping bought nothing. The C ABI's
+  `omni_tensor_mapped` is honest about which side of this a caller is on: it
+  reports whether the pointer aliases the container, and never claims a mapping.
+  `store.rs` carries the same reasoning where the stores are defined
 
 See [`docs/design/roadmap.md`](../docs/design/roadmap.md) for the plan.
 
