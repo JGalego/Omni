@@ -1635,6 +1635,14 @@ pub unsafe extern "C" fn omni_builder_set_codec(
                 )
             });
         }
+        // A decode-only codec (brotli) is readable but cannot be produced here,
+        // so a builder asked to write one is indeterminate — never a downgrade.
+        if c.decode_only() {
+            return Err(Fail::new(
+                OMNI_INDETERMINATE,
+                format!("codec: `{id}` is decode-only in this build; it cannot be produced"),
+            ));
+        }
         *h.codec.borrow_mut() = c;
         Ok(())
     })

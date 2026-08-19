@@ -1,0 +1,47 @@
+Two distinct things in this tree derive from google/brotli
+(https://github.com/google/brotli), which is distributed under the MIT licence
+reproduced verbatim at the end of this file.
+
+1. The static tables in `omni-core/src/brotli_tables.rs` and the raw dictionary
+   in `omni-core/src/brotli_dict.bin`. These are the 122 784-byte static
+   dictionary, its `size_bits`/`offsets` index, the 121 word transforms and
+   their prefix/suffix pool, and the UTF-8 and signed context lookup tables —
+   copied verbatim from `c/common/{dictionary,transform,context}.c`. RFC 7932 is
+   *defined* by these tables; there is no independent version of them to
+   reconstruct from, so they are transcribed rather than reinvented, and a
+   transcription error in them can only be caught by decoding real streams,
+   which is what item 2 is for.
+
+2. The `.br` streams in this directory. `tools/brotli-fixture.py` compresses a
+   fixed corpus with `libbrotli` at quality levels 1, 5 and 11; each `<name>.br`
+   is that library's output and each `<name>.raw` is the original input, listed
+   in `manifest.txt`. The vectors are libbrotli's own bytes; nothing here was
+   hand-edited. `omni-core`'s decoder must reproduce every `.raw` from its `.br`
+   byte for byte — that differential check against the one reference
+   implementation is the only oracle brotli has, since it is a single library
+   rather than a spec with a field of independent implementations. Re-run the
+   script to regenerate them; the corpus and quality levels are defined there.
+
+The brotli sources carry no NOTICE file of their own; the MIT licence's only
+condition is that the copyright and permission notice travel with the copied
+material, which is why it is reproduced here in full:
+
+    Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    THE SOFTWARE.

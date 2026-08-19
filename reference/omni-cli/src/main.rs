@@ -2613,6 +2613,14 @@ fn codec_flag(args: &[String]) -> Result<Option<omni_core::codec::Codec>, String
             format!("--codec: `{name}` is registered but not implemented in this build")
         });
     }
+    // A decode-only codec (brotli) is readable but this build has no encoder for
+    // it, so refuse to select it for a write rather than fail later inside pack.
+    if c.decode_only() {
+        return Err(format!(
+            "--codec: `{id}` is decode-only in this build; brotli objects can be \
+             read and `repack`ed to another codec, but not produced"
+        ));
+    }
     Ok(Some(c))
 }
 

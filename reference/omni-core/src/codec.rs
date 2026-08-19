@@ -12,9 +12,14 @@
 //! §03.7.2 cares about, because transposing to byte-plane order groups the
 //! highly redundant exponent bytes of a float tensor together.
 //!
-//! Still unimplemented and reported as such: `brotli` and the two lossy ones. A registered codec this build cannot
-//! decode makes an object *indeterminate* (§15.1), never invalid — and never
-//! silently half-decoded.
+//! `brotli` (RFC 7932) is decode-only: a full decoder ships in [`crate::brotli`]
+//! and reads any brotli-stored object, but this build has no encoder that would
+//! shrink weights, so it will not *produce* brotli — asking it to is
+//! indeterminate, not a silent downgrade to raw.
+//!
+//! Still unimplemented and reported as such: the two lossy ones. A registered
+//! codec this build cannot decode makes an object *indeterminate* (§15.1), never
+//! invalid — and never silently half-decoded.
 //!
 //! §03.7's own honest guidance is worth repeating: do not expect compression to
 //! shrink weights. The size wins in OMNI come from deduplication, deltas and
@@ -96,6 +101,12 @@ pub enum Codec {
     Lz4 {
         level: u8,
     },
+    /// Brotli (RFC 7932). Decode-only in this build: [`crate::brotli`] is a
+    /// complete decoder — static dictionary, transforms, context modelling and
+    /// all — checked byte-for-byte against libbrotli, so an object stored with
+    /// brotli is readable. There is no size-competitive encoder here, so
+    /// `encode` refuses rather than emit an expanding stream (see below).
+    Brotli,
     /// The `.xz` container over LZMA2 — §03.7.1's archival codec.
     Xz {
         level: u8,
@@ -124,6 +135,7 @@ impl Codec {
             Codec::BitshuffleZstd { .. } => id::BITSHUFFLE_ZSTD,
             Codec::Deflate { .. } => id::DEFLATE,
             Codec::Lz4 { .. } => id::LZ4,
+            Codec::Brotli => id::BROTLI,
             Codec::Xz { .. } => id::XZ,
             Codec::AnsLut => id::ANS_LUT,
             Codec::BitshuffleDeflate { .. } => id::BITSHUFFLE_DEFLATE,
@@ -131,7 +143,6 @@ impl Codec {
             // paired with an entropy coder, and is exposed here for testing.
             Codec::Bitshuffle { .. } => id::BITSHUFFLE_DEFLATE,
             Codec::Unsupported(name) => match *name {
-                "brotli" => id::BROTLI,
                 "xz" => id::XZ,
                 "zfp" => id::ZFP,
                 "sz3" => id::SZ3,
@@ -148,6 +159,7 @@ impl Codec {
             Codec::BitshuffleZstd { .. } => "bitshuffle+zstd",
             Codec::Deflate { .. } => "deflate",
             Codec::Lz4 { .. } => "lz4",
+            Codec::Brotli => "brotli",
             Codec::Xz { .. } => "xz",
             Codec::AnsLut => "ans-lut",
             Codec::BitshuffleDeflate { .. } => "bitshuffle+deflate",
@@ -161,6 +173,14 @@ impl Codec {
         matches!(self, Codec::Unsupported("zfp") | Codec::Unsupported("sz3"))
     }
 
+    /// Whether this build can read this codec but not produce it. A decode-only
+    /// codec is a legitimate stored form — a reader decompresses it — but a
+    /// builder asked to *write* one has nothing to write with, which is
+    /// indeterminate rather than a silent downgrade.
+    pub fn decode_only(&self) -> bool {
+        matches!(self, Codec::Brotli)
+    }
+
     pub fn from_id(id: u8) -> Codec {
         match id {
             id::RAW => Codec::Raw,
@@ -171,13 +191,13 @@ impl Codec {
             },
             id::DEFLATE => Codec::Deflate { level: 6 },
             id::LZ4 => Codec::Lz4 { level: 6 },
+            id::BROTLI => Codec::Brotli,
             id::XZ => Codec::Xz { level: 6 },
             id::ANS_LUT => Codec::AnsLut,
             id::BITSHUFFLE_DEFLATE => Codec::BitshuffleDeflate {
                 elem_size: 2,
                 level: 6,
             },
-            id::BROTLI => Codec::Unsupported("brotli"),
             id::ZFP => Codec::Unsupported("zfp"),
             id::SZ3 => Codec::Unsupported("sz3"),
             _ => Codec::Unsupported("unknown"),
@@ -241,11 +261,11 @@ impl Codec {
             "bitshuffle+zstd" => Codec::BitshuffleZstd { elem_size, level },
             "deflate" => Codec::Deflate { level },
             "lz4" => Codec::Lz4 { level },
+            "brotli" => Codec::Brotli,
             "xz" => Codec::Xz { level },
             "ans-lut" => Codec::AnsLut,
             "bitshuffle+deflate" => Codec::BitshuffleDeflate { elem_size, level },
             "bitshuffle" => Codec::Bitshuffle { elem_size },
-            "brotli" => Codec::Unsupported("brotli"),
             "zfp" => Codec::Unsupported("zfp"),
             "sz3" => Codec::Unsupported("sz3"),
             _ => Codec::Unsupported("unknown"),
@@ -263,6 +283,10 @@ impl Codec {
             )),
             Codec::Deflate { level } => Ok(deflate(logical, *level)),
             Codec::Lz4 { level } => Ok(crate::lz4::compress(logical, *level)),
+            // Decode-only: this build reads brotli but ships no encoder that
+            // would shrink weights, and emitting uncompressed meta-blocks would
+            // expand them. Refusing is the honest answer (§15.1 indeterminate).
+            Codec::Brotli => Err(Error::Unsupported("brotli")),
             Codec::Xz { level } => Ok(crate::xz::compress(logical, *level)),
             Codec::AnsLut => Ok(crate::ans::compress(logical, 0)),
             Codec::Bitshuffle { elem_size } => Ok(bitshuffle(logical, *elem_size)),
@@ -299,6 +323,7 @@ impl Codec {
             }
             Codec::Deflate { .. } => inflate(stored, n)?,
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, n)?,
+            Codec::Brotli => crate::brotli::decompress(stored, n).map_err(brotli_err)?,
             Codec::Xz { .. } => crate::xz::decompress(stored, n)?,
             Codec::AnsLut => crate::ans::decompress(stored, n)?,
             Codec::Bitshuffle { elem_size } => unbitshuffle(stored, *elem_size),
@@ -334,6 +359,7 @@ impl Codec {
             )),
             Codec::Deflate { .. } => inflate(stored, cap),
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, cap),
+            Codec::Brotli => crate::brotli::decompress(stored, cap).map_err(brotli_err),
             Codec::Xz { .. } => crate::xz::decompress(stored, cap),
             Codec::AnsLut => crate::ans::decompress(stored, cap),
             Codec::Bitshuffle { elem_size } => Ok(unbitshuffle(stored, *elem_size)),
@@ -342,6 +368,18 @@ impl Codec {
             }
             Codec::Unsupported(name) => Err(Error::Unsupported(name)),
         }
+    }
+}
+
+/// Carries a brotli decoder error into this module's vocabulary: an output that
+/// overran its declared length is a §03.7.4 bound, everything else is a corrupt
+/// stream.
+fn brotli_err(e: crate::brotli::Error) -> Error {
+    match e {
+        crate::brotli::Error::TooLarge => {
+            Error::Bounds("brotli output exceeds the declared logical length".into())
+        }
+        other => Error::Corrupt(other.to_string()),
     }
 }
 
@@ -1043,7 +1081,7 @@ mod tests {
 
     #[test]
     fn unimplemented_codecs_say_so_rather_than_guessing() {
-        for name in ["brotli", "zfp", "sz3"] {
+        for name in ["zfp", "sz3"] {
             let c = Codec::from_value(&Value::map(vec![("id", Value::text(name))]));
             assert_eq!(c.name(), name);
             assert!(matches!(c.encode(b"x"), Err(Error::Unsupported(_))));
@@ -1058,6 +1096,31 @@ mod tests {
         assert!(Codec::Unsupported("sz3").is_lossy());
         assert!(!Codec::Deflate { level: 6 }.is_lossy());
         assert!(!Codec::Raw.is_lossy());
+    }
+
+    #[test]
+    fn brotli_reads_through_the_codec_layer_but_will_not_be_produced() {
+        let c = Codec::Brotli;
+        assert_eq!(c.id(), id::BROTLI);
+        assert_eq!(c.name(), "brotli");
+        assert!(c.decode_only());
+        assert!(!c.is_lossy());
+        // Producing brotli is refused — not a silent downgrade to raw.
+        assert!(matches!(
+            c.encode(b"weights"),
+            Err(Error::Unsupported("brotli"))
+        ));
+        // A valid brotli stream decodes through the codec-layer path. The
+        // stream here comes from this crate's uncompressed-meta-block writer,
+        // which the RFC 7932 decoder reads like any other brotli; the
+        // dictionary-and-transform streams are covered byte-for-byte against
+        // libbrotli in tests/brotli_vectors.rs.
+        let data = b"the quick brown fox jumps".repeat(8);
+        let stream = crate::brotli::compress(&data);
+        let out = c.decode(&stream, data.len() as u64, false).unwrap();
+        assert_eq!(out, data);
+        // §03.7.4: a cap below the true length is a bound error, not an over-read.
+        assert!(matches!(c.decode_framed(&stream, 4), Err(Error::Bounds(_))));
     }
 
     #[test]
@@ -1078,7 +1141,7 @@ mod tests {
             Codec::Lz4 { level: 6 },
             Codec::Xz { level: 6 },
             Codec::AnsLut,
-            Codec::Unsupported("brotli"),
+            Codec::Brotli,
         ] {
             let v = c.to_value();
             assert_eq!(Codec::from_value(&v), c, "{}", c.name());

@@ -778,7 +778,7 @@ it.
 
 ## Tests
 
-652 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+658 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -844,7 +844,12 @@ decodes to the original, that deflate round-trips at every
 level and is reproducible, that bitshuffle is exactly invertible at any length
 and helps on float weights, that a compressed container holds the same objects
 and digests as an uncompressed one, and that a lying ratio, a back-reference
-before the start of a stream and a tampered compressed object are all refused; and, for planning, that the
+before the start of a stream and a tampered compressed object are all refused;
+that brotli decodes every stream libbrotli produced from the corpus byte for
+byte — the prose, HTML and JSON cases forcing the 122 KiB static dictionary and
+its §8 transforms, the machinery a lazy decoder gets wrong — while a build that
+ships only a decoder refuses to *produce* brotli and refuses an output that
+would run past its declared length; and, for planning, that the
 objective decides which realization is chosen, that a refused capability is
 never attempted while an unknown one may be, that a dequantizable
 representation needs the scheme, and that resolution is deterministic; and, for
@@ -1076,7 +1081,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 652 passed; 0 failed
+test result: ok. 658 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

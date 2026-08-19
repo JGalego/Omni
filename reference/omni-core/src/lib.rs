@@ -60,6 +60,8 @@ pub mod ans;
 pub mod bao;
 pub mod blake3;
 pub mod bnb;
+pub mod brotli;
+pub mod brotli_tables;
 pub mod cbor;
 pub mod codec;
 pub mod container;
