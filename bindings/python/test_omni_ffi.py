@@ -141,6 +141,27 @@ class TestLifetimes(unittest.TestCase):
         self.assertEqual(bytes(t.memory()), expected)
         t.close()
 
+    def test_values_survive_the_temporary_tensor_they_were_read_from(self):
+        # `list(model[name].values())` is the obvious idiom, and it drops the
+        # temporary tensor the instant `.values()` returns — the library frees
+        # that tensor's value buffer on release, so a view that *aliased* it
+        # would be read after free and hand back zeros or garbage. `values()`
+        # copies into Python-owned memory precisely so this reads right. A
+        # computed tensor is the case that matters: its buffer is freshly
+        # allocated per handle, the first thing the allocator hands back.
+        name = "model.layers.0.attn.q_proj.weight.bf16"
+        with omni_ffi.open(QUANT) as model:
+            held = model[name]
+            want = list(held.values())
+            held.close()
+            self.assertTrue(any(v != 0 for v in want))
+            # The footgun: nothing keeps the tensor alive past this line.
+            view = model[name].values()
+            gc.collect()
+            # Churn the allocator so a dangling view would read something else.
+            _ = [bytearray(8192) for _ in range(512)]
+            self.assertEqual(list(view), want)
+
     def test_closing_twice_and_using_after_close_are_both_defined(self):
         model = omni_ffi.open(PLAIN)
         t = model["model.layers.0.norm.weight"]

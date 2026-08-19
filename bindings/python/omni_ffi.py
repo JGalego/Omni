@@ -829,6 +829,14 @@ class Tensor(_Handle):
 
         This is the C1 path and it costs 8 bytes an element, which is why it is
         a separate call from `memory()` rather than the only way to read.
+
+        Unlike `memory()`, the returned view is a Python-owned *copy*, not an
+        alias of the library's buffer. The C library ties that buffer to the
+        tensor handle and frees it on release, so a view that aliased it would
+        dangle the instant a caller wrote the obvious `model[name].values()` —
+        the temporary tensor is collected the moment `.values()` returns, before
+        anything reads the view. Copying here is what makes that idiom sound;
+        `memory()` is the zero-copy path and documents its lifetime.
         """
         ptr = ctypes.POINTER(ctypes.c_double)()
         n = ctypes.c_size_t()
@@ -841,7 +849,8 @@ class Tensor(_Handle):
         buf = (ctypes.c_double * n.value).from_address(
             ctypes.cast(ptr, ctypes.c_void_p).value
         )
-        return memoryview(buf).cast("B").cast("d").toreadonly()
+        # Copy into Python-owned memory before the handle can be released.
+        return memoryview(bytearray(memoryview(buf).cast("B"))).cast("d").toreadonly()
 
     def tolist(self) -> list:
         return list(self.values())
