@@ -570,6 +570,19 @@ jobs:
       # from 2076 can execute a 2026 custom op without the 2026 toolchain; the
       # testable part is that an op *this* build has never heard of computes the
       # right numbers from the module the model shipped.
+      # zfp is lossy, so the fixtures hold what zfpy's *own decompressor* makes of
+      # each stream rather than the array it came from — comparing against the
+      # original would measure zfp's error instead of this decoder. Regenerated
+      # here so the committed fixtures are a check on this code rather than a
+      # record of what it once did.
+      - name: The zfp fixtures still say what zfpy says
+        run: |
+          pip install --quiet zfpy numpy
+          python3 tools/zfp-fixture.py /tmp/zfpfix | tee /tmp/zfp.txt
+          grep -qE '[0-9]+ streams from zfpy' /tmp/zfp.txt
+          diff -r /tmp/zfpfix reference/omni-core/tests/vectors/zfp --exclude=NOTICE
+          echo "the committed zfp fixtures are the ones zfpy produces"
+
       # §11.6 permits fixed-width SIMD and forbids the relaxed kind. The host
       # implements ~230 lane-wise instructions, and the only thing that can tell
       # a correct implementation from a self-consistent one is another engine —
@@ -4300,11 +4313,11 @@ jobs:
           # counted as one. Adding the slhdsa directory beside the mldsa one is
           # what surfaced that — the count stayed put instead of going up.
           paths = re.findall(r'^  ([A-Za-z0-9_.\-/]+(?:\*\*)?)(?=\s{2,}\S)', text, re.M)
-          # 14 rows in the table plus the two third-party directories called out
-          # under "Third-party material", which carry NIST's terms rather than
+          # 14 rows in the table plus the seven third-party paths called out under
+          # "Third-party material", which carry someone else's terms rather than
           # either of ours and still have to be paths that exist.
-          if len(paths) != 16:
-              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 16; the table has '
+          if len(paths) != 21:
+              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 21; the table has '
                                      'changed shape and this check may no longer read all of it'))
           for p in paths:
               root = p.split('/')[0].replace('**', '')

@@ -340,6 +340,19 @@ implemented:
   Concatenating the layers reproduces the container byte for byte, and importing
   verifies every blob against the digest that named it before anything becomes a
   file
+- §03.7.1 **zfp**, the first of the two lossy codecs, decode-only: the header's
+  field metadata and mode, the per-block common exponent, the embedded bit-plane
+  coder with its unary group tests, the negabinary conversion, the coefficient
+  ordering by total sequency and the inverse lifting transform — 1D, 2D and 3D,
+  `f32` and `f64`, in every one of the fixed-rate, fixed-precision and
+  fixed-accuracy modes. It is the one implemented codec §03.7.3's `LOSSY` flag
+  applies to, so that machinery is now exercised rather than only defined. 96
+  streams from `zfpy` decode to what *that library's own decompressor* makes of
+  them — the right comparison for a lossy codec, since what a reader must
+  reproduce is the value the stream holds and not the value it came from.
+  Reversible mode, 4D fields and the integer scalar types are refused by name
+  rather than approximated, and so is a codec revision this decoder does not
+  implement
 - §01.9 **pack partitioning**, all five strategies, as `omni pack --strategy`:
   `linear`, `by-tensor`, `by-layer`, `by-dtype` and `by-novelty`. A strategy is a
   deterministic *ordering* of the data objects — the container writer takes a
@@ -807,7 +820,7 @@ it.
 
 ## Tests
 
-662 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+666 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -874,6 +887,11 @@ level and is reproducible, that bitshuffle is exactly invertible at any length
 and helps on float weights, that a compressed container holds the same objects
 and digests as an uncompressed one, and that a lying ratio, a back-reference
 before the start of a stream and a tampered compressed object are all refused;
+that zfp decodes 96 streams from `zfpy` to exactly what that library's own
+decompressor makes of them, across one, two and three dimensions, `f32` and
+`f64`, and all three lossy modes — with the partial-block, all-zero-block and
+extreme-exponent cases in the corpus — while reversible mode, a 4D field, an
+integer field and an unknown codec revision are each refused by name;
 that brotli decodes every stream libbrotli produced from the corpus byte for
 byte — the prose, HTML and JSON cases forcing the 122 KiB static dictionary and
 its §8 transforms, the machinery a lazy decoder gets wrong — while a build that
@@ -1114,7 +1132,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 662 passed; 0 failed
+test result: ok. 666 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

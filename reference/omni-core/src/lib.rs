@@ -110,6 +110,7 @@ pub mod train;
 pub mod transport;
 pub mod wasm;
 pub mod xz;
+pub mod zfp;
 pub mod zstd;
 
 pub use bao::BaoTree;

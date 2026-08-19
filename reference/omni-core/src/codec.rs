@@ -17,7 +17,12 @@
 //! shrink weights, so it will not *produce* brotli — asking it to is
 //! indeterminate, not a silent downgrade to raw.
 //!
-//! Still unimplemented and reported as such: the two lossy ones. A registered
+//! `zfp` is decode-only for the same reason and one more: it is *lossy*, so
+//! §03.7.3 ties producing it to the `LOSSY` flag and a declared error bound —
+//! which is a decision belonging to whoever chose to lose the bits, not a default
+//! this codec can pick. [`crate::zfp`] reads any zfp-stored float field.
+//!
+//! Still unimplemented and reported as such: `sz3`. A registered
 //! codec this build cannot decode makes an object *indeterminate* (§15.1), never
 //! invalid — and never silently half-decoded.
 //!
@@ -107,6 +112,12 @@ pub enum Codec {
     /// brotli is readable. There is no size-competitive encoder here, so
     /// `encode` refuses rather than emit an expanding stream (see below).
     Brotli,
+    /// zfp (§03.7.1's lossy codec for float arrays). Decode-only, like brotli,
+    /// and lossy, which §03.7.3 ties to the `LOSSY` flag and a declared error
+    /// bound: this build reads a zfp-stored object but will not *produce* one,
+    /// because producing one means choosing an error bound the container would
+    /// then have to declare on the writer's behalf.
+    Zfp,
     /// The `.xz` container over LZMA2 — §03.7.1's archival codec.
     Xz {
         level: u8,
@@ -136,6 +147,7 @@ impl Codec {
             Codec::Deflate { .. } => id::DEFLATE,
             Codec::Lz4 { .. } => id::LZ4,
             Codec::Brotli => id::BROTLI,
+            Codec::Zfp => id::ZFP,
             Codec::Xz { .. } => id::XZ,
             Codec::AnsLut => id::ANS_LUT,
             Codec::BitshuffleDeflate { .. } => id::BITSHUFFLE_DEFLATE,
@@ -144,7 +156,6 @@ impl Codec {
             Codec::Bitshuffle { .. } => id::BITSHUFFLE_DEFLATE,
             Codec::Unsupported(name) => match *name {
                 "xz" => id::XZ,
-                "zfp" => id::ZFP,
                 "sz3" => id::SZ3,
                 "ans-lut" => id::ANS_LUT,
                 _ => 0xff,
@@ -160,6 +171,7 @@ impl Codec {
             Codec::Deflate { .. } => "deflate",
             Codec::Lz4 { .. } => "lz4",
             Codec::Brotli => "brotli",
+            Codec::Zfp => "zfp",
             Codec::Xz { .. } => "xz",
             Codec::AnsLut => "ans-lut",
             Codec::BitshuffleDeflate { .. } => "bitshuffle+deflate",
@@ -170,7 +182,7 @@ impl Codec {
 
     /// Whether §03.7.3 requires the `LOSSY` flag and a declared error bound.
     pub fn is_lossy(&self) -> bool {
-        matches!(self, Codec::Unsupported("zfp") | Codec::Unsupported("sz3"))
+        matches!(self, Codec::Zfp | Codec::Unsupported("sz3"))
     }
 
     /// Whether this build can read this codec but not produce it. A decode-only
@@ -178,7 +190,7 @@ impl Codec {
     /// builder asked to *write* one has nothing to write with, which is
     /// indeterminate rather than a silent downgrade.
     pub fn decode_only(&self) -> bool {
-        matches!(self, Codec::Brotli)
+        matches!(self, Codec::Brotli | Codec::Zfp)
     }
 
     pub fn from_id(id: u8) -> Codec {
@@ -198,7 +210,7 @@ impl Codec {
                 elem_size: 2,
                 level: 6,
             },
-            id::ZFP => Codec::Unsupported("zfp"),
+            id::ZFP => Codec::Zfp,
             id::SZ3 => Codec::Unsupported("sz3"),
             _ => Codec::Unsupported("unknown"),
         }
@@ -266,7 +278,7 @@ impl Codec {
             "ans-lut" => Codec::AnsLut,
             "bitshuffle+deflate" => Codec::BitshuffleDeflate { elem_size, level },
             "bitshuffle" => Codec::Bitshuffle { elem_size },
-            "zfp" => Codec::Unsupported("zfp"),
+            "zfp" => Codec::Zfp,
             "sz3" => Codec::Unsupported("sz3"),
             _ => Codec::Unsupported("unknown"),
         }
@@ -287,6 +299,10 @@ impl Codec {
             // would shrink weights, and emitting uncompressed meta-blocks would
             // expand them. Refusing is the honest answer (§15.1 indeterminate).
             Codec::Brotli => Err(Error::Unsupported("brotli")),
+            // Decode-only and lossy: producing zfp means choosing an error bound,
+            // and §03.7.3 would make the container declare it. That is the
+            // writer's decision, not this codec's default.
+            Codec::Zfp => Err(Error::Unsupported("zfp")),
             Codec::Xz { level } => Ok(crate::xz::compress(logical, *level)),
             Codec::AnsLut => Ok(crate::ans::compress(logical, 0)),
             Codec::Bitshuffle { elem_size } => Ok(bitshuffle(logical, *elem_size)),
@@ -324,6 +340,7 @@ impl Codec {
             Codec::Deflate { .. } => inflate(stored, n)?,
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, n)?,
             Codec::Brotli => crate::brotli::decompress(stored, n).map_err(brotli_err)?,
+            Codec::Zfp => crate::zfp::decompress(stored, n).map_err(zfp_err)?,
             Codec::Xz { .. } => crate::xz::decompress(stored, n)?,
             Codec::AnsLut => crate::ans::decompress(stored, n)?,
             Codec::Bitshuffle { elem_size } => unbitshuffle(stored, *elem_size),
@@ -360,6 +377,7 @@ impl Codec {
             Codec::Deflate { .. } => inflate(stored, cap),
             Codec::Lz4 { .. } => crate::lz4::decompress(stored, cap),
             Codec::Brotli => crate::brotli::decompress(stored, cap).map_err(brotli_err),
+            Codec::Zfp => crate::zfp::decompress(stored, cap).map_err(zfp_err),
             Codec::Xz { .. } => crate::xz::decompress(stored, cap),
             Codec::AnsLut => crate::ans::decompress(stored, cap),
             Codec::Bitshuffle { elem_size } => Ok(unbitshuffle(stored, *elem_size)),
@@ -379,6 +397,20 @@ fn brotli_err(e: crate::brotli::Error) -> Error {
         crate::brotli::Error::TooLarge => {
             Error::Bounds("brotli output exceeds the declared logical length".into())
         }
+        other => Error::Corrupt(other.to_string()),
+    }
+}
+
+/// Carries a zfp decoder error into this module's vocabulary. A field larger
+/// than the caller's bound is a §03.7.4 bound; a codec revision or a mode this
+/// build does not implement stays *unsupported*, because §15.1 makes that
+/// indeterminate rather than invalid.
+fn zfp_err(e: crate::zfp::Error) -> Error {
+    match e {
+        crate::zfp::Error::TooLarge => {
+            Error::Bounds("the zfp field exceeds the declared logical length".into())
+        }
+        crate::zfp::Error::Unsupported(_) => Error::Unsupported("zfp"),
         other => Error::Corrupt(other.to_string()),
     }
 }
@@ -1081,21 +1113,61 @@ mod tests {
 
     #[test]
     fn unimplemented_codecs_say_so_rather_than_guessing() {
-        for name in ["zfp", "sz3"] {
-            let c = Codec::from_value(&Value::map(vec![("id", Value::text(name))]));
-            assert_eq!(c.name(), name);
-            assert!(matches!(c.encode(b"x"), Err(Error::Unsupported(_))));
-            assert!(matches!(
-                c.decode(b"x", 1, false),
-                Err(Error::Unsupported(_))
-            ));
-        }
+        // `sz3` is the only registered codec left with no implementation at all,
+        // and it is one rather than a list because the others were written. Its
+        // format is defined by a research implementation rather than by a
+        // specification, which is why — see the module comment.
+        let c = Codec::from_value(&Value::map(vec![("id", Value::text("sz3"))]));
+        assert_eq!(c.name(), "sz3");
+        assert!(matches!(c.encode(b"x"), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            c.decode(b"x", 1, false),
+            Err(Error::Unsupported(_))
+        ));
+        // An identifier in no registry is a different answer from one that is
+        // registered and unimplemented.
+        assert_eq!(
+            Codec::from_value(&Value::map(vec![("id", Value::text("gzip9000"))])),
+            Codec::Unsupported("unknown")
+        );
         // The lossy ones are flagged as lossy, which §03.7.3 ties to LOSSY and
         // a declared error bound.
-        assert!(Codec::Unsupported("zfp").is_lossy());
+        assert!(Codec::Zfp.is_lossy());
         assert!(Codec::Unsupported("sz3").is_lossy());
         assert!(!Codec::Deflate { level: 6 }.is_lossy());
         assert!(!Codec::Raw.is_lossy());
+    }
+
+    #[test]
+    fn zfp_reads_through_the_codec_layer_and_is_flagged_lossy() {
+        let c = Codec::Zfp;
+        assert_eq!(c.id(), id::ZFP);
+        assert_eq!(c.name(), "zfp");
+        assert!(c.decode_only());
+        // The one implemented codec §03.7.3's LOSSY flag actually applies to, so
+        // that machinery is now exercised rather than merely defined.
+        assert!(c.is_lossy());
+        assert!(matches!(
+            c.encode(b"weights"),
+            Err(Error::Unsupported("zfp"))
+        ));
+        assert_eq!(
+            Codec::from_value(&Value::map(vec![("id", Value::text("zfp"))])),
+            Codec::Zfp
+        );
+        assert_eq!(Codec::from_id(id::ZFP), Codec::Zfp);
+        // A real stream, decoded through this layer. The fixture is the smallest
+        // one `tools/zfp-fixture.py` writes; `tests/zfp_vectors.rs` checks the
+        // values against zfpy, and this checks the codec-layer plumbing.
+        let path = format!(
+            "{}/tests/vectors/zfp/smooth1d-r8.zfp",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let stream = std::fs::read(path).expect("a zfp fixture");
+        let out = c.decode_framed(&stream, 1 << 20).expect("it decodes");
+        assert_eq!(out.len(), 64 * 4, "64 f32 values");
+        // §03.7.4: a cap below the field's own size is refused from the header.
+        assert!(matches!(c.decode_framed(&stream, 8), Err(Error::Bounds(_))));
     }
 
     #[test]

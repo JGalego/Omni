@@ -223,9 +223,11 @@ in both directions — reading a container, and *writing* one, with DLPack going
 in as well as out. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
 it — every importer but those ten, `https://` (TLS
-needs a dependency), `mount` (FUSE), `mmap` (`unsafe`), *producing* `brotli` (the decoder is
-complete and checked byte-for-byte against libbrotli, so brotli objects read; this
-build simply does not write brotli), and the two lossy codecs — and every one of
+needs a dependency), `mount` (FUSE), `mmap` (`unsafe`), *producing* `brotli` or
+`zfp` (both decoders are complete and checked byte-for-byte against the libraries
+that define them, so objects stored either way read; this build does not *write*
+them, and for `zfp` that is because writing a lossy stream means choosing an error
+bound §03.7.3 would have the container declare), and `sz3` — and every one of
 them is reported as
 unsupported at run time rather than guessed at. See
 [the roadmap](docs/design/roadmap.md) for what the gates have and have not

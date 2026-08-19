@@ -40,8 +40,20 @@ its terms at the top.
 Third-party material
 --------------------
 
-There is no vendored third-party *code* in this repository, because there are no
-dependencies to vendor. There are two directories of third-party *data*:
+There is no vendored third-party *source code* in this repository, because there
+are no dependencies to vendor. There is third-party *data*, in two kinds: tables
+that a format is defined by and that ship inside the crate, and test vectors
+produced by the reference implementation of a format.
+
+  reference/omni-core/src/brotli_dict.bin
+  reference/omni-core/src/brotli_tables.rs
+      RFC 7932's static dictionary and its word transforms, plus the two context
+      lookup tables, copied verbatim from google/brotli under the MIT licence.
+      These are the only third-party bytes that ship *in the published crate*
+      rather than only in its tests, and they are here because they are what the
+      format is: a decoder that reconstructed them would be guessing. The licence
+      and the file each table came from are in the NOTICE beside the brotli
+      vectors.
 
   reference/omni-core/tests/vectors/mldsa/
   reference/omni-core/tests/vectors/slhdsa/
@@ -52,7 +64,22 @@ dependencies to vendor. There are two directories of third-party *data*:
       which also states what was changed. Software written by NIST employees is
       not subject to copyright protection within the United States.
 
-Those directories are the exception to the table above, and it is called out here
+  reference/omni-core/tests/vectors/brotli/
+      Streams produced by libbrotli (MIT), with the originals beside them, so
+      this crate's decoder can be required to reproduce every byte.
+
+  reference/omni-core/tests/vectors/zfp/
+      Streams produced by LLNL's zfp through `zfpy`, together with that library's
+      own decompression of them — the comparison a lossy codec needs. zfp is BSD
+      3-Clause; the decoder's constants were transcribed from its sources, and
+      both facts are in the NOTICE beside the vectors.
+
+  reference/omni-core/tests/vectors/wasmsimd/
+      WebAssembly modules this repository wrote, and the results Bytecode
+      Alliance's wasmtime (Apache-2.0 WITH LLVM-exception) produces for them,
+      which is what the SIMD implementation is checked against.
+
+Those paths are the exception to the table above, and it is called out here
 rather than left to be inferred from the table's silence — an unlisted file is a
 file whose terms somebody has to guess at.
 
