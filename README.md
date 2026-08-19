@@ -202,7 +202,8 @@ implemented twice), tokenizers and chat templates, adapters
 and deltas, OMNI-IR with its dialects and rewrites and an interpreter that runs
 it — including a dialect nobody has heard of shipping the WebAssembly that
 shapes, verifies *and computes* its own ops — capability negotiation,
-COSE signatures under Ed25519 and ES256, training state, a WebAssembly host for
+COSE signatures under Ed25519, ES256 and all three ML-DSA parameter sets — the
+post-quantum one checked against NIST's own known-answer vectors — training state, a WebAssembly host for
 plugins, HTTP range transport
 with the detached index sidecar, an object server, and the OCI mapping over a
 real registry — credentials, chunked upload, and the referrers API with the
@@ -220,7 +221,7 @@ in as well as out. What is *not* implemented is stated in
 the same place it is claimed: [`reference/README.md`](reference/README.md) lists
 it — every importer but those nine, `https://` (TLS
 needs a dependency), `mount` (FUSE), `mmap` (`unsafe`), SIMD in the
-plugin host, ML-DSA, and `brotli` and the two lossy codecs — and every one of them is reported as
+plugin host, SLH-DSA, and `brotli` and the two lossy codecs — and every one of them is reported as
 unsupported at run time rather than guessed at. See
 [the roadmap](docs/design/roadmap.md) for what the gates have and have not
 proven.

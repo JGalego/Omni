@@ -3593,6 +3593,44 @@ jobs:
       # codecs, so the check that means something exchanges signatures with an
       # independent implementation — here `cryptography`, which is OpenSSL
       # underneath.
+      # ML-DSA is the one algorithm here whose oracle is the standard itself
+      # rather than another implementation: NIST publishes the known-answer
+      # vectors for FIPS 204. The vector test runs in `cargo test`; this step
+      # checks the other half — that the algorithm is reachable from the CLI and
+      # survives a real container, which is what a user actually does with it.
+      - name: ML-DSA signs a real container, and every parameter set round-trips
+        run: |
+          OMNI=reference/target/release/omni
+          SEED=$(python3 -c "print('a7'*32)")
+          "$OMNI" example /tmp/pq.omni >/dev/null
+          for alg in ml-dsa-44 ml-dsa-65 ml-dsa-87; do
+            "$OMNI" keygen --alg "$alg" --seed "$SEED" --out "/tmp/pq-$alg.hex" >/dev/null
+            "$OMNI" sign /tmp/pq.omni --key "$SEED" --alg "$alg" -o "/tmp/pq-$alg.omni" >/dev/null
+            "$OMNI" sign --verify "/tmp/pq-$alg.omni" --key "@/tmp/pq-$alg.hex" \
+              | tee "/tmp/pq-$alg.txt"
+            grep -q 'policy satisfied' "/tmp/pq-$alg.txt"
+
+            # Writer rule W1 reaches the signature: FIPS 204's deterministic
+            # variant must produce the same container twice.
+            "$OMNI" sign /tmp/pq.omni --key "$SEED" --alg "$alg" -o "/tmp/pq-$alg-again.omni" >/dev/null
+            cmp "/tmp/pq-$alg.omni" "/tmp/pq-$alg-again.omni"
+
+            # And the wrong parameter set's key must not verify it. The key
+            # lengths differ, so this is caught as malformed rather than by
+            # accident.
+            other=ml-dsa-65; [ "$alg" = ml-dsa-65 ] && other=ml-dsa-87
+            "$OMNI" keygen --alg "$other" --seed "$SEED" --out /tmp/pq-other.hex >/dev/null
+            if "$OMNI" sign --verify "/tmp/pq-$alg.omni" --key @/tmp/pq-other.hex \
+                 | grep -q 'policy satisfied'; then
+              echo "::error::$alg verified under an $other key"; exit 1
+            fi
+          done
+
+          # A signature this build cannot check must be indeterminate, not
+          # invalid (§15.1). SLH-DSA is §12.5.1's MAY-level algorithm and is the
+          # one deliberately left unimplemented to keep that path exercised.
+          echo "all three ML-DSA parameter sets signed, verified and reproduced"
+
       - name: ES256 agrees with a real ECDSA implementation, both ways
         run: |
           # Already present on some images; installing over a distro package
@@ -4001,8 +4039,11 @@ jobs:
           # this check, it silently stops being covered by it, which is the worse
           # of the two outcomes because it looks like a pass.
           paths = re.findall(r'^  ([A-Za-z0-9_.\-/]+(?:\*\*)?)\s{2,}\S', text, re.M)
-          if len(paths) != 14:
-              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 14; the table has '
+          # 14 rows in the table plus the one third-party directory called out
+          # under "Third-party material", which carries NIST's terms rather than
+          # either of ours and still has to be a path that exists.
+          if len(paths) != 15:
+              bad.append(('LICENSE', f'{len(paths)} paths parsed, expected 15; the table has '
                                      'changed shape and this check may no longer read all of it'))
           for p in paths:
               root = p.split('/')[0].replace('**', '')

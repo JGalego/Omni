@@ -95,9 +95,10 @@ $ ./target/release/omni oci export model.omni -o layout/ # §13.5, push with ora
 - **Zero dependencies.** `docs/design/sdk.md` §5 claims a conforming C0 reader
   needs nothing beyond a hash function and fits in ~3 000 lines. This crate is
   the evidence rather than the assertion — BLAKE3, SHA-256, SHA-512, CRC-32C,
-  CRC-64, Ed25519, NIST P-256 with ECDSA and RFC 6979 deterministic nonces,
-  ChaCha20, deflate, Zstandard, LZ4, LZMA2 with its range coder, rANS, XXH64 and
-  a strict canonical CBOR codec are all implemented here. That list is longer
+  CRC-64, Keccak-f[1600] with SHAKE128 and SHAKE256, Ed25519, NIST P-256 with
+  ECDSA and RFC 6979 deterministic nonces, ML-DSA in all three FIPS 204
+  parameter sets, ChaCha20, deflate, Zstandard, LZ4, LZMA2 with its range coder,
+  rANS, XXH64 and a strict canonical CBOR codec are all implemented here. That list is longer
   than the C0 budget needs, which is the point: the budget covers a *reader*, and
   everything past it is what the constraint costs to keep once the crate does
   more than read.
@@ -242,9 +243,23 @@ implemented:
   been a real vulnerability in somebody's ECDSA. RFC 6979's own P-256 vector is a
   unit test, and CI exchanges signatures with `cryptography` in both directions,
   because §12.5's algorithms are somebody else's specification exactly like
-  §03.7's codecs. ML-DSA, the third §12.5.1 names, is **not** here: a lattice
-  signature is a different amount of code and its COSE registration is still
-  moving, so a container signed with one is reported *indeterminate* by name
+  §03.7's codecs. **ML-DSA** (FIPS 204), the third §12.5.1 names,
+  is here too, and all three parameter sets: 44, 65 and 87, with SHAKE128 and
+  SHAKE256 written out because Keccak is not SHA-2 and this crate had neither.
+  It exists for §12.11 rather than for compatibility — a container signed now
+  and verified in twenty years cannot be re-signed by whoever wrote it, which is
+  what makes an archival format's exposure to adversary A7 different in kind
+  from a TLS session's — and it signs deterministically, because writer rule W1
+  reaches the signature as well as the bytes it covers.
+  This is the one algorithm here checked against **NIST's own known-answer
+  vectors** rather than against a second implementation, which is a stronger
+  oracle and was a necessary one: with rejection sampling, a hint mechanism and
+  four little-endian bit packings, a signer and verifier that share a misreading
+  agree with each other perfectly. Swapping `ExpandA`'s row and column indices
+  leaves all twelve of the module's own tests passing and fails every NIST vector
+  on the first byte — that experiment is in the commit that added it. What is
+  *not* implemented is SLH-DSA (§12.5.1 marks it MAY) and ML-DSA's pre-hash and
+  external-mu interfaces, which are refused by name
 - §06.7 the tokenizer IR: read structurally — the vocabulary as a string tensor,
   the merges as `u32` id pairs — with `encode`/`decode` for the bpe, wordpiece,
   unigram, wordlevel, char and byte kinds, the normalizer, pre-tokenizer and
@@ -729,7 +744,7 @@ expectation.
 
 ## Tests
 
-614 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+631 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -1027,7 +1042,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 614 passed; 0 failed
+test result: ok. 631 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

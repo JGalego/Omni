@@ -77,6 +77,7 @@ pub mod jinja;
 pub mod json;
 pub mod layout;
 pub mod lz4;
+pub mod mldsa;
 pub mod model;
 pub mod npy;
 pub mod oci;

@@ -247,10 +247,10 @@ VERBS:
     plan    <file> [--caps caps.cbor] [--objective O] [--memory N]
                               [--optimistic] [--allow-lossy]
                               Resolve a model against a runtime (§10.5)
-    keygen  [--out key.hex] [--seed <hex>] [--alg ed25519|es256]
+    keygen  [--out key.hex] [--seed <hex>] [--alg ed25519|es256|ml-dsa-44|ml-dsa-65|ml-dsa-87]
                               Make a signing key (§12.5.1). ES256 is the one an
                               HSM, a KMS and a WebPKI certificate already speak
-    sign    <file> --key <hex> [--alg ed25519|es256] [-o <out.omni>]
+    sign    <file> --key <hex> [--alg ed25519|es256|ml-dsa-44|..] [-o <out.omni>]
                       [--purpose P] [--counter N]
                               Sign a manifest and embed the attestation. Signing
                               is deterministic under both algorithms, so the same
@@ -7920,6 +7920,24 @@ fn unhex(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 /// `omni keygen` — an Ed25519 key pair (§12.5.1).
+/// The `--alg` spellings for ML-DSA. Accepting both `ml-dsa-44` and `mldsa44`
+/// is not indulgence: FIPS 204, the COSE registry and everyday shorthand all
+/// punctuate this name differently, and a user who guesses wrong should get a
+/// key rather than a usage error.
+fn mldsa_params(spelling: &str) -> Option<omni_core::mldsa::Params> {
+    let norm: String = spelling
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    match norm.as_str() {
+        "mldsa44" | "mldsa" => Some(omni_core::mldsa::ML_DSA_44),
+        "mldsa65" => Some(omni_core::mldsa::ML_DSA_65),
+        "mldsa87" => Some(omni_core::mldsa::ML_DSA_87),
+        _ => None,
+    }
+}
+
 fn cmd_keygen(args: &[String]) -> R {
     let seed: [u8; 32] = match flag(args, "--seed") {
         // A declared seed makes the key reproducible, which is what tests and
@@ -7938,9 +7956,10 @@ fn cmd_keygen(args: &[String]) -> R {
                 .map_err(|_| "short read from /dev/urandom")?
         }
     };
-    // §12.5 names three algorithms and two are implemented. The default stays
-    // Ed25519, because that is what §12.5 makes the default; ES256 is for the
-    // keys an HSM, a KMS or a WebPKI certificate already holds.
+    // §12.5 names three algorithms and all three are implemented. The default
+    // stays Ed25519, because that is what §12.5 makes the default; ES256 is for
+    // the keys an HSM, a KMS or a WebPKI certificate already holds; ML-DSA is
+    // for the archive that has to still verify after the curve does not.
     let (alg, public, seed_hex) = match flag(args, "--alg").unwrap_or("ed25519") {
         "ed25519" | "eddsa" | "EdDSA" => {
             let sk = omni_core::ed25519::SecretKey::from_seed(&seed);
@@ -7950,10 +7969,19 @@ fn cmd_keygen(args: &[String]) -> R {
             let sk = omni_core::p256::from_seed(&seed);
             ("ES256", hex(&sk.public_key()), hex(&sk.to_bytes()))
         }
+        other if mldsa_params(other).is_some() => {
+            let params = mldsa_params(other).expect("just matched");
+            let kp = omni_core::mldsa::keygen(&params, &seed);
+            // The seed is printed rather than the 2560-byte secret key: FIPS 204
+            // derives the whole key from these 32 bytes, so the seed *is* the
+            // private key, and a key file that stored the expansion would be
+            // eighty times larger and no more secret.
+            (params.name, hex(&kp.public), hex(&seed))
+        }
         other => {
             prr!(
                 "omni: unknown --alg `{other}`. §12.5 names ed25519, es256 and \
-                 ml-dsa; the first two are implemented\n"
+                 ml-dsa (44, 65, 87)\n"
             );
             return Ok(2);
         }
@@ -8013,12 +8041,35 @@ fn cmd_sign(args: &[String]) -> R {
             if k.is_empty() {
                 continue;
             }
-            // 32 bytes is an Ed25519 point and 65 an uncompressed P-256 one, so
-            // the length names the algorithm and the caller does not have to.
-            let b = unhex(k)?;
-            if b.len() != 32 && b.len() != omni_core::p256::PUBLIC_LEN {
+            // The length names the algorithm and the caller does not have to:
+            // 32 bytes is an Ed25519 point, 65 an uncompressed P-256 one, and
+            // 1312/1952/2592 an ML-DSA-44/65/87 encoded key. No value is two of
+            // these, which is what makes the length sufficient.
+            //
+            // An ML-DSA key is 2624 hex digits, which is past what anyone will
+            // paste, so `--key @file` reads it from the file `keygen --out`
+            // wrote. That is a convenience for Ed25519 and a necessity here.
+            let b = if let Some(file) = k.strip_prefix('@') {
+                let text = std::fs::read_to_string(file)?;
+                let line = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("public "))
+                    .ok_or("that key file has no `public` line")?;
+                unhex(line.trim())?
+            } else {
+                unhex(k)?
+            };
+            let mldsa_lens: Vec<usize> = omni_core::mldsa::ALL
+                .iter()
+                .map(|p| p.public_key_len())
+                .collect();
+            if b.len() != 32
+                && b.len() != omni_core::p256::PUBLIC_LEN
+                && !mldsa_lens.contains(&b.len())
+            {
                 return Err(
-                    "--key takes 32 bytes of hex (Ed25519) or 65 (uncompressed ES256) per key"
+                    "--key takes 32 bytes of hex (Ed25519), 65 (uncompressed ES256), \
+                     or 1312/1952/2592 (ML-DSA-44/65/87); `@path` reads a keygen file"
                         .into(),
                 );
             }
@@ -8113,10 +8164,14 @@ fn cmd_sign(args: &[String]) -> R {
         "es256" | "ES256" | "p256" => {
             omni_core::sign::SigningKey::Es256(omni_core::p256::from_seed(&seed))
         }
+        other if mldsa_params(other).is_some() => {
+            let params = mldsa_params(other).expect("just matched");
+            omni_core::sign::SigningKey::MlDsa(Box::new(omni_core::mldsa::keygen(&params, &seed)))
+        }
         other => {
             prr!(
                 "omni: unknown --alg `{other}`. §12.5 names ed25519, es256 and \
-                 ml-dsa; the first two are implemented\n"
+                 ml-dsa (44, 65, 87)\n"
             );
             return Ok(2);
         }
@@ -8227,12 +8282,25 @@ fn cmd_sign(args: &[String]) -> R {
         "  canonical       {}",
         short(algo, &tbs.summary.canonical_digest)
     );
-    pr!("  public key      {}", hex(&sk.public_key()));
+    let public = hex(&sk.public_key());
+    // An ML-DSA public key is 2624 hex digits. Printing it in full, and then
+    // printing it again inside a command line, turns a useful hint into two
+    // screens of noise — so past the length anyone would paste, say where the
+    // key is instead of what it is.
+    const PASTEABLE: usize = 130;
+    if public.len() <= PASTEABLE {
+        pr!("  public key      {public}");
+        pr!("  verify with     omni sign --verify {out} --key {public}");
+    } else {
+        pr!(
+            "  public key      {}… ({} bytes, {})",
+            &public[..64],
+            public.len() / 2,
+            sk.alg_name()
+        );
+        pr!("  verify with     omni sign --verify {out} --key @<the file keygen --out wrote>");
+    }
     pr!("  new file root   {}", short(algo, &new_root));
-    pr!(
-        "  verify with     omni sign --verify {out} --key {}",
-        hex(&sk.public_key())
-    );
     Ok(0)
 }
 

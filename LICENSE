@@ -35,8 +35,25 @@ Under Apache-2.0 OR MIT (see LICENSE-APACHE and LICENSE-MIT):
 A file's own header wins over this list where the two disagree, and a
 `SPDX-License-Identifier` line is the header that says so. Where a directory
 above contains a file taken from somewhere else, that file names its origin and
-its terms at the top; there is no vendored third-party code in this repository
-at present, because there are no dependencies to vendor.
+its terms at the top.
+
+Third-party material
+--------------------
+
+There is no vendored third-party *code* in this repository, because there are no
+dependencies to vendor. There is one piece of third-party *data*:
+
+  reference/omni-core/tests/vectors/mldsa/
+      Test vectors derived from NIST's ACVP-Server, redistributed under NIST's
+      own terms rather than under either licence above. Those terms permit
+      copying and modification provided the notice is kept intact and NIST is
+      acknowledged as the source; both are done in the NOTICE file beside them,
+      which also states what was changed. Software written by NIST employees is
+      not subject to copyright protection within the United States.
+
+That directory is the exception to the table above, and it is called out here
+rather than left to be inferred from the table's silence — an unlisted file is a
+file whose terms somebody has to guess at.
 
 Why the split is drawn here
 ---------------------------
