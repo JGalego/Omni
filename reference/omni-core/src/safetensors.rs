@@ -528,16 +528,6 @@ pub struct Imported {
     pub report: Fidelity,
 }
 
-/// `__metadata__` keys this importer models, mapped onto OMNI metadata. Anything
-/// else goes to a `Foreign` object rather than being dropped or guessed at.
-///
-/// The list is short on purpose. `format` is written by every safetensors writer
-/// and says `pt`; it describes the *producer*, which OMNI records as provenance
-/// rather than as a property of the model.
-fn modelled_metadata_key(k: &str) -> bool {
-    matches!(k, "format")
-}
-
 /// The `Foreign` object that preserves the metadata keys this build does not
 /// model (I2), with the source path, offset and digest that make it recoverable.
 fn foreign_object(unmodelled: &[(String, String)], path: &str, source: &Digest) -> Object {
@@ -673,13 +663,13 @@ pub fn import(bytes: &[u8], opts: &ImportOpts) -> Res<Imported> {
         action: "recomputed from the imported tensors".into(),
     });
 
-    // I2: the metadata keys this build does not model, kept verbatim.
-    let unmodelled: Vec<(String, String)> = f
-        .metadata
-        .iter()
-        .filter(|(k, _)| !modelled_metadata_key(k))
-        .cloned()
-        .collect();
+    // I2: every `__metadata__` key, kept verbatim. `format` used to be the one
+    // modeled key — described as provenance rather than preserved — but the
+    // exporter then had to invent the value back (`"pt"`, whatever the source
+    // said), which is how the export stopped being the inverse of the import.
+    // The producer is already recorded in the Provenance object; the key is
+    // the source's data, and the source's data is preserved.
+    let unmodelled: Vec<(String, String)> = f.metadata.to_vec();
     if !f.metadata.is_empty() {
         report.represented.push("__metadata__".into());
     }
@@ -1104,43 +1094,54 @@ pub fn export(
     }
 
     // Header first, with the offsets the plan already computed: the plan is what
-    // was consented to, so the writer follows it rather than recomputing.
-    let mut header = std::collections::BTreeMap::new();
+    // was consented to, so the writer follows it rather than recomputing. The
+    // serialization is the reference implementations' own — `__metadata__`
+    // first, then the tensors in data order (not name order: the header lists
+    // tensors the way the data section lays them out), each entry spelled
+    // `dtype`/`shape`/`data_offsets` in that order, the JSON compact, and the
+    // header padded to an 8-byte boundary with spaces. None of that is what a
+    // canonical-JSON writer produces, and matching it is not cosmetic: Gate 1's
+    // round trip is *bit-exact against real files*, the header is part of the
+    // file, and an export that reorders it writes a file like the source
+    // instead of the source. Nothing is injected either — an `omni.exporter`
+    // key used to be, and one added key is one byte-for-byte failure per model;
+    // the loss report beside the artifact is where E3's pointer lives.
+    let mut entries: Vec<String> = Vec::new();
+    if !extra_metadata.is_empty() {
+        let mut md: Vec<&(String, String)> = extra_metadata.iter().collect();
+        md.sort();
+        md.dedup();
+        entries.push(format!(
+            "\"__metadata__\":{{{}}}",
+            md.iter()
+                .map(|(k, v)| format!(
+                    "{}:{}",
+                    json::string(k.clone()).encode(),
+                    json::string(v.clone()).encode()
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     let mut at = 0u64;
     for (name, st, shape, bytes) in &plan.tensors {
-        header.insert(
-            name.clone(),
-            json::object(vec![
-                ("dtype", json::string(st.clone())),
-                (
-                    "shape",
-                    json::Value::Array(shape.iter().map(|d| json::Value::U(*d)).collect()),
-                ),
-                (
-                    "data_offsets",
-                    json::Value::Array(vec![json::Value::U(at), json::Value::U(at + bytes)]),
-                ),
-            ]),
-        );
+        entries.push(format!(
+            "{}:{{\"dtype\":{},\"shape\":[{}],\"data_offsets\":[{at},{}]}}",
+            json::string(name.clone()).encode(),
+            json::string(st.clone()).encode(),
+            shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            at + bytes,
+        ));
         at += bytes;
     }
-    let mut md: std::collections::BTreeMap<String, json::Value> = extra_metadata
-        .iter()
-        .map(|(k, v)| (k.clone(), json::string(v.clone())))
-        .collect();
-    // E3: the exported file points back at what produced it.
-    md.insert("format".into(), json::string("pt"));
-    md.insert(
-        "omni.exporter".into(),
-        json::string(format!(
-            "omni-export-safetensors/{}",
-            env!("CARGO_PKG_VERSION")
-        )),
-    );
-    if !md.is_empty() {
-        header.insert("__metadata__".into(), json::Value::Object(md));
+    let mut header_bytes = format!("{{{}}}", entries.join(",")).into_bytes();
+    while !(8 + header_bytes.len()).is_multiple_of(8) {
+        header_bytes.push(b' ');
     }
-    let header_bytes = json::Value::Object(header).encode().into_bytes();
 
     let mut out = Vec::with_capacity(8 + header_bytes.len() + plan.bytes as usize);
     out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
@@ -1414,12 +1415,14 @@ mod tests {
             }
         }
 
-        // I2: the metadata key with no schema is preserved, and named.
+        // I2: every metadata key is preserved, and named — `format` included,
+        // because the export writes back what the source had rather than
+        // re-inventing it.
         assert!(r
             .unrepresented
             .iter()
             .any(|n| n.item == "__metadata__.hand.written"));
-        assert!(!r
+        assert!(r
             .unrepresented
             .iter()
             .any(|n| n.item == "__metadata__.format"));
@@ -1562,8 +1565,11 @@ mod tests {
             assert_eq!(mine.shape, e.shape, "{}", e.name);
             assert_eq!(f.tensor(mine), g.tensor(e), "{} differs", e.name);
         }
-        // E3: the exported file points back at what produced it.
-        assert!(f.metadata.iter().any(|(k, _)| k == "omni.exporter"));
+        // Nothing invented: no metadata was passed, so none is written. (An
+        // `omni.exporter` key used to be injected here, and one added key is
+        // one bit-exact round-trip failure per model; E3's pointer lives in
+        // the loss report beside the artifact instead.)
+        assert!(f.metadata.is_empty(), "{:?}", f.metadata);
 
         // And round-tripping through OMNI again gives the same tensor digests:
         // the identities survive, which is what "lossless" has to mean here.
@@ -1575,6 +1581,66 @@ mod tests {
                 .collect()
         };
         assert_eq!(blobs(&again.objects), blobs(&imported.objects));
+    }
+
+    /// A file serialized the way the reference implementations write it —
+    /// `__metadata__` first, tensors in data order, `dtype`/`shape`/
+    /// `data_offsets` per entry, compact JSON, the header space-padded to an
+    /// 8-byte boundary — must come back byte for byte, header included. This
+    /// is Gate 1's reading of "lossless", and the tensor-set equality above
+    /// cannot stand in for it: a reordered header keeps every digest and
+    /// still fails a bit-exact comparison against the source.
+    #[test]
+    fn a_reference_serialized_file_round_trips_byte_for_byte() {
+        // Note the data order (`z` first) disagreeing with name order, and the
+        // header padded with spaces — both are what the reference writers
+        // produce and both are what a name-sorted canonical writer gets wrong.
+        let mut data = Vec::new();
+        for i in 0..4u32 {
+            data.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+        for h in [0x3f80u16, 0x0000] {
+            data.extend_from_slice(&h.to_le_bytes());
+        }
+        let mut header = br#"{"__metadata__":{"format":"pt"},"z":{"dtype":"F32","shape":[4],"data_offsets":[0,16]},"a.weight":{"dtype":"BF16","shape":[2],"data_offsets":[16,20]}}"#.to_vec();
+        while !(8 + header.len()).is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut source = (header.len() as u64).to_le_bytes().to_vec();
+        source.extend_from_slice(&header);
+        source.extend_from_slice(&data);
+
+        let imported = import(&source, &ImportOpts::default()).unwrap();
+        let hash = HashAlgo::default();
+        let store = store_of(&imported.objects, hash);
+        let ctx = Ctx::new(&store);
+        let table = table_of(&imported.objects, &imported.root, hash).unwrap();
+        let manifest = crate::cbor::decode(
+            &crate::store::Store::resolve(&store, &imported.root)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let d = descs_of(&imported.objects, hash);
+        let p = plan(&ctx, &table, &manifest, &d).unwrap();
+        // The preserved metadata comes back through the same path the CLI
+        // uses: out of the Foreign object, not out of anyone's memory.
+        let objects = |dg: &Digest| {
+            imported
+                .objects
+                .iter()
+                .find(|o| &o.digest(hash) == dg)
+                .and_then(|o| crate::cbor::decode(&o.payload).ok())
+        };
+        let kept = preserved_metadata(&manifest, &objects);
+        assert_eq!(kept, vec![("format".to_string(), "pt".to_string())]);
+        let written = export(&ctx, &table, &p, &d, &kept, true).unwrap();
+        assert!(
+            written == source,
+            "the round trip is not byte-exact: {} bytes in, {} out",
+            source.len(),
+            written.len()
+        );
     }
 
     /// I2 is only worth doing if the preserved keys can come back. This is the
@@ -1599,7 +1665,15 @@ mod tests {
                 .and_then(|b| crate::cbor::decode(&b).ok())
         };
         let kept = preserved_metadata(&manifest, &objects);
-        assert_eq!(kept, vec![("hand.written".to_string(), "yes".to_string())]);
+        // `format` is preserved with everything else now — an export that has
+        // to re-invent it is an export that writes a file like the source.
+        assert_eq!(
+            kept,
+            vec![
+                ("format".to_string(), "pt".to_string()),
+                ("hand.written".to_string(), "yes".to_string())
+            ]
+        );
 
         // Through an export, it is a header key again.
         let ctx = Ctx::new(&store);
