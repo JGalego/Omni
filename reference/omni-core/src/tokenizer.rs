@@ -500,13 +500,37 @@ impl Tokenizer {
                         next.push(src.bytes().map(byte_to_unicode).collect::<String>());
                     }
                     PreTokenizer::Whitespace => {
-                        // Split on whitespace, keeping it attached to the
-                        // following word the way GPT-2 style tokenizers do.
+                        // `Whitespace` in a `tokenizer.json` is the regex
+                        // `\w+|[^\w\s]+`: runs of word characters, or runs of
+                        // punctuation, with the whitespace **discarded**.
+                        //
+                        // Keeping the space attached to the following word is
+                        // `ByteLevel`'s behaviour — the branch above — and this
+                        // used to do that, on the grounds that GPT-2 does. The
+                        // two are different pre-tokenizers with different names,
+                        // and conflating them made every tokenizer declaring
+                        // `Whitespace` encode differently from the library that
+                        // wrote it: the space became a piece nothing in the
+                        // vocabulary matched, so it came out as `<unk>` between
+                        // every pair of words. Ids that are wrong in a way
+                        // nobody notices is exactly what §06.7 says not to do.
+                        //
+                        // `is_alphanumeric` is Unicode-aware, as `\w` is here,
+                        // so `Zürich` is one piece rather than three.
                         let mut cur = String::new();
+                        let mut cur_is_word = false;
                         for c in w.chars() {
-                            if c.is_whitespace() && !cur.is_empty() {
+                            if c.is_whitespace() {
+                                if !cur.is_empty() {
+                                    next.push(std::mem::take(&mut cur));
+                                }
+                                continue;
+                            }
+                            let is_word = c.is_alphanumeric() || c == '_';
+                            if !cur.is_empty() && is_word != cur_is_word {
                                 next.push(std::mem::take(&mut cur));
                             }
+                            cur_is_word = is_word;
                             cur.push(c);
                         }
                         if !cur.is_empty() {
@@ -1034,6 +1058,56 @@ mod tests {
 
     /// A tiny byte-level BPE: the vocabulary is single characters plus a few
     /// merges, which is enough to exercise the algorithm exactly.
+    /// `Whitespace` is the pre-tokenizer whose semantics this build had wrong,
+    /// and it had them wrong for as long as nothing compared it with the library
+    /// that writes the files it reads. The whole suite passed before the fix and
+    /// after it, which is the argument for `tools/tokenizer-vectors.py` and also
+    /// the argument for this test: the behaviour is now pinned here too, so it
+    /// cannot regress on a machine with no `tokenizers` installed.
+    #[test]
+    fn whitespace_discards_the_space_and_splits_words_from_punctuation() {
+        let t = Tokenizer {
+            kind: Kind::Bpe,
+            normalizers: Vec::new(),
+            pretokenizers: vec![PreTokenizer::Whitespace],
+            tokens: Vec::new(),
+            scores: Vec::new(),
+            merges: Vec::new(),
+            added_tokens: Vec::new(),
+            byte_fallback: false,
+            unk: None,
+            decoder: Vec::new(),
+            post_single: Vec::new(),
+            max_token_len: None,
+            vectors: None,
+            index: BTreeMap::new(),
+        };
+        // The space is gone, not attached to `model`. Attaching it is
+        // `ByteLevel`, a different pre-tokenizer with a different name.
+        assert_eq!(t.pretokenize("a model").unwrap(), vec!["a", "model"]);
+        // Runs of punctuation are their own pieces, and separate from words.
+        assert_eq!(
+            t.pretokenize("content-addressed").unwrap(),
+            vec!["content", "-", "addressed"]
+        );
+        assert_eq!(
+            t.pretokenize("hashing, chunking;").unwrap(),
+            vec!["hashing", ",", "chunking", ";"]
+        );
+        // Repeated and leading/trailing whitespace produce no empty pieces.
+        assert_eq!(t.pretokenize("  a   b  ").unwrap(), vec!["a", "b"]);
+        assert_eq!(t.pretokenize("").unwrap(), Vec::<String>::new());
+        // `\w` is Unicode-aware, so an accented word is one piece rather than
+        // being split at the byte that is not ASCII.
+        assert_eq!(
+            t.pretokenize("Zürich café").unwrap(),
+            vec!["Zürich", "café"]
+        );
+        assert_eq!(t.pretokenize("42 1024").unwrap(), vec!["42", "1024"]);
+        // Underscore counts as a word character, as it does in `\w`.
+        assert_eq!(t.pretokenize("snake_case").unwrap(), vec!["snake_case"]);
+    }
+
     fn bpe_tokenizer(s: &mut MemoryStore) -> Value {
         let tokens: Vec<String> = [
             "<unk>", "a", "b", "c", " ", "ab", "abc", "<|bos|>", "Ġ", "Ġa",

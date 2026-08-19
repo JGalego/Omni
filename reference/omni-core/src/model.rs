@@ -159,6 +159,19 @@ impl ModelBuilder {
         }
     }
 
+    /// Stores bytes as a single blob and returns the ref.
+    ///
+    /// `chunk_list` is for tensor data, where chunking is what makes partial
+    /// reads and deduplication possible. This is for the small things read whole
+    /// — a conformance-vector file, a template — where a chunk list would add an
+    /// indirection and an object for nothing.
+    pub fn blob(&mut self, data: &[u8]) -> Ref {
+        let blob = Object::blob(data.to_vec());
+        let d = blob.digest(self.hash);
+        self.extra_objects.push(blob);
+        (otype::BLOB, d)
+    }
+
     /// Stores bytes as a `ChunkList` and returns the ref.
     pub fn chunk_list(&mut self, data: &[u8]) -> Ref {
         let mut chunk_refs = Vec::new();

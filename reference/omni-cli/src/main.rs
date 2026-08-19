@@ -143,6 +143,7 @@ VERBS:
                               I/O half of time-to-first-token
     import  safetensors <in.safetensors> -o <out.omni> [--name N]
                               [--license SPDX] [--arch FAMILY] [--codec C]
+                              [--arch-param k=v ...]
                               Absorb another format and report the fidelity:
                               every tensor verified against the source, nothing
                               invented, the unrepresentable preserved (§1.1)
@@ -4745,7 +4746,7 @@ fn cmd_import(args: &[String]) -> R {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1 << 20),
         license: flag(args, "--license").map(str::to_string),
-        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), arch_params(args))),
     };
     let imported = import(&bytes, &opts)?;
     let packed = pack(
@@ -4937,7 +4938,7 @@ fn cmd_import_onnx(args: &[String], input: &str) -> R {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1 << 20),
         license: flag(args, "--license").map(str::to_string),
-        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), arch_params(args))),
         graph: !args.iter().any(|a| a == "--no-graph"),
     };
     // §12.4: external data is resolved beside the model and nowhere else.
@@ -5246,6 +5247,11 @@ fn cmd_import_hf(args: &[String], input: &str) -> R {
         tokenizer: read("tokenizer.json"),
         tokenizer_config: read("tokenizer_config.json"),
         generation_config: read("generation_config.json"),
+        // §06.7.1 vectors, if the corpus shipped them. Not a Hugging Face
+        // convention — no hub repo contains this file — but the only way vectors
+        // from the *source* tokenizer ever reach a container, and therefore the
+        // only way `verify --tokenizer` becomes a check that can fail.
+        tokenizer_vectors: read("tokenizer_vectors.tsv"),
         shards,
     };
     let opts = ImportOpts {
@@ -5396,7 +5402,7 @@ fn cmd_import_pytorch(args: &[String], input: &str) -> R {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1 << 20),
         license: flag(args, "--license").map(str::to_string),
-        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), arch_params(args))),
     };
     let imported = match import(&bytes, &opts) {
         Ok(i) => i,
@@ -6082,7 +6088,7 @@ fn cmd_import_npz(args: &[String], input: &str) -> R {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1 << 20),
         license: flag(args, "--license").map(str::to_string),
-        arch: flag(args, "--arch").map(|f| (f.to_string(), Vec::new())),
+        arch: flag(args, "--arch").map(|f| (f.to_string(), arch_params(args))),
     };
     let imported = match import(&bytes, &opts) {
         Ok(i) => i,
@@ -7935,6 +7941,95 @@ fn mldsa_params(spelling: &str) -> Option<omni_core::mldsa::Params> {
         "mldsa65" => Some(omni_core::mldsa::ML_DSA_65),
         "mldsa87" => Some(omni_core::mldsa::ML_DSA_87),
         _ => None,
+    }
+}
+
+/// `--arch-param k=v`, repeatable, for the `arch.params` of §06.2.
+///
+/// Naming a family without its parameters produces a container `graph
+/// synthesize` refuses — "arch.params has no `hidden_size`" — which is the
+/// correct refusal and used to be a dead end, because nothing on the command
+/// line could supply them. An importer knows tensor names and shapes; it does
+/// not know how many attention heads they are meant to be read as, and §07.5 has
+/// to be told rather than allowed to guess.
+///
+/// Keys may be dotted: `rope.theta=10000` builds the nested map the synthesizer
+/// reads, because some of §06.2's parameters are maps and a flat key cannot
+/// express them. That is not a convenience — a decoder whose `rope` block is
+/// missing is synthesized *without* positional encoding, silently and correctly,
+/// and the resulting graph is a different model that runs perfectly well. Being
+/// unable to say `rope.theta` on the command line meant being unable to
+/// synthesize the model you meant.
+///
+/// Values parse as bool, then integer, then float, then text, because
+/// `n_heads` is a number, `interleaved` is a bool and `activation` is neither.
+fn arch_params(args: &[String]) -> Vec<(String, omni_core::cbor::Value)> {
+    use omni_core::cbor::Value;
+    let scalar = |v: &str| -> Value {
+        match v {
+            "true" => return Value::Bool(true),
+            "false" => return Value::Bool(false),
+            _ => {}
+        }
+        if let Ok(n) = v.parse::<u64>() {
+            return Value::U(n);
+        }
+        if let Ok(n) = v.parse::<i64>() {
+            return Value::I(n);
+        }
+        match v.parse::<f64>() {
+            Ok(f) => Value::F64(f),
+            Err(_) => Value::Text(v.to_string()),
+        }
+    };
+
+    // Dotted keys are merged rather than appended, so `rope.theta` and
+    // `rope.interleaved` become one map instead of two entries named `rope`.
+    let mut out: Vec<(String, Value)> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != "--arch-param" {
+            continue;
+        }
+        let Some(kv) = args.get(i + 1) else { continue };
+        let Some((key, v)) = kv.split_once('=') else {
+            continue;
+        };
+        let mut parts = key.split('.');
+        let head = parts.next().unwrap_or(key).to_string();
+        let rest: Vec<&str> = parts.collect();
+        if rest.is_empty() {
+            out.retain(|(k, _)| *k != head);
+            out.push((head, scalar(v)));
+            continue;
+        }
+        // Build the value from the inside out, then graft it onto any map
+        // already recorded under `head`.
+        let mut value = scalar(v);
+        for seg in rest.iter().rev() {
+            value = Value::map(vec![(*seg, value)]);
+        }
+        match out.iter_mut().find(|(k, _)| *k == head) {
+            Some((_, existing)) => merge(existing, &value),
+            None => out.push((head, value)),
+        }
+    }
+    out
+}
+
+/// Merge `src` into `dst` where both are maps, so repeated dotted keys under one
+/// head accumulate instead of the last one winning.
+fn merge(dst: &mut omni_core::cbor::Value, src: &omni_core::cbor::Value) {
+    use omni_core::cbor::Value;
+    match (dst, src) {
+        (Value::Map(d), Value::Map(s)) => {
+            for (k, v) in s {
+                match d.iter_mut().find(|(dk, _)| dk == k) {
+                    Some((_, dv)) => merge(dv, v),
+                    None => d.push((k.clone(), v.clone())),
+                }
+            }
+        }
+        (d, s) => *d = s.clone(),
     }
 }
 
