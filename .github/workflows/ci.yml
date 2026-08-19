@@ -1407,14 +1407,34 @@ jobs:
           assert not r['failed'], r['failed']
           print('tokenizer vectors: 1 tokenizer checked against huggingface tokenizers')"
 
-          # And a wrong id must fail, or the vectors are decoration.
-          sed -i 's/^tokenizer\t.*/tokenizer\t999/' \
-            /tmp/corpus/toks/model-a/tokenizer_vectors.tsv
+          # And a wrong id must fail, or the vectors are decoration. The
+          # corruption is done in python and asserted to have changed the file,
+          # because a negative test that quietly corrupts nothing reports a pass.
+          python3 - <<'PY_BAD'
+          import re, sys
+          p = "/tmp/corpus/toks/model-a/tokenizer_vectors.tsv"
+          before = open(p, encoding="utf-8").read()
+          after = re.sub(r"^tokenizer\t.*$", "tokenizer\t999", before,
+                         count=1, flags=re.M)
+          if after == before:
+              print("::error::the vectors file has no `tokenizer` line to corrupt")
+              sys.exit(1)
+          open(p, "w", encoding="utf-8").write(after)
+          PY_BAD
           "$OMNI" import hf /tmp/corpus/toks/model-a -o /tmp/tokbad.omni >/dev/null
-          if "$OMNI" verify /tmp/tokbad.omni --tokenizer | grep -q 'vectors pass'; then
-            echo "::error::a wrong conformance vector passed"; exit 1
+          # The exit code, not a substring of the output. `9/10 vectors pass`
+          # contains "vectors pass", so grepping for that matched both outcomes —
+          # which is how this check passed locally under `pipefail` (where
+          # `verify`'s own failure sank the pipeline) and failed on a runner,
+          # whose default shell for `run` is `bash -e` without it.
+          if "$OMNI" verify /tmp/tokbad.omni --tokenizer > /tmp/tokbad.txt 2>&1; then
+            echo "::error::a wrong conformance vector passed"
+            cat /tmp/tokbad.txt
+            exit 1
           fi
-          echo "a wrong vector fails, so the passing ones mean something"
+          grep -q 'the vector says 999' /tmp/tokbad.txt
+          grep -q '9/10 vectors pass' /tmp/tokbad.txt
+          echo "a wrong vector fails by name, so the passing ones mean something"
 
           # Gate 2's first row also asks for outputs matching the *source
           # framework*, which needs the framework's answers as data. The harness
