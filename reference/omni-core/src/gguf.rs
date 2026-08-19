@@ -2297,7 +2297,16 @@ fn preserved(ctx: &Ctx<'_>, manifest: &Value) -> Res<Option<Preserved>> {
         let Ok(r) = crate::expr::parse_ref_value(item) else {
             continue;
         };
-        let Ok(v) = ctx.value(&r.1) else { continue };
+        // A Foreign entry that exists but does not decode is corruption, not
+        // absence: skipping it silently made this export claim "this container
+        // did not come from GGUF" about one that did, and compose a header the
+        // source never had. Absence is `None`; this is an error.
+        let v = ctx.value(&r.1).map_err(|e| {
+            Error::Malformed(format!(
+                "the Foreign object this container's import left behind does not \
+                 decode ({e}); refusing to compose a header in its place"
+            ))
+        })?;
         if v.get("format").and_then(|x| x.as_str()) != Some("gguf") {
             continue;
         }
@@ -2936,6 +2945,62 @@ mod tests {
         assert!(plan.from_gguf);
         assert!(plan.lossless(), "{:?}", plan.loss);
         assert_eq!(out.len(), src.len(), "the file changed length");
+        assert!(out == src, "the round trip is not byte-exact");
+    }
+
+    #[test]
+    fn signed_metadata_that_is_positive_survives_the_round_trip() {
+        // `tokenizer.ggml.token_type` is an I32 array in every llama-family
+        // file, and its values are small positives. The first real GGUF
+        // pointed at this importer produced a container whose Foreign object
+        // was malformed CBOR: the canonical encoder trusted a `debug_assert`
+        // to keep non-negative integers out of the negative major type, so a
+        // release build wrote `-1 - n` wrapped to a u64 — 2^64-3 for a token
+        // type of 2 — `verify` refused the container its own import had just
+        // written, and the export silently composed a header instead of
+        // reproducing the source's. Positive values through every signed
+        // width, and the whole trip.
+        let src = W::new()
+            .kv("general.architecture", Meta::Str("llama".into()))
+            .kv(
+                "tokenizer.ggml.token_type",
+                Meta::Arr(5, vec![Meta::I32(1), Meta::I32(2), Meta::I32(3)]),
+            )
+            .kv("signed.i8", Meta::I8(7))
+            .kv("signed.i16", Meta::I16(300))
+            .kv("signed.i64", Meta::I64(1 << 40))
+            .kv("signed.negative", Meta::I32(-2))
+            .tensor("w", Type::F32, &[4], junk(16, 11))
+            .finish();
+        let imported = import(&src, &ImportOpts::default()).unwrap();
+
+        let mut mem = MemoryStore::new(HashAlgo::default());
+        for o in &imported.objects {
+            let _ = mem.put(&o.payload);
+        }
+        let ctx = Ctx::new(&mem);
+        let manifest = ctx.value(&imported.root).unwrap();
+        // The Foreign object itself must be readable CBOR — before the fix it
+        // was not, and everything downstream inherited the corruption.
+        let foreign = crate::expr::parse_ref_value(
+            manifest
+                .get("foreign")
+                .and_then(|f| f.as_array())
+                .and_then(|l| l.first())
+                .expect("the import left a Foreign object"),
+        )
+        .unwrap();
+        ctx.value(&foreign.1).expect("the Foreign object decodes");
+
+        let model = crate::expr::parse_ref_value(
+            manifest.get("assets").and_then(|a| a.get("model")).unwrap(),
+        )
+        .unwrap();
+        let mv = ctx.value(&model.1).unwrap();
+        let tref = crate::expr::parse_ref_value(mv.get("tensors").unwrap()).unwrap();
+        let table = TensorTable::load(&ctx, &tref).unwrap();
+        let (out, plan) = export(&ctx, &manifest, &table).unwrap();
+        assert!(plan.from_gguf, "the preserved header was not found");
         assert!(out == src, "the round trip is not byte-exact");
     }
 

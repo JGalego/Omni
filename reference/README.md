@@ -851,7 +851,7 @@ it.
 
 ## Tests
 
-666 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
+668 tests covering: SHA-256 against FIPS 180-4 vectors; BLAKE3 against the
 official test vectors (all three keying modes, 131 bytes of XOF output each)
 plus tree-reconstruction and domain-separation properties; CRC-32C against
 standard check values; CBOR against RFC 8949 Appendix A vectors; canonical-form
@@ -1163,7 +1163,7 @@ and `omni` disagreeing about what happened is the failure mode that matters.
 
 ```console
 $ cargo test
-test result: ok. 666 passed; 0 failed
+test result: ok. 668 passed; 0 failed
 $ cargo clippy --all-targets -- -D warnings
     Finished (no warnings)
 ```

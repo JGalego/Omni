@@ -193,8 +193,20 @@ impl Value {
         match self {
             Value::U(n) => put_head(out, 0, *n),
             Value::I(n) => {
-                debug_assert!(*n < 0, "non-negative integers must use Value::U (D1)");
-                put_head(out, 1, (-1 - *n) as u64)
+                // A non-negative integer has exactly one canonical encoding —
+                // major type 0 — whichever variant carried it here. This used
+                // to be a `debug_assert`, which meant a release build handed a
+                // positive `Value::I` wrote `(-1 - n) as u64` into the
+                // negative major type: 2^64-3 for a value of 2, bytes the
+                // strict decoder rightly refuses. GGUF's signed metadata
+                // (`tokenizer.ggml.token_type` in every llama-family file) is
+                // exactly such a caller, so the encoder is total instead of
+                // trusting each one.
+                if *n < 0 {
+                    put_head(out, 1, (-1 - *n) as u64)
+                } else {
+                    put_head(out, 0, *n as u64)
+                }
             }
             Value::Bytes(b) => {
                 put_head(out, 2, b.len() as u64);
@@ -615,6 +627,18 @@ mod tests {
             Value::F64(1.1).encode(),
             vec![0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a]
         );
+    }
+
+    #[test]
+    fn a_non_negative_value_i_encodes_as_major_type_0() {
+        // The encoder is total: a caller that puts a non-negative integer in
+        // the signed variant still gets that integer's one canonical encoding
+        // rather than `(-1 - n) as u64` in the negative major type. It decodes
+        // back as `Value::U`, the same way every float decodes as `F64`.
+        assert_eq!(Value::I(0).encode(), vec![0x00]);
+        assert_eq!(Value::I(5).encode(), vec![0x05]);
+        assert_eq!(Value::I(1000).encode(), vec![0x19, 0x03, 0xe8]);
+        assert_eq!(decode(&Value::I(5).encode()).unwrap(), Value::U(5));
     }
 
     #[test]
