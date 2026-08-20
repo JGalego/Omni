@@ -9404,14 +9404,72 @@ fn cmd_delta(args: &[String]) -> R {
 
     for (name, tr) in &ttable.tensors {
         let td = TensorDesc::load(&tctx, tr)?;
-        let Some(br) = btable.get(name) else {
-            // A tensor the base does not have is carried whole.
-            carried += 1;
-            continue;
+        // A tensor that cannot be read out of the tuned container cannot be
+        // represented at all — and a delta that leaves it out reconstructs a
+        // different model, so that is an error with the tensor's name on it,
+        // not a skip.
+        let tt = match td.value.eval(&tctx) {
+            Ok(t) => t,
+            Err(e) => {
+                prr!(
+                    "omni: `{name}` cannot be evaluated from {tuned_path} ({e}); \
+                     a delta without it would reconstruct a different model\n"
+                );
+                return Ok(1);
+            }
         };
-        let bd = TensorDesc::load(&bctx, br)?;
-        let (Ok(bt), Ok(tt)) = (bd.value.eval(&bctx), td.value.eval(&tctx)) else {
+        let counterpart = match btable.get(name) {
+            Some(br) => {
+                let bd = TensorDesc::load(&bctx, br)?;
+                bd.value.eval(&bctx).ok().map(|bt| (bd, bt))
+            }
+            None => None,
+        };
+        let Some((bd, bt)) = counterpart else {
+            // No counterpart in the base (or one this build cannot evaluate):
+            // carried whole, as §08.6's `full` representation. This used to be
+            // a skip that the summary line owned up to — but a delta is the
+            // claim "base plus this is the tuned model", and a fine-tune's
+            // classifier head is exactly the tensor the fine-tune added.
             carried += 1;
+            let bytes = tt.to_bytes(
+                &td.dtype,
+                &omni_core::layout::Layout::default(),
+                omni_core::Round::Rne,
+            )?;
+            let plan = omni_core::delta::Plan {
+                kind: Kind::Full,
+                max_rel_err: 0.0,
+                stored_bytes: bytes.len() as u64,
+                tensors: vec![],
+                changed_chunks: vec![],
+                total_chunks: 0,
+            };
+            report.add(&plan);
+            let cl = b.chunk_list(&bytes);
+            let value = Expr::Literal {
+                chunks: cl,
+                dtype: td.dtype.clone(),
+                shape: omni_core::expr::dims(&tt.shape),
+                layout: omni_core::layout::Layout::default(),
+            };
+            let inferred = value.infer()?;
+            b = b.derived(
+                name.clone(),
+                TensorDesc {
+                    shape: inferred.shape,
+                    dtype: inferred.dtype,
+                    layout: td.layout.clone(),
+                    value,
+                    semantic: td.semantic.clone(),
+                    role: td.role.clone(),
+                    axes: td.axes.clone(),
+                    device_hint: None,
+                    materialize: Materialize::Lazy,
+                    stats: None,
+                    digest_materialized: None,
+                },
+            );
             continue;
         };
         // Store the delta's own tensors in the *tuned* tensor's dtype: LoRA
@@ -9497,7 +9555,7 @@ fn cmd_delta(args: &[String]) -> R {
     std::fs::write(out, &bytes)?;
     pr!("{report}");
     if carried > 0 {
-        pr!("  ({carried} tensor(s) had no counterpart in the base and were skipped)");
+        pr!("  ({carried} tensor(s) had no usable counterpart in the base and were carried whole)");
     }
     pr!();
     pr!("wrote {out}  {}", human(bytes.len() as u64));

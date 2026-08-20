@@ -3396,7 +3396,34 @@ jobs:
           # §08.3: an adapter is checked against a base before any weights load.
           "$OMNI" adapter make /tmp/b.omni -o /tmp/lora.omni
           "$OMNI" adapter check /tmp/b.omni /tmp/lora.omni | grep -q attachable
-          echo "delta and adapter paths hold"
+          # A tensor the base does not have — a fine-tune's classifier head —
+          # is carried whole (§08.6 `full`), because a delta is the claim
+          # "base plus this is the tuned model" and a skipped head would
+          # reconstruct a different model. The first real base/fine-tune pair
+          # this repository imported (bert-tiny and one of its published
+          # fine-tunes) is what caught the skip.
+          python3 - <<'PY_HEAD'
+          import json, struct
+          def write(path, tensors):
+              hdr, data, at = {}, b"", 0
+              for name, vals in tensors.items():
+                  raw = b"".join(struct.pack("<f", v) for v in vals)
+                  hdr[name] = {"dtype": "F32", "shape": [len(vals)],
+                               "data_offsets": [at, at + len(raw)]}
+                  at += len(raw); data += raw
+              h = json.dumps(hdr, separators=(",", ":")).encode()
+              open(path, "wb").write(struct.pack("<Q", len(h)) + h + data)
+          write("/tmp/dbase.st",  {"w": [1.0, 2.0, 3.0, 4.0]})
+          write("/tmp/dtuned.st", {"w": [1.0, 2.5, 3.0, 4.0],
+                                   "head.weight": [0.5, -0.5]})
+          PY_HEAD
+          "$OMNI" import safetensors /tmp/dbase.st  -o /tmp/dbase.omni  >/dev/null
+          "$OMNI" import safetensors /tmp/dtuned.st -o /tmp/dtuned.omni >/dev/null
+          "$OMNI" delta /tmp/dbase.omni /tmp/dtuned.omni -o /tmp/dhead.omni \
+            | grep -q 'carried whole'
+          "$OMNI" cat /tmp/dhead.omni --tensor head.weight --with /tmp/dbase.omni \
+            | grep -q -- '0.500000'
+          echo "delta and adapter paths hold, carried tensors reconstruct"
 
       - name: Both mandatory hash algorithms produce valid containers
         run: |
